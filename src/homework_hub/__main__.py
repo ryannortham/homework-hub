@@ -116,8 +116,33 @@ def auth_compass(subdomain: str, cookie: str | None, token_path: Path | None) ->
 
 @auth.command("edrolo")
 @click.option("--child", required=True)
-def auth_edrolo(child: str) -> None:
-    click.echo(f"edrolo auth stub (child={child}) — wired up in phase 7")
+@click.option(
+    "--token-path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Override storage-state output path. Defaults to <tokens_dir>/<child>-edrolo.json.",
+)
+@click.option(
+    "--base-url",
+    default="https://edrolo.com.au",
+    help="Override Edrolo base URL (rarely needed).",
+)
+def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
+    """Run a headed Playwright login for Edrolo and dump storage_state.json.
+
+    Opens a real Chromium window so Google SSO (including 2FA) works without
+    being detected as a bot. The kid signs in once on the Mac; the resulting
+    cookies are copied to the server. Re-run when Discord alerts on expiry.
+    """
+    from homework_hub.sources.edrolo import run_headed_login
+
+    settings = Settings()
+    out_path = token_path or settings.child_token_path(child, "edrolo")
+
+    click.echo(f"Opening headed Chromium for {child} (Edrolo)…")
+    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
+    run_headed_login(out_path, base_url=base_url)
+    click.echo(f"Edrolo storage state saved → {out_path}")
 
 
 @cli.command("bootstrap-sheet")

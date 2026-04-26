@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "id": 99821,
+      "title": "Chapter 4 — Calculus Practice",
+      "course_name": "Mathematical Methods 3/4",
+      "description": "Complete questions 1-15.",
+      "assigned_at": "2026-04-20T08:00:00Z",
+      "due_at": "2026-05-02T13:00:00Z",
+      "status": "not_started",
+      "url": "https://edrolo.com.au/student/tasks/99821/"
+    },
+    {
+      "id": 99822,
+      "title": "Photosynthesis Quiz",
+      "course_name": "Biology 1/2",
+      "description": "Short-answer quiz.",
+      "assigned_at": "2026-04-21T08:00:00Z",
+      "due_at": "2026-04-28T13:00:00Z",
+      "submitted_at": "2026-04-27T10:15:00Z",
+      "url": "https://edrolo.com.au/student/tasks/99822/"
+    }
+  ]
+}

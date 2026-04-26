@@ -1,0 +1,35 @@
+{
+  "cookies": [
+    {
+      "name": "sessionid",
+      "value": "fake-session-abc123",
+      "domain": ".edrolo.com.au",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "csrftoken",
+      "value": "fake-csrf-xyz789",
+      "domain": ".edrolo.com.au",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_ga",
+      "value": "GA1.2.fake",
+      "domain": ".edrolo.com.au",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}
