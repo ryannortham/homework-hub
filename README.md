@@ -54,10 +54,13 @@ python -m homework_hub
 
 ## Deployment (TrueNAS + Portainer)
 
-Custom-built image; the Dockerfile lives in this repo and the compose
-stack is checked in as `docker-compose.yml`. Deployed as a Portainer
-GitOps stack pulling directly from this repo on `main`. Convention
-follows `HomeworkHub.md` in the vault:
+Custom-built image; the Dockerfile lives in this repo. Deployed as a
+Portainer GitOps stack pulling `docker-compose.yml` directly from this
+repo on `main`. The image itself is built manually on the TrueNAS host
+(Portainer's container has no buildx) and tagged `homework-hub:latest`
+so the compose stack can reference it without a `build:` block.
+
+Layout on TrueNAS:
 
 ```
 /mnt/tank/Apps/HomeworkHub/
@@ -69,17 +72,28 @@ follows `HomeworkHub.md` in the vault:
 into its own working directory and stores the four `BW_*` secrets in
 its encrypted DB.)
 
-Deploy:
+### Initial deploy
 
 1. Create the persistent dirs once:
    ```bash
    ssh root@192.168.1.100 'mkdir -p /mnt/tank/Apps/HomeworkHub/{Config/tokens,Logs} && chown -R 568:568 /mnt/tank/Apps/HomeworkHub'
    ```
-2. https://portainer.homelab → **Stacks** → **Add stack** → name `homework-hub`.
-3. Build method: **Repository** → URL `https://github.com/ryannortham/homework-hub`, ref `refs/heads/main`, compose path `docker-compose.yml`.
-4. Environment variables (Advanced mode): `BW_SERVER`, `BW_CLIENTID`, `BW_CLIENTSECRET`, `BW_PASSWORD`.
-5. Enable **GitOps updates** (5 min polling) so `git push` auto-redeploys.
-6. **Deploy the stack**.
+2. Build the image on TrueNAS:
+   ```bash
+   ssh root@192.168.1.100 'cd /tmp && rm -rf homework-hub-build && \
+     git clone https://github.com/ryannortham/homework-hub homework-hub-build && \
+     cd homework-hub-build && docker build -t homework-hub:latest .'
+   ```
+3. https://portainer.homelab → **Stacks** → **Add stack** → name `homework-hub`.
+4. Build method: **Repository** → URL `https://github.com/ryannortham/homework-hub`, ref `refs/heads/main`, compose path `docker-compose.yml`.
+5. Environment variables (Advanced mode): `BW_SERVER`, `BW_CLIENTID`, `BW_CLIENTSECRET`, `BW_PASSWORD`.
+6. Enable **GitOps updates** (5 min polling) so `git push` auto-redeploys the compose changes.
+7. **Deploy the stack**.
+
+### Updating after a code change
+
+- **Compose-only change** (env vars, volumes, etc.): `git push` and Portainer auto-redeploys within 5 min.
+- **Code/Dockerfile change**: rerun step 2 above (`docker build` on TrueNAS), then trigger a redeploy in Portainer (Stacks → homework-hub → "Update the stack").
 
 `/health` is polled by Uptime Kuma at port 30062 — there is no Caddy
 entry and no UI; ops surface only.

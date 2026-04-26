@@ -1,10 +1,22 @@
 # Portainer stack for Homework Hub.
 #
-# Deployment: Portainer (https://portainer.homelab) → Stacks → Add stack →
+# Deployment: Portainer (https://portainer.homelab) -> Stacks -> Add stack ->
 # Build method: Repository (this repo, branch main, compose path
 # docker-compose.yml). Set the four BW_* environment variables in the
 # Portainer UI -- they are stored encrypted in Portainer's DB and injected
 # at runtime (no .env file on the host).
+#
+# IMAGE BUILD: Portainer's container lacks buildx, so we don't use a
+# `build:` directive here. Build the image manually on the TrueNAS host
+# whenever the Dockerfile or Python source changes:
+#
+#     ssh root@192.168.1.100
+#     cd /tmp && rm -rf homework-hub-build && \
+#         git clone https://github.com/ryannortham/homework-hub homework-hub-build && \
+#         cd homework-hub-build && docker build -t homework-hub:latest .
+#
+# Then click "Update the stack" in Portainer (or wait for GitOps to redeploy)
+# and the new image is picked up.
 #
 # Persistent volumes (bind-mounted from TrueNAS):
 #   /mnt/tank/Apps/HomeworkHub/Config/  -> /config  (children.yaml, tokens, state.db)
@@ -13,9 +25,6 @@
 services:
   homework-hub:
     container_name: homework-hub
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: homework-hub:latest
     restart: unless-stopped
     user: "568:568"
