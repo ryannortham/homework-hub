@@ -1,0 +1,12 @@
+{
+  "id": 8842,
+  "name": "Pythagoras Investigation",
+  "subjectName": "9MATH",
+  "description": "<p>Complete the investigation worksheet on Pythagorean triples. Submit a typed response of <strong>500 words</strong>.</p>",
+  "activityStart": "2026-04-15T00:00:00",
+  "dueDateTimestamp": "2026-04-29T15:00:00",
+  "status": 0,
+  "students": [
+    {"userId": 12345, "status": 0, "submittedTimestamp": null}
+  ]
+}

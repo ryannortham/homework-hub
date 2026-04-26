@@ -1,5 +1,10 @@
 # Per-child configuration. Copy to children.yaml and edit.
 # Secrets live in Vaultwarden, not here.
+#
+# Compass uses a single parent login covering all kids; each child's
+# `compass_user_id` is the numeric userId Compass returns for that student.
+# Capture it during onboarding by inspecting the Compass UI (or the network
+# tab after logging in as parent) and record it here.
 
 children:
   james:
@@ -12,6 +17,7 @@ children:
         subdomain: mcsc-vic        # https://mcsc-vic.compass.education
       edrolo:
         enabled: true
+    compass_user_id: null          # populate after capturing James's userId
     # sheet_id is populated by `homework-hub bootstrap-sheet --child james`
     sheet_id: null
 
@@ -25,4 +31,5 @@ children:
         subdomain: mcsc-vic
       edrolo:
         enabled: true
+    compass_user_id: null
     sheet_id: null

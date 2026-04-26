@@ -1,0 +1,25 @@
+{
+  "d": {
+    "data": [
+      {
+        "id": 8842,
+        "name": "Pythagoras Investigation",
+        "subjectName": "9MATH",
+        "description": "Complete the investigation worksheet.",
+        "activityStart": "2026-04-15T00:00:00",
+        "dueDateTimestamp": "2026-04-29T15:00:00",
+        "status": 0
+      },
+      {
+        "id": 8843,
+        "name": "WW1 Source Analysis",
+        "subjectName": "9HUM",
+        "description": "Analyse three primary sources.",
+        "activityStart": "2026-04-10T00:00:00",
+        "dueDateTimestamp": "2026-05-02T23:59:00",
+        "status": 1
+      }
+    ],
+    "h": "ok"
+  }
+}

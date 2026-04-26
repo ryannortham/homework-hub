@@ -73,9 +73,45 @@ def auth_classroom(child: str, client_secret_file: Path | None, token_path: Path
 
 
 @auth.command("compass")
-@click.option("--child", required=True)
-def auth_compass(child: str) -> None:
-    click.echo(f"compass auth stub (child={child}) — wired up in phase 6")
+@click.option(
+    "--subdomain",
+    required=True,
+    help="Compass school subdomain, e.g. mcsc-vic.",
+)
+@click.option(
+    "--cookie",
+    default=None,
+    help="ASP.NET_SessionId value. If omitted, prompts interactively.",
+)
+@click.option(
+    "--token-path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Override token output path. Defaults to <tokens_dir>/compass-parent.json.",
+)
+def auth_compass(subdomain: str, cookie: str | None, token_path: Path | None) -> None:
+    """Persist the parent Compass ASP.NET_SessionId cookie.
+
+    The Compass school portal requires SMS-OTP login that we cannot automate.
+    Log into Compass on Chrome, F12 → Application → Cookies → copy the value
+    of ``ASP.NET_SessionId`` and pass it to this command (or paste when
+    prompted).
+
+    One token covers all children — no --child flag needed.
+    """
+    from homework_hub.sources.compass import CompassToken
+
+    settings = Settings()
+    out_path = token_path or settings.tokens_dir / "compass-parent.json"
+
+    if not cookie:
+        cookie = click.prompt("Paste ASP.NET_SessionId", hide_input=True)
+    cookie = (cookie or "").strip()
+    if not cookie:
+        raise click.ClickException("Cookie is empty.")
+
+    CompassToken(subdomain=subdomain, cookie=cookie).save(out_path)
+    click.echo(f"Compass parent token saved → {out_path}")
 
 
 @auth.command("edrolo")

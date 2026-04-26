@@ -29,6 +29,9 @@ class ChildConfig(BaseModel):
     display_name: str
     sources: ChildSources = ChildSources()
     sheet_id: str | None = None
+    # Compass uses a single parent session covering all children. Per-child
+    # numeric userId is captured during onboarding and recorded here.
+    compass_user_id: int | None = None
 
 
 class ChildrenConfig(BaseModel):

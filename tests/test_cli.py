@@ -33,11 +33,46 @@ def test_sync_with_child():
     assert "child=james" in result.output
 
 
-def test_auth_compass_stub():
+def test_auth_compass_saves_token(tmp_path: Path):
+    out_token = tmp_path / "compass.json"
     runner = CliRunner()
-    result = runner.invoke(cli, ["auth", "compass", "--child", "james"])
-    assert result.exit_code == 0
-    assert "compass" in result.output
+    result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "compass",
+            "--subdomain",
+            "mcsc-vic",
+            "--cookie",
+            "ABC123",
+            "--token-path",
+            str(out_token),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert out_token.exists()
+    data = json.loads(out_token.read_text())
+    assert data["subdomain"] == "mcsc-vic"
+    assert data["cookie"] == "ABC123"
+
+
+def test_auth_compass_rejects_empty_cookie(tmp_path: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "compass",
+            "--subdomain",
+            "mcsc-vic",
+            "--cookie",
+            "   ",
+            "--token-path",
+            str(tmp_path / "x.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "empty" in result.output.lower()
 
 
 def test_auth_edrolo_stub():
@@ -75,6 +110,13 @@ def test_auth_classroom_runs_oauth_flow_with_local_secret(tmp_path: Path):
 
 
 def test_auth_requires_child():
+    """Edrolo (and other per-child) auth commands require --child."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["auth", "edrolo"])
+    assert result.exit_code != 0
+
+
+def test_auth_compass_requires_subdomain():
     runner = CliRunner()
     result = runner.invoke(cli, ["auth", "compass"])
     assert result.exit_code != 0
