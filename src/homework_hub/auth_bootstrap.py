@@ -36,7 +36,7 @@ from homework_hub.secrets import BitwardenCLI, from_env
 
 log = logging.getLogger(__name__)
 
-OAUTH_CLIENT_BW_NAME = "Homework Hub - OAuth Client"
+OAUTH_CLIENT_BW_NAME = "Homework Hub - Google OAuth Client"
 BOOTSTRAP_TOKEN_FILENAME = "ryan-bootstrap.json"
 
 # Same scopes as the service account: spreadsheets (full) + drive (for
