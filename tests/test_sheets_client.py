@@ -142,7 +142,7 @@ def test_apply_diff_writes_updates_and_appends():
     assert len(ws.batch_calls) == 1
     data, opt = ws.batch_calls[0]
     assert opt == "USER_ENTERED"
-    assert data == [{"range": f"Raw!A3:{last_col}3", "values": [row_a]}]
+    assert data == [{"range": f"A3:{last_col}3", "values": [row_a]}]
 
     assert len(ws.update_calls) == 1
     values, range_name, opt = ws.update_calls[0]

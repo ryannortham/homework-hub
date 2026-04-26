@@ -160,7 +160,10 @@ class SheetsClient:
         if diff.updates:
             data: list[dict[str, Any]] = []
             for row_num, values in diff.updates.items():
-                rng = f"{RAW_TAB_NAME}!A{row_num}:{last_col}{row_num}"
+                # ``Worksheet.batch_update`` prepends the worksheet title to the
+                # range itself, so the range value here MUST be sheet-relative
+                # (no ``Raw!`` prefix), otherwise the API receives ``Raw!Raw!…``.
+                rng = f"A{row_num}:{last_col}{row_num}"
                 data.append({"range": rng, "values": [values]})
             ws.batch_update(data, value_input_option="USER_ENTERED")
 
