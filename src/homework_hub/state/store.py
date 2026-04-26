@@ -179,7 +179,7 @@ class StateStore:
     def get_seen(self, child: str, source: str, source_id: str) -> SeenRecord | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT * FROM seen_tasks " "WHERE child = ? AND source = ? AND source_id = ?",
+                "SELECT * FROM seen_tasks WHERE child = ? AND source = ? AND source_id = ?",
                 (child, source, source_id),
             ).fetchone()
         if row is None:

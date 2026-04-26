@@ -4,12 +4,14 @@
 #
 # Multi-stage:
 #   1. builder: install uv, sync the locked dependency set into a venv.
-#   2. runtime: copy the venv + source into a slim Python image and run
-#      the daemon (APScheduler + FastAPI /health).
+#   2. runtime: copy the venv + source into a slim Python image, install
+#      Chromium for Playwright, and run the daemon (APScheduler + FastAPI
+#      /health).
 #
-# Edrolo's *headed* Playwright login is performed on the Mac during
-# onboarding -- the container only replays cookies via httpx, so no
-# browser binaries are needed here. Keep this Dockerfile lean.
+# Both Edrolo and Classroom use Playwright. Edrolo only needs cookies at
+# runtime (httpx replay), but Classroom blocks third-party OAuth at the
+# Workspace level, so we scrape the rendered DOM with headless Chromium
+# every sync. That dictates the Chromium install below.
 
 # --------------------------------------------------------------------------- #
 # Builder
@@ -65,7 +67,16 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     HOMEWORK_HUB_CONFIG_DIR=/config \
     HOMEWORK_HUB_TOKENS_DIR=/config/tokens \
     HOMEWORK_HUB_STATE_DB=/config/state.db \
-    HOMEWORK_HUB_LOG_DIR=/logs
+    HOMEWORK_HUB_LOG_DIR=/logs \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+
+# Install Chromium + its system deps via Playwright. The image gains ~450MB
+# but it's the price of bypassing the school's OAuth block on Classroom.
+# We pin to whatever Chromium ships with the Playwright version in uv.lock.
+RUN set -eux; \
+    mkdir -p /opt/playwright; \
+    /opt/venv/bin/python -m playwright install --with-deps chromium; \
+    chown -R 568:568 /opt/playwright
 
 # Match the homelab convention: PUID/PGID 568 (apps user on TrueNAS).
 RUN groupadd --system --gid 568 app \

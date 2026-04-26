@@ -215,7 +215,10 @@ def test_create_sheet_applies_bootstrap_requests_and_shares():
             return _FakeCreate()
 
         def batchUpdate(  # noqa: N802 — Google API names
-            self, *, spreadsheetId: str, body: dict[str, Any]  # noqa: N803
+            self,
+            *,
+            spreadsheetId: str,  # noqa: N803
+            body: dict[str, Any],
         ) -> _FakeBatchUpdate:
             captured["batch_id"] = spreadsheetId
             captured["batch_body"] = body

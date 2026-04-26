@@ -167,13 +167,11 @@ def test_auth_edrolo_invokes_headed_login(tmp_path: Path):
     assert "saved" in result.output.lower()
 
 
-def test_auth_classroom_runs_oauth_flow_with_local_secret(tmp_path: Path):
-    secret = tmp_path / "secret.json"
-    secret.write_text(json.dumps({"installed": {"client_id": "x", "client_secret": "y"}}))
+def test_auth_classroom_runs_headed_login(tmp_path: Path):
     out_token = tmp_path / "out.json"
 
     runner = CliRunner()
-    with patch("homework_hub.sources.classroom.run_oauth_flow") as mock_flow:
+    with patch("homework_hub.sources.classroom.run_headed_login") as mock_login:
         result = runner.invoke(
             cli,
             [
@@ -181,17 +179,15 @@ def test_auth_classroom_runs_oauth_flow_with_local_secret(tmp_path: Path):
                 "classroom",
                 "--child",
                 "james",
-                "--client-secret-file",
-                str(secret),
                 "--token-path",
                 str(out_token),
             ],
         )
     assert result.exit_code == 0, result.output
-    mock_flow.assert_called_once()
-    args = mock_flow.call_args[0]
-    assert "installed" in args[0]
-    assert args[1] == out_token
+    mock_login.assert_called_once()
+    call_args = mock_login.call_args
+    assert call_args.args[0] == out_token
+    assert "saved" in result.output.lower()
 
 
 def test_auth_requires_child():

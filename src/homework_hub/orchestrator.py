@@ -141,8 +141,7 @@ class Orchestrator:
 
         if cfg.sheet_id is None:
             report.sheet_skipped_reason = (
-                "No sheet_id in children.yaml — run "
-                f"`homework-hub bootstrap-sheet --child {child}`"
+                f"No sheet_id in children.yaml — run `homework-hub bootstrap-sheet --child {child}`"
             )
             log.warning("Skipping sheet write for %s: %s", child, report.sheet_skipped_reason)
         elif not all_tasks and self._all_sources_failed(report):
@@ -229,8 +228,7 @@ def summarise_for_humans(report: SyncReport) -> str:
     lines: list[str] = []
     duration = (report.finished_at - report.started_at).total_seconds()
     lines.append(
-        f"Sync completed in {duration:.1f}s "
-        f"(failures: {'yes' if report.any_failures else 'no'})"
+        f"Sync completed in {duration:.1f}s (failures: {'yes' if report.any_failures else 'no'})"
     )
     for child in report.children:
         lines.append(f"  {child.child}:")

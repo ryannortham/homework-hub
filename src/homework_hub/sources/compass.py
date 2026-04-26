@@ -282,7 +282,7 @@ class CompassClient:
             raise TransientError(f"Compass {resp.status_code} on {url}")
         if resp.status_code != 200:
             raise SchemaBreakError(
-                f"Unexpected Compass status {resp.status_code} on {url}: " f"{resp.text[:200]}"
+                f"Unexpected Compass status {resp.status_code} on {url}: {resp.text[:200]}"
             )
 
         try:
@@ -323,7 +323,7 @@ class CompassSource(Source):
     def fetch(self, child: str) -> list[Task]:
         if child not in self.user_id_for_child:
             raise SchemaBreakError(
-                f"No compass_user_id configured for {child}. " f"Add it to children.yaml."
+                f"No compass_user_id configured for {child}. Add it to children.yaml."
             )
         user_id = self.user_id_for_child[child]
         token = CompassToken.load(self.token_path)

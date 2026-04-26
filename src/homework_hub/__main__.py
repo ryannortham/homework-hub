@@ -59,40 +59,34 @@ def auth() -> None:
 @auth.command("classroom")
 @click.option("--child", required=True)
 @click.option(
-    "--client-secret-file",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=None,
-    help="Google OAuth client secret JSON. Defaults to fetching from Vaultwarden.",
-)
-@click.option(
     "--token-path",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Override the output token path. Defaults to <tokens_dir>/<child>-classroom.json.",
+    help="Override storage-state output path. Defaults to <tokens_dir>/<child>-classroom.json.",
 )
-def auth_classroom(child: str, client_secret_file: Path | None, token_path: Path | None) -> None:
-    """Run the Google Classroom OAuth flow on the local machine.
+@click.option(
+    "--base-url",
+    default="https://classroom.google.com",
+    help="Override Classroom base URL (rarely needed).",
+)
+def auth_classroom(child: str, token_path: Path | None, base_url: str) -> None:
+    """Run a headed Playwright login for Classroom and dump storage_state.json.
 
-    Opens a browser window for the kid to grant consent. Token is written to
-    ``<tokens_dir>/<child>-classroom.json``. The same token is used by every
-    subsequent sync; refresh is automatic.
+    Mordialloc's Workspace admin blocks third-party OAuth apps, so we replay
+    the kid's authenticated browser session instead. Opens a real Chromium
+    window so Google SSO (including 2FA) works without being detected as a
+    bot. The kid signs in once on the Mac; the resulting cookies are copied
+    to the server. Re-run when Discord alerts on expiry.
     """
-    from homework_hub.secrets import from_env
-    from homework_hub.sources.classroom import load_client_secret, run_oauth_flow
+    from homework_hub.sources.classroom import run_headed_login
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "classroom")
 
-    if client_secret_file:
-        client_secret = load_client_secret(client_secret_file.read_text())
-    else:
-        bw = from_env()
-        raw = bw.get_notes("Homework Hub - Google OAuth Client")
-        client_secret = load_client_secret(raw)
-
-    click.echo(f"Opening browser for {child} (Google Classroom)…")
-    run_oauth_flow(client_secret, out_path)
-    click.echo(f"Token saved → {out_path}")
+    click.echo(f"Opening headed Chromium for {child} (Google Classroom)…")
+    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
+    run_headed_login(out_path, base_url=base_url)
+    click.echo(f"Classroom storage state saved → {out_path}")
 
 
 @auth.command("compass")

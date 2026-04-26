@@ -64,6 +64,7 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
     out: dict[str, list[Source]] = {}
     compass_user_ids: dict[str, int] = {}
     edrolo_paths: dict[str, Path] = {}
+    classroom_paths: dict[str, Path] = {}
 
     # First pass: collect per-child config knobs that the shared sources need.
     for child, child_cfg in cfg.children.items():
@@ -71,6 +72,8 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
             compass_user_ids[child] = child_cfg.compass_user_id
         if child_cfg.sources.edrolo.enabled:
             edrolo_paths[child] = settings.child_token_path(child, "edrolo")
+        if child_cfg.sources.classroom.enabled:
+            classroom_paths[child] = settings.child_token_path(child, "classroom")
 
     # Build the shared Compass source once (single parent token covers all).
     compass_source = None
@@ -87,12 +90,19 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
 
         edrolo_source = EdroloSource(edrolo_paths)
 
+    # Build the shared Classroom source once (per-child storage_state on disk).
+    classroom_source = None
+    if classroom_paths:
+        from homework_hub.sources.classroom import ClassroomSource
+
+        classroom_source = ClassroomSource(classroom_paths)
+
     # Second pass: assemble the per-child source list in stable order
     # (classroom, compass, edrolo) so the report ordering is predictable.
     for child, child_cfg in cfg.children.items():
         sources: list[Source] = []
-        if child_cfg.sources.classroom.enabled:
-            sources.append(_build_classroom(settings, child))
+        if child_cfg.sources.classroom.enabled and classroom_source is not None:
+            sources.append(classroom_source)
         if (
             child_cfg.sources.compass.enabled
             and child in compass_user_ids
@@ -103,13 +113,6 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
             sources.append(edrolo_source)
         out[child] = sources
     return out
-
-
-def _build_classroom(settings: Settings, child: str) -> Source:
-    from homework_hub.sources.classroom import ClassroomSource
-
-    token_path = settings.child_token_path(child, "classroom")
-    return ClassroomSource(token_path)
 
 
 def _build_sheets_backend(bw: BitwardenCLI | None = None) -> SheetsBackend:

@@ -47,7 +47,7 @@ def test_write_sheet_id_updates_existing_key(tmp_path: Path):
 
 def test_write_sheet_id_appends_when_missing(tmp_path: Path):
     yaml_path = tmp_path / "children.yaml"
-    yaml_path.write_text("children:\n" "  james:\n" "    display_name: James\n")
+    yaml_path.write_text("children:\n  james:\n    display_name: James\n")
     write_sheet_id_to_config(yaml_path, "james", "abc")
     text = yaml_path.read_text()
     assert "sheet_id: abc" in text
