@@ -1,0 +1,101 @@
+# Subject canonicalisation rules.
+#
+# Loaded into the `dim_subjects` table on demand via:
+#     homework-hub subjects seed                    # additive
+#     homework-hub subjects seed --replace          # wipe and reload
+#
+# Resolution precedence: exact (priority 100) > prefix (50) > regex (10).
+# Within a tier, higher priority wins; ties broken by row id.
+#
+# Patterns observed live (Apr 2026):
+#   Compass:   "9SCI Science Y9", "9MATH", "11CHEM 3", "11ENG", …
+#   Edrolo:    "VCE Biology Units 3&4 [2026]", "11BIO 3", …
+#   Classroom: "9SCI2 (2026 Academic)", "Year 11 English", …
+
+rules:
+  # ----------------------------------------------------------------- #
+  # Year 9 — James
+  # ----------------------------------------------------------------- #
+
+  # Maths
+  - {match: prefix, pattern: "9MATH",     canonical: "Year 9 Maths",    short: "Maths"}
+
+  # Science
+  - {match: prefix, pattern: "9SCI",      canonical: "Year 9 Science",  short: "Sci"}
+
+  # English
+  - {match: prefix, pattern: "9ENG",      canonical: "Year 9 English",  short: "Eng"}
+
+  # Humanities
+  - {match: prefix, pattern: "9HUM",      canonical: "Year 9 Humanities", short: "Hum"}
+  - {match: prefix, pattern: "9HIST",     canonical: "Year 9 History",  short: "Hist"}
+
+  # Outdoor Ed (James does this; Tahlia doesn't)
+  - {match: prefix, pattern: "9OUTED",    canonical: "Year 9 Outdoor Ed", short: "OutEd"}
+  - {match: prefix, pattern: "9OUTDOOR",  canonical: "Year 9 Outdoor Ed", short: "OutEd"}
+
+  # Health
+  - {match: prefix, pattern: "9HEAL",     canonical: "Year 9 Health",   short: "Health"}
+  - {match: prefix, pattern: "9HPE",      canonical: "Year 9 Health & PE", short: "PE"}
+  - {match: prefix, pattern: "9PE",       canonical: "Year 9 PE",       short: "PE"}
+
+  # Languages
+  - {match: prefix, pattern: "9JAP",      canonical: "Year 9 Japanese", short: "Jap"}
+
+  # Arts
+  - {match: prefix, pattern: "9ART",      canonical: "Year 9 Art",      short: "Art"}
+  - {match: prefix, pattern: "9MUS",      canonical: "Year 9 Music",    short: "Music"}
+
+  # Classroom-style "(2026 Academic)" suffixes — handled by the prefix rules above.
+  # Year-level pastoral / form-class admin
+  - {match: regex,  pattern: "Year 9.*",  canonical: "Year 9 Form",     short: "Form"}
+
+  # ----------------------------------------------------------------- #
+  # Year 11 — Tahlia
+  # ----------------------------------------------------------------- #
+
+  # Maths
+  - {match: prefix, pattern: "11MATH",    canonical: "Year 11 Maths",   short: "Maths"}
+  - {match: prefix, pattern: "11GMATH",   canonical: "Year 11 General Maths", short: "Maths"}
+  - {match: prefix, pattern: "11METH",    canonical: "Year 11 Methods", short: "Maths"}
+
+  # Sciences
+  - {match: prefix, pattern: "11BIO",     canonical: "Year 11 Biology", short: "Bio"}
+  - {match: prefix, pattern: "11CHEM",    canonical: "Year 11 Chemistry", short: "Chem"}
+  - {match: prefix, pattern: "11PHYS",    canonical: "Year 11 Physics", short: "Phys"}
+  - {match: prefix, pattern: "11PSYCH",   canonical: "Year 11 Psychology", short: "Psych"}
+
+  # English
+  - {match: prefix, pattern: "11ENG",     canonical: "Year 11 English", short: "Eng"}
+  - {match: regex,  pattern: "(?i)Year 11 English",
+     canonical: "Year 11 English", short: "Eng"}
+
+  # Humanities
+  - {match: prefix, pattern: "11LEGAL",   canonical: "Year 11 Legal Studies", short: "Legal"}
+  - {match: prefix, pattern: "11ECON",    canonical: "Year 11 Economics", short: "Econ"}
+  - {match: prefix, pattern: "11BUSMAN",  canonical: "Year 11 Business Management", short: "BusMan"}
+  - {match: prefix, pattern: "11HIST",    canonical: "Year 11 History", short: "Hist"}
+
+  # PE / Health
+  - {match: prefix, pattern: "11HHD",     canonical: "Year 11 Health & Human Dev", short: "HHD"}
+  - {match: prefix, pattern: "11PE",      canonical: "Year 11 PE",      short: "PE"}
+
+  # Languages / Arts
+  - {match: prefix, pattern: "11JAP",     canonical: "Year 11 Japanese", short: "Jap"}
+  - {match: prefix, pattern: "11ART",     canonical: "Year 11 Art",     short: "Art"}
+  - {match: prefix, pattern: "11MUS",     canonical: "Year 11 Music",   short: "Music"}
+
+  # Edrolo VCE course titles (used when course_titles lookup succeeds)
+  - {match: regex,  pattern: "VCE Biology.*",   canonical: "Year 11 Biology",  short: "Bio"}
+  - {match: regex,  pattern: "VCE Chemistry.*", canonical: "Year 11 Chemistry", short: "Chem"}
+  - {match: regex,  pattern: "VCE Physics.*",   canonical: "Year 11 Physics", short: "Phys"}
+  - {match: regex,  pattern: "VCE Psychology.*", canonical: "Year 11 Psychology", short: "Psych"}
+  - {match: regex,  pattern: "VCE English.*",   canonical: "Year 11 English", short: "Eng"}
+  - {match: regex,  pattern: "VCE Methods.*",   canonical: "Year 11 Methods", short: "Maths"}
+  - {match: regex,  pattern: "VCE General Maths.*", canonical: "Year 11 General Maths", short: "Maths"}
+
+  # Pastoral / form-class admin
+  - {match: regex,  pattern: "Year 11.*Form.*", canonical: "Year 11 Form",    short: "Form"}
+  - {match: regex,  pattern: "Year 11 SLC.*",   canonical: "Year 11 SLC",     short: "SLC"}
+  - {match: regex,  pattern: ".*[Cc]areers.*",  canonical: "Careers",          short: "Careers"}
+  - {match: regex,  pattern: ".*[Hh]eadstart.*", canonical: "Headstart",       short: "HS"}
