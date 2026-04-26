@@ -1,6 +1,7 @@
 """CLI entrypoint. Subcommands are wired in as phases land.
 
 Usage:
+    python -m homework_hub                         # run daemon (default)
     python -m homework_hub sync [--child <name>]
     python -m homework_hub auth (classroom|compass|edrolo) --child <name>
     python -m homework_hub bootstrap-sheet --child <name>
@@ -9,11 +10,13 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import click
 
 from homework_hub.config import Settings
+from homework_hub.daemon import run_daemon
 from homework_hub.orchestrator import summarise_for_humans
 from homework_hub.wiring import (
     _build_sheets_backend,
@@ -22,9 +25,17 @@ from homework_hub.wiring import (
 )
 
 
-@click.group()
-def cli() -> None:
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Homework Hub — aggregate homework from Classroom, Compass and Edrolo."""
+    if ctx.invoked_subcommand is None:
+        # Default action: start the long-running daemon (cron + /health).
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+        run_daemon(Settings())
 
 
 @cli.command()
