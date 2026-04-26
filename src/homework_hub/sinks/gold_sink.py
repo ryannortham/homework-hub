@@ -206,14 +206,20 @@ class GspreadGoldSink:
         requests: list[dict[str, Any]] = []
 
         # 1. Delete all current data rows (keep header at row index 0).
-        if ws.row_count > 1:
+        #    Use the actual populated row count, not ws.row_count (which is
+        #    the full grid capacity, e.g. 1000). Sheets rejects deleteDimension
+        #    when endIndex == row_count because it would remove all non-frozen
+        #    rows — we must leave at least one grid row.
+        all_values = ws.get_all_values()
+        populated_rows = len(all_values)  # includes header
+        if populated_rows > 1:
             requests.append({
                 "deleteDimension": {
                     "range": {
                         "sheetId": ws.id,
                         "dimension": "ROWS",
                         "startIndex": 1,
-                        "endIndex": ws.row_count,
+                        "endIndex": populated_rows,
                     }
                 }
             })
