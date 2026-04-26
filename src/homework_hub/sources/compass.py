@@ -124,21 +124,16 @@ def _resolve_student_status(lt: dict[str, Any]) -> int:
     Live responses don't carry a top-level ``status`` field at all; the only
     reliable source is the matching ``students[]`` entry (one per cohort
     member when an admin/parent token is used, one entry when fetched per
-    userId). We accept ``submissionStatus`` (the real field name) and ``status``
-    (defensive fallback in case Compass ever flattens the schema).
+    userId).
     """
     students = lt.get("students")
     if isinstance(students, list) and students:
         for s in students:
             if not isinstance(s, dict):
                 continue
-            for key in ("submissionStatus", "status"):
-                v = s.get(key)
-                if isinstance(v, int):
-                    return v
-    top = lt.get("status")
-    if isinstance(top, int):
-        return top
+            v = s.get("submissionStatus")
+            if isinstance(v, int):
+                return v
     return 0
 
 

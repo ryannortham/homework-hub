@@ -96,12 +96,14 @@ class TestMapping:
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.status is Status.SUBMITTED
 
-    def test_legacy_status_field_name_still_honoured(self, lt):
-        # Defensive fallback: if Compass ever flattens the schema and uses
-        # ``status`` on the students[] entry instead of ``submissionStatus``.
+    def test_legacy_status_field_name_no_longer_honoured(self, lt):
+        # The defensive ``status`` fallback was dropped in the medallion
+        # tail commit — only ``submissionStatus`` is read now. If Compass
+        # ever flattens the schema this needs revisiting; treat absence as
+        # NOT_STARTED rather than silently misreporting.
         lt["students"] = [{"userId": 1, "status": 1}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
-        assert t.status is Status.SUBMITTED
+        assert t.status is Status.NOT_STARTED
 
     def test_per_student_status_used_when_top_level_absent(self, lt):
         lt.pop("status", None)

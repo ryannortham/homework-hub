@@ -5,7 +5,7 @@ Two concerns live in this module:
 
 * **Scheduler** — APScheduler ``BackgroundScheduler`` configured from
   ``settings.sync_cron`` (default ``7 * * * *`` — hourly at :07). The job
-  builds a fresh ``Orchestrator`` per run so a transient failure inside
+  builds a fresh ``MedallionOrchestrator`` per run so a transient failure inside
   one source can't poison the next tick.
 
 * **Health endpoint** — FastAPI app on ``settings.health_port`` exposing a
@@ -36,7 +36,6 @@ from homework_hub.medallion_orchestrator import (
     MedallionOrchestrator,
     summarise_medallion,
 )
-from homework_hub.orchestrator import Orchestrator
 from homework_hub.state.store import StateStore
 from homework_hub.wiring import build_medallion_orchestrator
 
@@ -83,28 +82,21 @@ def build_scheduler(
 
 
 def make_sync_job(
-    orchestrator_factory: Callable[[], MedallionOrchestrator | Orchestrator],
+    orchestrator_factory: Callable[[], MedallionOrchestrator],
 ) -> Callable[[], None]:
     """Wrap a fresh-orchestrator-per-tick callable with logging.
 
     Each tick rebuilds the orchestrator so token reloads / config edits
-    take effect without restarting the daemon. Both the legacy
-    ``Orchestrator`` and the medallion variant are accepted; the
-    summary is rendered with the medallion formatter when applicable.
+    take effect without restarting the daemon.
     """
 
     def _tick() -> None:
         try:
             orchestrator = orchestrator_factory()
             report = orchestrator.run()
-            if isinstance(orchestrator, MedallionOrchestrator):
-                log.info("sync tick complete\n%s", summarise_medallion(report))
-            else:  # pragma: no cover - legacy path retained for safety
-                from homework_hub.orchestrator import summarise_for_humans
-
-                log.info("sync tick complete\n%s", summarise_for_humans(report))
+            log.info("sync tick complete\n%s", summarise_medallion(report))
         except Exception:
-            # Never let an exception propagate out of an APScheduler job \u2014
+            # Never let an exception propagate out of an APScheduler job —
             # it would tear down the scheduler thread.
             log.exception("sync tick crashed")
 

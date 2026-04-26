@@ -338,14 +338,16 @@ class TestSyncRuns:
 
 
 class TestSchemaCoexistence:
-    """Medallion tables coexist with legacy seen_tasks/auth_status (M1)."""
+    """Medallion tables coexist with auth_status (M1)."""
 
-    def test_legacy_tables_still_present(self, conn: sqlite3.Connection):
+    def test_seen_tasks_removed(self, conn: sqlite3.Connection):
+        # Legacy ``seen_tasks`` ledger was dropped in the medallion tail
+        # commit; bronze/silver are the system of record now.
         names = {
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
-        assert "seen_tasks" in names
+        assert "seen_tasks" not in names
         assert "auth_status" in names
 
     def test_all_medallion_tables_present(self, conn: sqlite3.Connection):

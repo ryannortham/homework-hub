@@ -1,16 +1,18 @@
-"""Google Sheets API client — wraps service-account auth + bootstrap + sync writes.
+"""Google Sheets API client — service-account auth + sheet bootstrap.
 
 Two API surfaces are used together:
 
 - ``googleapiclient.discovery`` for ``spreadsheets.create`` and
   ``spreadsheets.batchUpdate`` (needed to apply the template; gspread
-  doesn't expose the full update-cells / addConditionalFormatRule surface).
-- ``gspread`` for the per-sync read of the Raw tab, in-place row updates,
-  and the bottom-append. Faster to write against and handles range/A1
-  conversions cleanly.
+  doesn't expose the full update-cells / addTable / setDataValidation
+  surface).
+- ``gspread`` for the post-create share() (cleaner than driveapi's
+  permissions endpoint).
 
-This module isolates all live Google API calls behind a small interface so
-the orchestrator can be unit-tested with a fake.
+This module only handles **sheet bootstrap**. Per-sync reads and writes
+live in :class:`homework_hub.sinks.gold_sink.GspreadGoldSink`, which is
+constructed against either the SA (daemon) or the human bootstrap user
+(``homework-hub bootstrap-sheet``).
 """
 
 from __future__ import annotations
@@ -24,8 +26,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from homework_hub.sheet_template import bootstrap_requests
-from homework_hub.sinks.sheets import RAW_HEADERS
-from homework_hub.sinks.sheets_diff import RawDiff
 
 # Scopes needed for: create sheet, batchUpdate (apply template), read/write
 # values, share via drive API. The drive scope is needed by gspread.share().
@@ -34,21 +34,15 @@ DEFAULT_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-RAW_TAB_NAME = "Raw"
-
 
 class SheetsAPIError(Exception):
     """Raised when the Sheets API returns an unrecoverable error."""
 
 
 class SheetsBackend(Protocol):
-    """Interface the orchestrator depends on; lets tests inject a fake."""
+    """Minimal interface used by ``bootstrap-sheet``; lets tests inject a fake."""
 
     def create_sheet(self, title: str, *, share_with: list[str] | None = None) -> str: ...
-
-    def read_raw_rows(self, spreadsheet_id: str) -> list[list[str]]: ...
-
-    def apply_diff(self, spreadsheet_id: str, diff: RawDiff) -> None: ...
 
 
 def load_service_account_credentials(
@@ -64,11 +58,10 @@ def load_service_account_credentials(
 
 
 class SheetsClient:
-    """Concrete SheetsBackend backed by the live Google APIs."""
+    """Concrete :class:`SheetsBackend` backed by the live Google APIs."""
 
     def __init__(self, credentials: Credentials):
         self._credentials = credentials
-        # Lazy: only construct the discovery service once needed.
         self._sheets_service: Any | None = None
         self._gspread_client: gspread.Client | None = None
 
@@ -124,62 +117,3 @@ class SheetsClient:
                 sh.share(email, perm_type="user", role="writer", notify=False)
 
         return spreadsheet_id
-
-    # ------------------------------------------------------------------ #
-    # Raw-tab read + diff apply
-    # ------------------------------------------------------------------ #
-
-    def read_raw_rows(self, spreadsheet_id: str) -> list[list[str]]:
-        """Return all rows currently on the Raw tab, including the header."""
-        sh = self._gspread().open_by_key(spreadsheet_id)
-        try:
-            ws = sh.worksheet(RAW_TAB_NAME)
-        except gspread.WorksheetNotFound as exc:
-            raise SheetsAPIError(
-                f"Spreadsheet {spreadsheet_id} has no '{RAW_TAB_NAME}' tab — "
-                "was it bootstrapped via `homework-hub bootstrap-sheet`?"
-            ) from exc
-        return ws.get_all_values()
-
-    def apply_diff(self, spreadsheet_id: str, diff: RawDiff) -> None:
-        """Apply a precomputed RawDiff to the Raw tab.
-
-        Strategy:
-        - In-place updates: one batch_update call grouping all changed rows.
-        - Appends: a single batch range write at ``next_append_row``.
-        Both no-ops are skipped to avoid empty API calls.
-        """
-        if not diff.updates and not diff.appends:
-            return
-
-        sh = self._gspread().open_by_key(spreadsheet_id)
-        ws = sh.worksheet(RAW_TAB_NAME)
-
-        last_col = _col_letter(len(RAW_HEADERS))
-
-        if diff.updates:
-            data: list[dict[str, Any]] = []
-            for row_num, values in diff.updates.items():
-                # ``Worksheet.batch_update`` prepends the worksheet title to the
-                # range itself, so the range value here MUST be sheet-relative
-                # (no ``Raw!`` prefix), otherwise the API receives ``Raw!Raw!…``.
-                rng = f"A{row_num}:{last_col}{row_num}"
-                data.append({"range": rng, "values": [values]})
-            ws.batch_update(data, value_input_option="USER_ENTERED")
-
-        if diff.appends:
-            start_row = diff.next_append_row
-            end_row = start_row + len(diff.appends) - 1
-            rng = f"A{start_row}:{last_col}{end_row}"
-            ws.update(values=diff.appends, range_name=rng, value_input_option="USER_ENTERED")
-
-
-def _col_letter(n: int) -> str:
-    """Convert 1-based column number to A1 letters (1 -> A, 27 -> AA)."""
-    if n < 1:
-        raise ValueError(f"column index must be >= 1, got {n}")
-    letters = ""
-    while n:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(ord("A") + rem) + letters
-    return letters

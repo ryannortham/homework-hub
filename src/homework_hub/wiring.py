@@ -1,12 +1,13 @@
-"""Composition root — builds the orchestrator from runtime config.
+"""Composition root — builds the medallion orchestrator from runtime config.
 
-The CLI and (later) the daemon both call ``build_orchestrator`` with a
+The CLI and daemon both call ``build_medallion_orchestrator`` with a
 ``Settings`` to get a wired-up orchestrator. Tests bypass this module and
 construct components directly with fakes.
 
 Kept deliberately simple: read ``children.yaml``, instantiate one Source
 per (child, source) pair from config, load tokens from the ``tokens_dir``,
-and pass the collection plus a real ``SheetsClient`` to ``Orchestrator``.
+build a live :class:`GspreadGoldSink` from BW-stored SA creds (or skip
+gracefully if BW is unavailable).
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from typing import Any
 
 from homework_hub.config import ChildrenConfig, Settings
 from homework_hub.medallion_orchestrator import MedallionOrchestrator
-from homework_hub.orchestrator import Orchestrator
 from homework_hub.pipeline.publish import GoldSink
 from homework_hub.secrets import BitwardenCLI, from_env
 from homework_hub.sinks.gold_sink import GspreadGoldSink
@@ -32,29 +32,6 @@ from homework_hub.state.store import StateStore
 log = logging.getLogger(__name__)
 
 SERVICE_ACCOUNT_BW_NAME = "Homework Hub - Sheets Service Account"
-
-
-def build_orchestrator(
-    settings: Settings,
-    *,
-    sheets_backend: SheetsBackend | None = None,
-    bw: BitwardenCLI | None = None,
-) -> Orchestrator:
-    """Construct a (legacy) Orchestrator wired from config + tokens on disk.
-
-    Kept for the bootstrap-sheet path (it still uses ``SheetsBackend``)
-    and for callers that have not been migrated to the medallion flow.
-    """
-    children_config = ChildrenConfig.load(settings.children_yaml)
-    sources_for_child = _build_sources(settings, children_config)
-    state = StateStore(settings.state_db)
-    backend = sheets_backend or _build_sheets_backend(bw)
-    return Orchestrator(
-        children_config=children_config,
-        sources_for_child=sources_for_child,
-        sheets=backend,
-        state=state,
-    )
 
 
 def build_medallion_orchestrator(
@@ -162,13 +139,6 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
     return out
 
 
-def _build_sheets_backend(bw: BitwardenCLI | None = None) -> SheetsBackend:
-    bw = bw or from_env()
-    raw = bw.get_notes(SERVICE_ACCOUNT_BW_NAME)
-    creds = load_service_account_credentials(raw)
-    return SheetsClient(creds)
-
-
 def build_bootstrap_sheets_backend(
     settings: Settings, *, bw: BitwardenCLI | None = None
 ) -> tuple[SheetsBackend, str]:
@@ -220,7 +190,6 @@ def write_sheet_id_to_config(children_yaml: Path, child: str, sheet_id: str) -> 
 __all__: list[str] = [
     "build_bootstrap_sheets_backend",
     "build_medallion_orchestrator",
-    "build_orchestrator",
     "write_sheet_id_to_config",
 ]
 
