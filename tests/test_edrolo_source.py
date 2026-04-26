@@ -22,13 +22,14 @@ from homework_hub.sources.edrolo import (
     EdroloStorageState,
     _extract_tasks_payload,
     _parse_dt,
+    is_active_edrolo_task,
     map_edrolo_task_to_task,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def _load(name: str) -> dict:
+def _load(name: str):
     return json.loads((FIXTURES / name).read_text())
 
 
@@ -42,93 +43,71 @@ def storage_raw():
     return _load("edrolo_storage_state.json")
 
 
+@pytest.fixture
+def course_titles():
+    return {str(c["id"]): c["title"] for c in _load("edrolo_courses.json")}
+
+
 # --------------------------------------------------------------------------- #
 # Pure mapping
 # --------------------------------------------------------------------------- #
 
 
 class TestMapping:
-    def test_basic_mapping(self, task):
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
+    def test_basic_mapping(self, task, course_titles):
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
         assert t.source is SourceEnum.EDROLO
         assert t.source_id == "99821"
         assert t.child == "james"
-        assert t.subject == "Mathematical Methods 3/4"
-        assert t.title == "Chapter 4 — Calculus Practice"
+        assert t.subject == "VCE Biology Units 3&4 [2026]"
+        assert t.title == "11BIO 3 - Chapter 4 Practice"
         assert t.status is Status.NOT_STARTED
-        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
+        assert t.url == "https://app.edrolo.com/studyplanner/tasks/99821/"
 
-    def test_due_date_parsed(self, task):
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
+    def test_due_date_parsed(self, task, course_titles):
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
         assert t.due_at == datetime(2026, 5, 2, 13, 0, 0, tzinfo=UTC)
 
-    def test_assigned_at_parsed(self, task):
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
+    def test_assigned_at_parsed(self, task, course_titles):
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
         assert t.assigned_at == datetime(2026, 4, 20, 8, 0, 0, tzinfo=UTC)
 
-    def test_status_submitted_via_string(self, task):
-        task["status"] = "submitted"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
+    def test_status_completed_via_assignment(self, task, course_titles):
+        task["task_assignments"][0]["completion_status"] = "COMPLETED"
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
         assert t.status is Status.SUBMITTED
+        assert t.status_raw == "completed"
 
-    def test_status_graded_via_string(self, task):
-        task["status"] = "graded"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.status is Status.GRADED
-
-    def test_status_inferred_from_submitted_at(self, task):
-        del task["status"]
-        task["submitted_at"] = "2026-04-30T10:00:00Z"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.status is Status.SUBMITTED
-        assert t.status_raw == "submitted"
-
-    def test_status_inferred_from_graded_at(self, task):
-        del task["status"]
-        task["graded_at"] = "2026-04-30T10:00:00Z"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.status is Status.GRADED
-
-    def test_status_inferred_from_started_at(self, task):
-        del task["status"]
-        task["started_at"] = "2026-04-22T10:00:00Z"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
+    def test_status_in_progress_via_assignment(self, task, course_titles):
+        task["task_assignments"][0]["completion_status"] = "IN_PROGRESS"
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
         assert t.status is Status.IN_PROGRESS
+        assert t.status_raw == "in_progress"
 
-    def test_unknown_status_falls_back_to_not_started(self, task):
-        task["status"] = "wibble"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.status is Status.NOT_STARTED
-        assert t.status_raw == "wibble"
+    def test_status_archived_overrides_assignment(self, task, course_titles):
+        task["resolved_stage"] = "ARCHIVED"
+        task["task_assignments"][0]["completion_status"] = "NOT_STARTED"
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
+        assert t.status is Status.SUBMITTED
+        assert t.status_raw == "archived"
 
-    def test_default_url_when_missing(self, task):
-        del task["url"]
+    def test_unknown_course_id_falls_back(self, task):
+        # No course_titles passed → subject defaults to "Edrolo".
         t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
+        assert t.subject == "Edrolo"
 
-    def test_alternate_subject_field(self, task):
-        del task["course_name"]
-        task["subject"] = "Physics"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.subject == "Physics"
+    def test_default_url_uses_studyplanner_path(self, task, course_titles):
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
+        assert t.url == "https://app.edrolo.com/studyplanner/tasks/99821/"
 
-    def test_nested_course_object(self, task):
-        del task["course_name"]
-        task["course"] = {"id": 5, "name": "Chemistry"}
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.subject == "Chemistry"
+    def test_description_for_spaced_retrieval(self, task, course_titles):
+        task["type"] = "spaced_retrieval"
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
+        assert "spaced retrieval" in t.description.lower()
 
-    def test_alternate_title_field(self, task):
-        del task["title"]
-        task["name"] = "Quiz 5"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.title == "Quiz 5"
-
-    def test_uuid_id_accepted(self, task):
-        del task["id"]
-        task["uuid"] = "abc-123-def"
-        t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.source_id == "abc-123-def"
+    def test_description_for_created(self, task, course_titles):
+        t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
+        assert "teacher" in t.description.lower()
 
     def test_missing_id_raises(self, task):
         del task["id"]
@@ -152,6 +131,36 @@ class TestMapping:
         assert _parse_dt("not a date") is None
         assert _parse_dt(None) is None
         assert _parse_dt("") is None
+
+
+# --------------------------------------------------------------------------- #
+# Active-task filter
+# --------------------------------------------------------------------------- #
+
+
+class TestIsActiveEdroloTask:
+    def test_open_not_started_is_active(self, task):
+        assert is_active_edrolo_task(task) is True
+
+    def test_archived_is_inactive(self, task):
+        task["resolved_stage"] = "ARCHIVED"
+        assert is_active_edrolo_task(task) is False
+
+    def test_closed_is_inactive(self, task):
+        task["resolved_stage"] = "CLOSED"
+        assert is_active_edrolo_task(task) is False
+
+    def test_completed_assignment_is_inactive(self, task):
+        task["task_assignments"][0]["completion_status"] = "COMPLETED"
+        assert is_active_edrolo_task(task) is False
+
+    def test_soft_deleted_is_inactive(self, task):
+        task["soft_deleted"] = True
+        assert is_active_edrolo_task(task) is False
+
+    def test_in_progress_is_active(self, task):
+        task["task_assignments"][0]["completion_status"] = "IN_PROGRESS"
+        assert is_active_edrolo_task(task) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -228,12 +237,25 @@ class TestEdroloClient:
         result = client.get_tasks()
 
         assert "/api/v1/student-tasks/" in captured["url"]
-        assert "task_type=all" in captured["url"]
         assert "sessionid=fake-session-abc123" in captured["headers"]["cookie"]
         assert captured["headers"]["x-requested-with"] == "XMLHttpRequest"
         assert isinstance(result, list)
-        assert len(result) == 2
+        assert len(result) == 3
         assert result[0]["id"] == 99821
+
+    def test_get_courses_happy_path(self, storage_raw):
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, json=_load("edrolo_courses.json"))
+
+        client = self._client(handler, storage_raw)
+        result = client.get_courses()
+
+        assert "/api/v1/my-courses/" in captured["url"]
+        assert len(result) == 2
+        assert result[0]["title"] == "VCE Biology Units 3&4 [2026]"
 
     def test_302_translates_to_auth_expired(self, storage_raw):
         client = self._client(
@@ -304,8 +326,9 @@ class TestExtractTasksPayload:
 
 
 class FakeEdroloClient:
-    def __init__(self, raw_tasks: list[dict]):
+    def __init__(self, raw_tasks: list[dict], raw_courses: list[dict] | None = None):
         self.raw_tasks = raw_tasks
+        self.raw_courses = raw_courses or []
         self.calls: list[EdroloStorageState] = []
 
     def __enter__(self):
@@ -317,6 +340,9 @@ class FakeEdroloClient:
     def get_tasks(self) -> list[dict]:
         return self.raw_tasks
 
+    def get_courses(self) -> list[dict]:
+        return self.raw_courses
+
 
 class TestEdroloSource:
     def _save_storage(self, tmp_path: Path, storage_raw, name: str) -> Path:
@@ -327,12 +353,13 @@ class TestEdroloSource:
     def test_fetch_uses_per_child_storage_path(self, tmp_path: Path, task, storage_raw):
         james_path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
         tahlia_path = self._save_storage(tmp_path, storage_raw, "tahlia-edrolo.json")
+        courses = _load("edrolo_courses.json")
 
         loaded_paths: list[Path] = []
 
         def factory(storage):
             loaded_paths.append(storage.path)
-            return FakeEdroloClient([task])
+            return FakeEdroloClient([task], courses)
 
         source = EdroloSource(
             {"james": james_path, "tahlia": tahlia_path},
@@ -343,6 +370,7 @@ class TestEdroloSource:
         assert len(tasks) == 1
         assert tasks[0].child == "james"
         assert tasks[0].source_id == "99821"
+        assert tasks[0].subject == "VCE Biology Units 3&4 [2026]"
 
     def test_unknown_child_raises_schema_break(self, tmp_path: Path, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
@@ -358,14 +386,17 @@ class TestEdroloSource:
         with pytest.raises(AuthExpiredError):
             source.fetch("james")
 
-    def test_response_passed_through_mapper(self, tmp_path: Path, storage_raw):
+    def test_archived_and_completed_filtered_out(self, tmp_path: Path, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
-        raw = _load("edrolo_response.json")["results"]
+        raw_tasks = _load("edrolo_response.json")
+        courses = _load("edrolo_courses.json")
+        # Fixture has 3 tasks: one open, one completed, one archived.
+        # Only the open one should survive.
         source = EdroloSource(
             {"james": path},
-            client_factory=lambda _s: FakeEdroloClient(raw),
+            client_factory=lambda _s: FakeEdroloClient(raw_tasks, courses),
         )
         tasks = source.fetch("james")
-        assert len(tasks) == 2
-        # Second task has submitted_at → status inferred as SUBMITTED
-        assert tasks[1].status is Status.SUBMITTED
+        assert len(tasks) == 1
+        assert tasks[0].source_id == "99821"
+        assert tasks[0].status is Status.NOT_STARTED

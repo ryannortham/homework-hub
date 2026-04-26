@@ -12,22 +12,26 @@ Split architecture (mirrors Compass):
 - ``map_edrolo_task_to_task``: pure dict → Task. Fully unit-tested.
 - ``EdroloStorageState``: load/save the Playwright ``storage_state.json``;
   exposes the cookie jar Edrolo's API needs (``sessionid``, ``csrftoken``).
-- ``EdroloClient``: thin httpx wrapper around the suspected REST API.
-  Endpoint paths and response envelope are best-guess based on Edrolo's
-  Django stack (see DEVTOOLS_NEEDED below) — verify on first headed login
-  by running the browser with DevTools and capturing requests, then update
-  ``API_TASKS_PATH`` and the mapper to match reality.
+- ``EdroloClient``: thin httpx wrapper around the confirmed REST API.
 - ``EdroloSource``: per-child Source.fetch implementation.
 
-DEVTOOLS_NEEDED:
-    On first headed login, open DevTools → Network → XHR, browse to the
-    student dashboard / tasks page, and capture:
-      1. The exact URL of the tasks/assignments listing endpoint
-      2. The full response JSON shape (including any envelope like {results: [...]})
-      3. The fields used for: id, title, due date, status, subject/course, url
-    Then update ``API_TASKS_PATH``, ``_extract_tasks_payload``, and
-    ``map_edrolo_task_to_task`` to match. The current values are defensive
-    guesses based on standard Django REST Framework conventions.
+API shape confirmed via DevTools sniffing (see ``scripts/sniff_edrolo_api.py``):
+
+- ``GET /api/v1/student-tasks/`` — bare endpoint returns a flat list of all
+  tasks for the logged-in student (both ``created`` and ``spaced_retrieval``
+  types, all stages including ARCHIVED). The SPA's paginated variants apply
+  filters that we deliberately don't reproduce; we filter client-side.
+- ``GET /api/v1/my-courses/`` — flat list of the student's enrolled courses.
+  Used to translate ``course_ids: ["66921"]`` → ``"VCE Biology Units 3&4"``.
+
+Task fields we use::
+
+    id, title, start_datetime, due_datetime, type ('created'|'spaced_retrieval'),
+    resolved_stage ('ARCHIVED'|'OPEN'|...), soft_deleted (bool),
+    course_ids (list of str), task_assignments[0].completion_status
+
+We surface only **active** tasks: ``resolved_stage != "ARCHIVED"``,
+``not soft_deleted``, and the assignment's ``completion_status != "COMPLETED"``.
 """
 
 from __future__ import annotations
@@ -52,19 +56,12 @@ from homework_hub.sources.base import (
 # Edrolo serves its app under the apex domain.
 DEFAULT_BASE_URL = "https://app.edrolo.com"
 
-# Confirmed via DevTools sniffing on app.edrolo.com (2026-04). The SPA's
-# studyplanner uses /api/v1/student-tasks/ with multi-valued ``assignment_stage``
-# filters and ``task_type=all`` to fetch the full per-student task list. The
-# response is DRF-paginated (``count``/``next``/``results``).
+# Confirmed via DevTools sniffing on app.edrolo.com (2026-04). The bare
+# endpoint returns a flat list of *all* tasks (no envelope, no pagination).
+# We filter client-side rather than try to encode Edrolo's many overlapping
+# query-param conventions.
 API_TASKS_PATH = "/api/v1/student-tasks/"
-API_TASKS_QUERY: tuple[tuple[str, str], ...] = (
-    ("page_size", "100"),
-    ("assignment_stage", "NOT_STARTED"),
-    ("assignment_stage", "IN_PROGRESS"),
-    ("assignment_stage", "COMPLETED"),
-    ("assignment_stage", "CLOSED"),
-    ("task_type", "all"),
-)
+API_COURSES_PATH = "/api/v1/my-courses/"
 
 # Browser-like UA so we don't stand out from a logged-in session.
 DEFAULT_USER_AGENT = (
@@ -72,21 +69,11 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Edrolo task status — best guess. DRF apps commonly use string enums or
-# booleans like ``submitted``/``completed_at``. Map liberally; unknown values
-# fall back to NOT_STARTED so we err toward "still to do".
-_STATUS_MAP: dict[str, Status] = {
-    "not_started": Status.NOT_STARTED,
-    "pending": Status.NOT_STARTED,
-    "open": Status.NOT_STARTED,
-    "in_progress": Status.IN_PROGRESS,
-    "started": Status.IN_PROGRESS,
-    "submitted": Status.SUBMITTED,
-    "completed": Status.SUBMITTED,
-    "complete": Status.SUBMITTED,
-    "graded": Status.GRADED,
-    "marked": Status.GRADED,
-    "returned": Status.GRADED,
+# Edrolo's task_assignments[].completion_status enum.
+_COMPLETION_STATUS_MAP: dict[str, Status] = {
+    "NOT_STARTED": Status.NOT_STARTED,
+    "IN_PROGRESS": Status.IN_PROGRESS,
+    "COMPLETED": Status.SUBMITTED,
 }
 
 
@@ -95,42 +82,42 @@ _STATUS_MAP: dict[str, Status] = {
 # --------------------------------------------------------------------------- #
 
 
-def map_edrolo_task_to_task(*, child: str, edrolo_task: dict[str, Any]) -> Task:
+def map_edrolo_task_to_task(
+    *,
+    child: str,
+    edrolo_task: dict[str, Any],
+    course_titles: dict[str, str] | None = None,
+) -> Task:
     """Translate one Edrolo task dict into a canonical Task.
 
-    Field names are best-guess; verify against captured DevTools responses.
-    Synonyms are accepted for resilience across API revisions.
+    ``course_titles`` maps stringified ``course_id`` → human-readable course
+    title (e.g. ``"66921" -> "VCE Biology Units 3&4 [2026]"``). Tasks may
+    reference course IDs from previous years that aren't in the current
+    enrolment list — those fall back to ``"Edrolo"``.
     """
-    task_id = edrolo_task.get("id") or edrolo_task.get("uuid") or edrolo_task.get("pk")
-    title = edrolo_task.get("title") or edrolo_task.get("name") or edrolo_task.get("display_name")
+    task_id = edrolo_task.get("id")
+    title = edrolo_task.get("title")
     if task_id is None or not title:
         raise SchemaBreakError(f"Edrolo task missing id/title: keys={list(edrolo_task.keys())}")
 
-    subject = (
-        edrolo_task.get("course_name")
-        or edrolo_task.get("subject_name")
-        or edrolo_task.get("subject")
-        or _nested_str(edrolo_task.get("course"), "name")
-        or _nested_str(edrolo_task.get("subject_obj"), "name")
-        or ""
-    )
+    course_titles = course_titles or {}
+    course_ids = edrolo_task.get("course_ids") or []
+    subject_titles = [course_titles[str(cid)] for cid in course_ids if str(cid) in course_titles]
+    subject = subject_titles[0] if subject_titles else "Edrolo"
 
-    description = edrolo_task.get("description") or edrolo_task.get("instructions") or ""
+    assigned_at = _parse_dt(edrolo_task.get("start_datetime"))
+    due_at = _parse_dt(edrolo_task.get("due_datetime"))
 
-    assigned_at = _parse_dt(
-        edrolo_task.get("assigned_at")
-        or edrolo_task.get("created_at")
-        or edrolo_task.get("set_at")
-        or edrolo_task.get("start_date")
-    )
-    due_at = _parse_dt(
-        edrolo_task.get("due_at") or edrolo_task.get("due_date") or edrolo_task.get("deadline")
-    )
+    status_raw, status = _resolve_status(edrolo_task)
 
-    status_raw = _resolve_status_raw(edrolo_task)
-    status = _STATUS_MAP.get(status_raw.lower(), Status.NOT_STARTED)
+    description = ""
+    task_type = edrolo_task.get("type")
+    if task_type == "spaced_retrieval":
+        description = "Edrolo revision (spaced retrieval)"
+    elif task_type == "created":
+        description = "Edrolo task (teacher-set)"
 
-    url = edrolo_task.get("url") or edrolo_task.get("absolute_url") or _build_default_url(task_id)
+    url = _build_default_url(task_id)
 
     return Task(
         source=SourceEnum.EDROLO,
@@ -147,33 +134,46 @@ def map_edrolo_task_to_task(*, child: str, edrolo_task: dict[str, Any]) -> Task:
     )
 
 
-def _resolve_status_raw(t: dict[str, Any]) -> str:
-    """Edrolo may report status as a string, a bool, or via timestamps."""
-    explicit = t.get("status") or t.get("state")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    # Common DRF idiom: completed_at / submitted_at non-null implies done.
-    if t.get("graded_at") or t.get("marked_at"):
-        return "graded"
-    if t.get("submitted_at") or t.get("completed_at"):
-        return "submitted"
-    if t.get("started_at"):
-        return "in_progress"
-    if isinstance(t.get("is_complete"), bool) and t["is_complete"]:
-        return "submitted"
-    return "not_started"
+def _resolve_status(t: dict[str, Any]) -> tuple[str, Status]:
+    """Derive (raw, canonical) status from Edrolo's nested assignment record."""
+    assignments = t.get("task_assignments") or []
+    completion = ""
+    if assignments and isinstance(assignments[0], dict):
+        completion = (assignments[0].get("completion_status") or "").upper()
+
+    resolved = (t.get("resolved_stage") or "").upper()
+
+    # Archived/closed always means the work is no longer outstanding. We map
+    # to SUBMITTED for canonical bucketing; the upstream filter in
+    # ``EdroloSource`` drops these before they ever get here in the normal
+    # path, but be safe in case the filter is ever loosened.
+    if resolved in ("ARCHIVED", "CLOSED"):
+        return resolved.lower(), Status.SUBMITTED
+
+    if completion in _COMPLETION_STATUS_MAP:
+        return completion.lower(), _COMPLETION_STATUS_MAP[completion]
+
+    return "not_started", Status.NOT_STARTED
 
 
-def _nested_str(obj: Any, key: str) -> str:
-    if isinstance(obj, dict):
-        v = obj.get(key)
-        if isinstance(v, str):
-            return v
-    return ""
+def is_active_edrolo_task(t: dict[str, Any]) -> bool:
+    """Return True if the task is outstanding (not archived/done/deleted)."""
+    if t.get("soft_deleted"):
+        return False
+    if (t.get("resolved_stage") or "").upper() in ("ARCHIVED", "CLOSED"):
+        return False
+    assignments = t.get("task_assignments") or []
+    return not (
+        assignments
+        and isinstance(assignments[0], dict)
+        and (assignments[0].get("completion_status") or "").upper() == "COMPLETED"
+    )
 
 
 def _build_default_url(task_id: Any) -> str:
-    return f"{DEFAULT_BASE_URL}/student/tasks/{task_id}/"
+    # The SPA presents tasks under the studyplanner namespace; this URL form
+    # opens the task detail view in a logged-in browser.
+    return f"{DEFAULT_BASE_URL}/studyplanner/tasks/{task_id}/"
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -341,8 +341,12 @@ class EdroloClient:
             self._client.close()
 
     def get_tasks(self) -> list[dict[str, Any]]:
-        """Fetch all tasks for the logged-in student."""
-        return self._get_json(API_TASKS_PATH, params=API_TASKS_QUERY)
+        """Fetch all tasks for the logged-in student (flat list, no filters)."""
+        return self._get_json(API_TASKS_PATH)
+
+    def get_courses(self) -> list[dict[str, Any]]:
+        """Fetch the student's enrolled courses (used for course_id → title)."""
+        return self._get_json(API_COURSES_PATH)
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -436,4 +440,15 @@ class EdroloSource(Source):
         storage = EdroloStorageState.load(path)
         with self._client_factory(storage) as client:
             raw_tasks = client.get_tasks()
-        return [map_edrolo_task_to_task(child=child, edrolo_task=t) for t in raw_tasks]
+            raw_courses = client.get_courses()
+
+        course_titles = {
+            str(c["id"]): c.get("title", "")
+            for c in raw_courses
+            if isinstance(c, dict) and "id" in c
+        }
+        active_tasks = [t for t in raw_tasks if is_active_edrolo_task(t)]
+        return [
+            map_edrolo_task_to_task(child=child, edrolo_task=t, course_titles=course_titles)
+            for t in active_tasks
+        ]
