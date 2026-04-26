@@ -142,7 +142,7 @@ class TestSeedRow:
                 continue
             for cell in uc["rows"][0]["values"]:
                 f = cell.get("userEnteredValue", {}).get("formulaValue", "")
-                if "[@Due]" in f:
+                if "TODAY()" in f and "C2" in f:
                     return
         raise AssertionError("Days formula not seeded on Tasks row 2")
 

@@ -224,26 +224,10 @@ class GspreadGoldSink:
                 }
             })
 
-        # 2. Write fresh data rows via updateCells (one cell-value dict per
-        #    cell so formulas, booleans, numbers and strings each use the
-        #    correct Sheets API value type).
-        if encoded:
-            requests.append({
-                "updateCells": {
-                    "rows": [
-                        {"values": [_to_cell_value(v) for v in row]}
-                        for row in encoded
-                    ],
-                    "fields": "userEnteredValue",
-                    "start": {
-                        "sheetId": ws.id,
-                        "rowIndex": 1,       # 0-based → row 2
-                        "columnIndex": 0,
-                    },
-                }
-            })
-
-        # 3. Resize the Table to cover header + all data rows.
+        # 2. Resize the Table *before* writing data so that structured column
+        #    references in formula cells (e.g. ``=[@Due]-TODAY()``) resolve
+        #    correctly — they only work when the cell is inside a named Table
+        #    column.  endRowIndex = 1 header + len(encoded) data rows.
         requests.append({
             "updateTable": {
                 "table": {
@@ -260,6 +244,32 @@ class GspreadGoldSink:
                 "fields": "range",
             }
         })
+
+        # 3. Write fresh data rows via updateCells with explicit cell value
+        #    dicts so formulas, booleans, numbers and strings each use the
+        #    correct Sheets API value type — no server-side deduplication.
+        #    Formula templates containing ``{row}`` are substituted with the
+        #    1-based row number (data starts at row 2 of the sheet).
+        if encoded:
+            requests.append({
+                "updateCells": {
+                    "rows": [
+                        {"values": [
+                            _to_cell_value(
+                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v
+                            )
+                            for v in row
+                        ]}
+                        for i, row in enumerate(encoded)
+                    ],
+                    "fields": "userEnteredValue",
+                    "start": {
+                        "sheetId": ws.id,
+                        "rowIndex": 1,       # 0-based → row 2
+                        "columnIndex": 0,
+                    },
+                }
+            })
 
         disc.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,

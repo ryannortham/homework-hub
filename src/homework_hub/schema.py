@@ -73,9 +73,8 @@ class ColumnSpec:
         Empty for non-dropdown columns.
     formula_template:
         For ``FORMULA`` columns, the per-row template. ``{row}`` is
-        substituted with the 1-based row number at write time. e.g.
-        ``"=[@Due]-TODAY()"`` for Sheets-Table-relative formulas, or
-        ``"=B{row}-TODAY()"`` for absolute references.
+        substituted with the 1-based row number at write time, e.g.
+        ``"=C{row}-TODAY()"`` where C is the absolute column letter for Due.
     width_px:
         Optional column-width hint applied at bootstrap time. ``None``
         leaves Sheets' default (100px).
@@ -162,7 +161,7 @@ TASKS_TAB = TabSpec(
             key="days",
             header="Days",
             kind=ColumnKind.FORMULA,
-            formula_template="=[@Due]-TODAY()",
+            formula_template="=C{row}-TODAY()",
             width_px=70,
         ),
         ColumnSpec(

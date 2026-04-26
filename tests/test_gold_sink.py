@@ -276,7 +276,7 @@ def test_to_cell_value_number():
 
 
 def test_to_cell_value_formula():
-    assert _to_cell_value("=[@Due]-TODAY()") == {"userEnteredValue": {"formulaValue": "=[@Due]-TODAY()"}}
+    assert _to_cell_value("=C2-TODAY()") == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}
 
 
 def test_to_cell_value_string():
@@ -298,27 +298,28 @@ def _single_batch_requests(sink: GspreadGoldSink) -> list[dict]:
 
 
 def test_write_table_tab_single_batchupdate_with_all_requests():
-    """All three operations (deleteDimension, updateCells, updateTable) go in
-    one batchUpdate call for efficiency."""
+    """deleteDimension, updateTable, updateCells go in one batchUpdate.
+    updateTable comes before updateCells so structured column references
+    in formula cells resolve correctly (cells must be inside the Table)."""
     header = ["subject", "title", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
     ws = FakeWorksheet("Tasks", rows=[header, [""]*11], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [("Maths", "Chapter 3", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
+    rows = [("Maths", "Chapter 3", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
     assert ws.cleared == []
     assert ws.updates == []
-    assert ws.appended == []  # append_rows no longer used
+    assert ws.appended == []
 
     reqs = _single_batch_requests(sink)
     req_kinds = [list(r.keys())[0] for r in reqs]
-    assert req_kinds == ["deleteDimension", "updateCells", "updateTable"]
+    assert req_kinds == ["deleteDimension", "updateTable", "updateCells"]
 
 
 def test_write_table_tab_delete_covers_all_existing_rows():
     ws = FakeWorksheet("Tasks", rows=[["h"]] + [[""] * 11] * 5, ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
     reqs = _single_batch_requests(sink)
     del_range = reqs[0]["deleteDimension"]["range"]
     assert del_range["startIndex"] == 1
@@ -329,13 +330,15 @@ def test_write_table_tab_updatecells_uses_correct_value_types():
     """Booleans, formulas, numbers and strings each get the right cell type."""
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [("Maths", "HW", 46143, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
+    rows = [("Maths", "HW", 46143, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
     reqs = _single_batch_requests(sink)
-    cells = reqs[1]["updateCells"]["rows"][0]["values"]
+    # order: deleteDimension, updateTable, updateCells
+    cells = reqs[2]["updateCells"]["rows"][0]["values"]
     assert cells[2] == {"userEnteredValue": {"numberValue": 46143}}    # due (date serial)
-    assert cells[3] == {"userEnteredValue": {"formulaValue": "=[@Due]-TODAY()"}}  # days
+    # The sink substitutes {row} in formula templates; row index 0 = sheet row 2
+    assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}  # days
     assert cells[6] == {"userEnteredValue": {"boolValue": False}}       # done
     assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}  # subject
 
@@ -344,13 +347,14 @@ def test_write_table_tab_updatetable_endrow_covers_data_rows():
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     rows = [
-        ("Maths", "HW1", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1"),
-        ("English", "Essay", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Compass", "", "uid-2"),
-        ("Science", "Lab", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Compass", "", "uid-3"),
+        ("Maths", "HW1", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1"),
+        ("English", "Essay", None, "=C{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-2"),
+        ("Science", "Lab", None, "=C{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-3"),
     ]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
     reqs = _single_batch_requests(sink)
-    upd = reqs[2]["updateTable"]["table"]
+    # order: deleteDimension, updateTable, updateCells
+    upd = reqs[1]["updateTable"]["table"]
     assert upd["tableId"] == TASKS_TAB.table_id
     assert upd["range"]["endRowIndex"] == 4   # 1 header + 3 data rows
     assert upd["range"]["endColumnIndex"] == len(TASKS_TAB.columns)
@@ -369,13 +373,13 @@ def test_write_table_tab_empty_rows_no_updatecells_endrow_1():
 
 
 def test_write_table_tab_header_only_no_delete():
-    """Header-only sheet: no deleteDimension, just updateCells + updateTable."""
+    """Header-only sheet: no deleteDimension, just updateTable + updateCells."""
     ws = FakeWorksheet("Tasks", rows=[["h"]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
     reqs = _single_batch_requests(sink)
     req_kinds = [list(r.keys())[0] for r in reqs]
-    assert req_kinds == ["updateCells", "updateTable"]
+    assert req_kinds == ["updateTable", "updateCells"]
 
 
 def test_write_table_tab_header_only_empty_rows_only_updatetable():
@@ -399,7 +403,8 @@ def test_write_table_tab_encodes_values_correctly():
     ]
     sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
     reqs = _single_batch_requests(sink)
-    update_rows = reqs[0]["updateCells"]["rows"]  # no delete (header-only)
+    # order: updateTable, updateCells (no delete — header-only)
+    update_rows = reqs[1]["updateCells"]["rows"]
     assert update_rows[0]["values"][2] == {"userEnteredValue": {"stringValue": "High"}}
     assert update_rows[0]["values"][3] == {"userEnteredValue": {"stringValue": "2026-04-26"}}
     assert update_rows[1]["values"][2] == {"userEnteredValue": {"boolValue": True}}

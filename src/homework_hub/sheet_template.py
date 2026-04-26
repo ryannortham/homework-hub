@@ -178,7 +178,8 @@ def _seed_table_data_rows(schema: SheetSchema, sheet_ids: dict[str, int]) -> lis
         cells: list[dict[str, Any]] = []
         for col in tab.columns:
             if col.kind is ColumnKind.FORMULA:
-                cells.append(_formula_cell(col.formula_template))
+                # Seed row is row 2 (1-based); substitute {row} in template.
+                cells.append(_formula_cell(col.formula_template.format(row=2)))
             elif col.kind is ColumnKind.CHECKBOX:
                 cells.append(_bool_cell(False))
             else:

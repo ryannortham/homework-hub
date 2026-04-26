@@ -98,7 +98,7 @@ class TestProjectTasksRows:
         # Due converted to Melbourne local date (May 2).
         assert cells[_idx("due")] == date(2026, 5, 2)
         # Days written as row-relative formula for Sheets to evaluate.
-        assert cells[_idx("days")] == "=[@Due]-TODAY()"
+        assert cells[_idx("days")] == "=C{row}-TODAY()"
         assert cells[_idx("status")] == "Not started"
         assert cells[_idx("priority")] == ""
         assert cells[_idx("done")] is False
