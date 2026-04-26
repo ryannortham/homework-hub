@@ -97,8 +97,8 @@ class TestProjectTasksRows:
         assert cells[_idx("title")] == "Photosynthesis Worksheet"
         # Due converted to Melbourne local date (May 2).
         assert cells[_idx("due")] == date(2026, 5, 2)
-        # Days column left blank for Sheets formula.
-        assert cells[_idx("days")] == ""
+        # Days written as row-relative formula for Sheets to evaluate.
+        assert cells[_idx("days")] == "=[@Due]-TODAY()"
         assert cells[_idx("status")] == "Not started"
         assert cells[_idx("priority")] == ""
         assert cells[_idx("done")] is False

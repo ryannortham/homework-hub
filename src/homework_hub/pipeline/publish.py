@@ -107,8 +107,8 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
 
     Editable columns (``priority``, ``done``, ``notes``) are written as
     blank/false defaults; :func:`merge_user_edits` overlays kid overrides
-    afterwards. The ``Days`` column is left blank — Sheets fills it in
-    from the column's row-relative formula.
+    afterwards. The ``Days`` column is written as a row-relative formula
+    (``=[@Due]-TODAY()``) so Sheets evaluates it as a number on every open.
     """
     rows: list[TaskRow] = []
     for t in tasks:
@@ -116,7 +116,7 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
             "subject": t.subject or "",
             "title": t.title,
             "due": melbourne_local_date(t.due_at),
-            "days": "",  # filled by formula at write time
+            "days": TASKS_TAB.columns[TASKS_TAB.column_index("days")].formula_template,
             "status": _STATUS_DISPLAY.get(t.status.value, t.status.value),
             "priority": "",
             "done": False,
