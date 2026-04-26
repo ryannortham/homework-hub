@@ -43,9 +43,20 @@ services:
       HOMEWORK_HUB_HEALTH_PORT: "30062"
       LOG_LEVEL: INFO
       TZ: Australia/Melbourne
+      # TrueNAS host uses Cloudflare/Quad9 DNS, not Pi-hole, so the
+      # *.homelab domain doesn't resolve from inside the container.
+      # Tell the bw CLI (Node) to trust Caddy's local CA when hitting
+      # https://vaultwarden.homelab.
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/caddy-local-ca.crt
+    extra_hosts:
+      # Map vaultwarden.homelab -> the TrueNAS host IP (Caddy is bound there).
+      - "vaultwarden.homelab:192.168.1.100"
     volumes:
       - /mnt/tank/Apps/HomeworkHub/Config:/config
       - /mnt/tank/Apps/HomeworkHub/Logs:/logs
+      # Caddy's local CA -- needed by NODE_EXTRA_CA_CERTS above so bw can
+      # validate the self-signed cert behind https://vaultwarden.homelab.
+      - /mnt/tank/Apps/Caddy/Data/caddy/pki/authorities/local/root.crt:/etc/ssl/certs/caddy-local-ca.crt:ro
     ports:
       # Health endpoint -- Uptime Kuma polls this. NOT exposed via Caddy
       # (no UI; ops-only surface).
