@@ -159,7 +159,7 @@ class GspreadGoldSink:
         encoded = [[_encode_cell(v) for v in row] for row in rows]
 
         if tab.table_id:
-            self._write_table_tab(spreadsheet_id, ws, encoded)
+            self._write_table_tab(spreadsheet_id, ws, tab, encoded)
         else:
             self._write_plain_tab(ws, len(tab.columns), encoded)
 
@@ -185,19 +185,25 @@ class GspreadGoldSink:
         self,
         spreadsheet_id: str,
         ws: gspread.Worksheet,
+        tab: TabSpec,
         encoded: list[list[object]],
     ) -> None:
-        """Delete all data rows then append fresh rows for Table-backed tabs.
+        """Delete all data rows, append fresh rows, then resize the Table.
 
-        Deleting rows (rather than just clearing values) resets the Table's
-        row range back to header-only, so the subsequent ``append_rows``
-        call causes the Table to auto-extend cleanly from row 2.
+        Deleting rows resets the Table's row range back to header-only.
+        ``append_rows`` (``values.append``) writes data into the grid but
+        does NOT cause the native Table to auto-extend its range — the Table
+        widget stays frozen at its original ``endRowIndex``.  We therefore
+        follow every write with an ``updateTable`` batchUpdate to explicitly
+        set the Table range to cover header + all appended rows, which is what
+        makes column types (DATE, BOOLEAN, DROPDOWN, FORMULA) apply correctly.
         """
-        # How many rows currently exist (including header)?
+        disc = self._disc()
+
+        # 1. Delete all current data rows (keep header at row 0).
         current_row_count = ws.row_count
         if current_row_count > 1:
-            # Delete rows 2..end via batchUpdate deleteRows request.
-            self._disc().spreadsheets().batchUpdate(
+            disc.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
                     "requests": [
@@ -215,6 +221,7 @@ class GspreadGoldSink:
                 },
             ).execute()
 
+        # 2. Append new rows (grid write — Table range not updated yet).
         if encoded:
             ws.append_rows(
                 encoded,
@@ -222,6 +229,34 @@ class GspreadGoldSink:
                 insert_data_option="INSERT_ROWS",
                 table_range="A1",
             )
+
+        # 3. Resize the Table to cover header + all data rows so that column
+        #    types (DATE sort, BOOLEAN checkbox, DROPDOWN, FORMULA) apply.
+        #    endRowIndex = 1 header row + len(encoded) data rows.
+        #    When encoded is empty the Table shrinks to header-only (valid).
+        disc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateTable": {
+                            "table": {
+                                "tableId": tab.table_id,
+                                "name": tab.table_id,
+                                "range": {
+                                    "sheetId": ws.id,
+                                    "startRowIndex": 0,
+                                    "endRowIndex": 1 + len(encoded),
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": len(tab.columns),
+                                },
+                            },
+                            "fields": "range",
+                        }
+                    }
+                ]
+            },
+        ).execute()
 
     def set_tab_hidden(self, spreadsheet_id: str, tab: TabSpec, hidden: bool) -> None:
         """Toggle ``hidden`` on ``tab``."""

@@ -259,56 +259,113 @@ def test_read_duplicate_checkboxes_parses_columns_correctly():
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# write_tab — table-backed tabs (Tasks, UserEdits, Possible Duplicates)
+# --------------------------------------------------------------------------- #
+
+
+def _batch_update_bodies(sink: GspreadGoldSink) -> list[dict]:
+    """Return the body kwargs from each batchUpdate call on the discovery mock."""
+    calls = sink._discovery.spreadsheets.return_value.batchUpdate.call_args_list
+    return [c.kwargs["body"] for c in calls]
+
+
 def test_write_table_tab_deletes_data_rows_then_appends():
-    """For table-backed tabs, write_tab deletes existing data rows (keeping
-    the header) then appends new rows so the Table auto-extends."""
+    """For table-backed tabs, write_tab deletes existing data rows then appends."""
     header = ["subject", "title", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
     ws = FakeWorksheet("Tasks", rows=[header, ["", "", "", "", "", "", False, "", "", "", ""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [
-        ("Maths", "Chapter 3", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1"),
-    ]
+    rows = [("Maths", "Chapter 3", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
-    # Should NOT use plain clear/update
     assert ws.cleared == []
     assert ws.updates == []
-    # Should have called deleteDimension via discovery
-    disc = sink._discovery
-    disc.spreadsheets.return_value.batchUpdate.assert_called_once()
-    body = disc.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
-    req = body["requests"][0]["deleteDimension"]["range"]
-    assert req["sheetId"] == 1
-    assert req["dimension"] == "ROWS"
-    assert req["startIndex"] == 1  # 0-based row 2
-    assert req["endIndex"] == 2    # ws had 2 rows total
-    # Should have appended the new row
+
+    bodies = _batch_update_bodies(sink)
+    assert len(bodies) == 2
+
+    # First call: deleteDimension
+    del_req = bodies[0]["requests"][0]["deleteDimension"]["range"]
+    assert del_req["sheetId"] == 1
+    assert del_req["dimension"] == "ROWS"
+    assert del_req["startIndex"] == 1
+    assert del_req["endIndex"] == 2  # ws had 2 rows
+
+    # Second call: updateTable with endRowIndex = 1 header + 1 data row
+    upd_table = bodies[1]["requests"][0]["updateTable"]
+    assert upd_table["fields"] == "range"
+    r = upd_table["table"]["range"]
+    assert r["sheetId"] == 1
+    assert r["startRowIndex"] == 0
+    assert r["endRowIndex"] == 2  # 1 + 1 row
+    assert r["endColumnIndex"] == len(TASKS_TAB.columns)
+
     assert len(ws.appended) == 1
     assert ws.appended[0][0][0] == "Maths"
 
 
 def test_write_table_tab_skips_delete_when_header_only():
-    """If the sheet already has only the header row (row_count=1), skip delete."""
+    """If the sheet has only the header row, skip deleteDimension."""
     ws = FakeWorksheet("Tasks", rows=[["subject"]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1")])
-    disc = sink._discovery
-    disc.spreadsheets.return_value.batchUpdate.assert_not_called()
+
+    bodies = _batch_update_bodies(sink)
+    assert len(bodies) == 1  # only updateTable, no deleteDimension
+    assert "updateTable" in bodies[0]["requests"][0]
     assert len(ws.appended) == 1
 
 
 def test_write_table_tab_empty_rows_skips_append():
-    """Empty rows: deletes existing data rows but does not call append_rows."""
+    """Empty rows: deleteDimension fires if rows existed, then updateTable with endRowIndex=1."""
     ws = FakeWorksheet("Tasks", rows=[["subject"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     sink.write_tab("sheet-id", TASKS_TAB, rows=[])
-    disc = sink._discovery
-    disc.spreadsheets.return_value.batchUpdate.assert_called_once()
+
+    bodies = _batch_update_bodies(sink)
+    assert len(bodies) == 2
+
+    # deleteDimension fires because row_count > 1
+    assert "deleteDimension" in bodies[0]["requests"][0]
+    # updateTable with endRowIndex=1 (header only)
+    r = bodies[1]["requests"][0]["updateTable"]["table"]["range"]
+    assert r["endRowIndex"] == 1
+
     assert ws.appended == []
 
 
+def test_write_table_tab_empty_header_only_no_delete_updatetable_endrow_1():
+    """Header-only sheet + empty rows: only updateTable (endRowIndex=1), no delete."""
+    ws = FakeWorksheet("Tasks", rows=[["subject"]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
+
+    bodies = _batch_update_bodies(sink)
+    assert len(bodies) == 1
+    assert "updateTable" in bodies[0]["requests"][0]
+    r = bodies[0]["requests"][0]["updateTable"]["table"]["range"]
+    assert r["endRowIndex"] == 1
+    assert ws.appended == []
+
+
+def test_write_table_tab_update_table_covers_all_rows():
+    """updateTable endRowIndex equals 1 + number of appended rows."""
+    ws = FakeWorksheet("UserEdits", rows=[["task_uid"]], ws_id=2)
+    sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
+    rows = [
+        ("uid-1", "priority", "High", "2026-04-26"),
+        ("uid-2", "done", "TRUE", "2026-04-26"),
+        ("uid-3", "notes", "hello", "2026-04-26"),
+    ]
+    sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
+
+    bodies = _batch_update_bodies(sink)
+    upd = bodies[-1]["requests"][0]["updateTable"]["table"]["range"]
+    assert upd["endRowIndex"] == 4  # 1 header + 3 data rows
+
+
 def test_write_table_tab_encodes_values_correctly():
-    """Rows written via append_rows are encoded the same as plain tabs."""
+    """Rows passed to append_rows are fully encoded."""
     ws = FakeWorksheet("UserEdits", rows=[["task_uid"]], ws_id=2)
     sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
     rows = [
