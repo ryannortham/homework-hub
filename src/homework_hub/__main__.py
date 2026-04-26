@@ -14,6 +14,12 @@ from pathlib import Path
 import click
 
 from homework_hub.config import Settings
+from homework_hub.orchestrator import summarise_for_humans
+from homework_hub.wiring import (
+    _build_sheets_backend,
+    build_orchestrator,
+    write_sheet_id_to_config,
+)
 
 
 @click.group()
@@ -25,7 +31,13 @@ def cli() -> None:
 @click.option("--child", default=None, help="Child name; omit to sync all.")
 def sync(child: str | None) -> None:
     """Run a one-shot sync."""
-    click.echo(f"sync stub (child={child or 'all'}) — wired up in phase 9")
+    settings = Settings()
+    orchestrator = build_orchestrator(settings)
+    report = orchestrator.run(only_child=child)
+    click.echo(summarise_for_humans(report))
+    if report.any_failures:
+        # Non-zero exit so a CI/cron wrapper can detect issues.
+        raise SystemExit(2)
 
 
 @cli.group()
@@ -147,13 +159,72 @@ def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
 
 @cli.command("bootstrap-sheet")
 @click.option("--child", required=True)
-def bootstrap_sheet(child: str) -> None:
-    click.echo(f"bootstrap-sheet stub (child={child}) — wired up in phase 3")
+@click.option(
+    "--title",
+    default=None,
+    help="Sheet title. Defaults to 'Homework — <Child Display Name>'.",
+)
+@click.option(
+    "--share-with",
+    multiple=True,
+    help="Email(s) to share the new sheet with as Editor. May be repeated.",
+)
+def bootstrap_sheet(child: str, title: str | None, share_with: tuple[str, ...]) -> None:
+    """Create a new Google Sheet for a child and apply the homework-hub template.
+
+    Saves the spreadsheet ID back to children.yaml so subsequent syncs
+    target the correct sheet. Service-account credentials are pulled from
+    Vaultwarden.
+    """
+    from homework_hub.config import ChildrenConfig
+
+    settings = Settings()
+    cfg = ChildrenConfig.load(settings.children_yaml)
+    if child not in cfg.children:
+        raise click.ClickException(f"Unknown child '{child}' in children.yaml")
+    if cfg.children[child].sheet_id:
+        raise click.ClickException(
+            f"{child} already has sheet_id={cfg.children[child].sheet_id}. "
+            "Delete it from children.yaml first if you really want to re-bootstrap."
+        )
+
+    sheet_title = title or f"Homework — {cfg.children[child].display_name}"
+    backend = _build_sheets_backend()
+    click.echo(f"Creating sheet '{sheet_title}' …")
+    sheet_id = backend.create_sheet(sheet_title, share_with=list(share_with) or None)
+    write_sheet_id_to_config(settings.children_yaml, child, sheet_id)
+    click.echo(f"Created sheet {sheet_id} and saved to children.yaml")
+    if share_with:
+        click.echo(f"Shared with: {', '.join(share_with)}")
 
 
 @cli.command()
 def status() -> None:
-    click.echo("status stub — wired up in phase 9")
+    """Print the most recent success/failure per child + source."""
+    from homework_hub.config import ChildrenConfig
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    cfg = ChildrenConfig.load(settings.children_yaml)
+    state = StateStore(settings.state_db)
+    records = {(r.child, r.source): r for r in state.all_auth()}
+
+    for child_name, child_cfg in cfg.children.items():
+        click.echo(f"{child_name} ({child_cfg.display_name})")
+        click.echo(f"  sheet_id: {child_cfg.sheet_id or '— not bootstrapped —'}")
+        for src in ("classroom", "compass", "edrolo"):
+            rec = records.get((child_name, src))
+            if rec is None:
+                click.echo(f"  {src:9s}  — never synced —")
+                continue
+            success = rec.last_success_at.isoformat() if rec.last_success_at else "never"
+            failure = ""
+            if rec.last_failure_at:
+                failure = (
+                    f"  last_failure: {rec.last_failure_at.isoformat()} "
+                    f"({rec.last_failure_kind}: {rec.last_failure_message})"
+                )
+            click.echo(f"  {src:9s}  last_success: {success}{failure}")
 
 
 if __name__ == "__main__":
