@@ -188,74 +188,76 @@ class GspreadGoldSink:
         tab: TabSpec,
         encoded: list[list[object]],
     ) -> None:
-        """Delete all data rows, append fresh rows, then resize the Table.
+        """Delete all data rows, write fresh rows via updateCells, resize Table.
 
-        Deleting rows resets the Table's row range back to header-only.
-        ``append_rows`` (``values.append``) writes data into the grid but
-        does NOT cause the native Table to auto-extend its range — the Table
-        widget stays frozen at its original ``endRowIndex``.  We therefore
-        follow every write with an ``updateTable`` batchUpdate to explicitly
-        set the Table range to cover header + all appended rows, which is what
-        makes column types (DATE, BOOLEAN, DROPDOWN, FORMULA) apply correctly.
+        ``append_rows`` (``values.append``) deduplicates identical formula
+        strings across rows — only the first row receives the formula, all
+        subsequent rows get empty cells.  Writing via ``batchUpdate →
+        updateCells`` with explicit ``formulaValue`` / ``boolValue`` /
+        ``numberValue`` / ``stringValue`` cell descriptors sidesteps this and
+        correctly populates every row.
+
+        The ``updateTable`` call at the end resizes the Table range to cover
+        header + all data rows so that column type semantics (DATE sort,
+        BOOLEAN checkbox, DROPDOWN enforcement, DOUBLE formula evaluation)
+        apply to every row.
         """
         disc = self._disc()
+        requests: list[dict[str, Any]] = []
 
-        # 1. Delete all current data rows (keep header at row 0).
-        current_row_count = ws.row_count
-        if current_row_count > 1:
-            disc.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={
-                    "requests": [
-                        {
-                            "deleteDimension": {
-                                "range": {
-                                    "sheetId": ws.id,
-                                    "dimension": "ROWS",
-                                    "startIndex": 1,  # 0-based → row 2
-                                    "endIndex": current_row_count,
-                                }
-                            }
-                        }
-                    ]
-                },
-            ).execute()
+        # 1. Delete all current data rows (keep header at row index 0).
+        if ws.row_count > 1:
+            requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": ws.row_count,
+                    }
+                }
+            })
 
-        # 2. Append new rows (grid write — Table range not updated yet).
+        # 2. Write fresh data rows via updateCells (one cell-value dict per
+        #    cell so formulas, booleans, numbers and strings each use the
+        #    correct Sheets API value type).
         if encoded:
-            ws.append_rows(
-                encoded,
-                value_input_option="USER_ENTERED",
-                insert_data_option="INSERT_ROWS",
-                table_range="A1",
-            )
+            requests.append({
+                "updateCells": {
+                    "rows": [
+                        {"values": [_to_cell_value(v) for v in row]}
+                        for row in encoded
+                    ],
+                    "fields": "userEnteredValue",
+                    "start": {
+                        "sheetId": ws.id,
+                        "rowIndex": 1,       # 0-based → row 2
+                        "columnIndex": 0,
+                    },
+                }
+            })
 
-        # 3. Resize the Table to cover header + all data rows so that column
-        #    types (DATE sort, BOOLEAN checkbox, DROPDOWN, FORMULA) apply.
-        #    endRowIndex = 1 header row + len(encoded) data rows.
-        #    When encoded is empty the Table shrinks to header-only (valid).
+        # 3. Resize the Table to cover header + all data rows.
+        requests.append({
+            "updateTable": {
+                "table": {
+                    "tableId": tab.table_id,
+                    "name": tab.table_id,
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1 + len(encoded),
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(tab.columns),
+                    },
+                },
+                "fields": "range",
+            }
+        })
+
         disc.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            body={
-                "requests": [
-                    {
-                        "updateTable": {
-                            "table": {
-                                "tableId": tab.table_id,
-                                "name": tab.table_id,
-                                "range": {
-                                    "sheetId": ws.id,
-                                    "startRowIndex": 0,
-                                    "endRowIndex": 1 + len(encoded),
-                                    "startColumnIndex": 0,
-                                    "endColumnIndex": len(tab.columns),
-                                },
-                            },
-                            "fields": "range",
-                        }
-                    }
-                ]
-            },
+            body={"requests": requests},
         ).execute()
 
     def set_tab_hidden(self, spreadsheet_id: str, tab: TabSpec, hidden: bool) -> None:
@@ -318,6 +320,25 @@ def _encode_cell(value: object) -> object:
     if isinstance(value, int | float | str):
         return value
     return str(value)
+
+
+def _to_cell_value(value: object) -> dict[str, Any]:
+    """Convert an already-encoded Python value to a Sheets API cell value dict.
+
+    Used by ``_write_table_tab`` to build ``updateCells`` request bodies so
+    that each cell gets the correct value type (formulaValue / boolValue /
+    numberValue / stringValue) rather than the generic USER_ENTERED string
+    parsing used by ``values.append``.  This avoids the Sheets API bug where
+    identical formula strings across multiple rows are deduplicated and only
+    the first row receives the formula.
+    """
+    if isinstance(value, bool):
+        return {"userEnteredValue": {"boolValue": value}}
+    if isinstance(value, (int, float)):
+        return {"userEnteredValue": {"numberValue": value}}
+    if isinstance(value, str) and value.startswith("="):
+        return {"userEnteredValue": {"formulaValue": value}}
+    return {"userEnteredValue": {"stringValue": str(value) if value is not None else ""}}
 
 
 def _col_letter(n: int) -> str:

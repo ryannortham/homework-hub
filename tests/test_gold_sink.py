@@ -24,6 +24,7 @@ from homework_hub.sinks.gold_sink import (
     GspreadGoldSink,
     _col_letter,
     _encode_cell,
+    _to_cell_value,
 )
 
 # --------------------------------------------------------------------------- #
@@ -260,125 +261,149 @@ def test_read_duplicate_checkboxes_parses_columns_correctly():
 
 
 # --------------------------------------------------------------------------- #
+# _to_cell_value
+# --------------------------------------------------------------------------- #
+
+
+def test_to_cell_value_bool():
+    assert _to_cell_value(True) == {"userEnteredValue": {"boolValue": True}}
+    assert _to_cell_value(False) == {"userEnteredValue": {"boolValue": False}}
+
+
+def test_to_cell_value_number():
+    assert _to_cell_value(42) == {"userEnteredValue": {"numberValue": 42}}
+    assert _to_cell_value(3.14) == {"userEnteredValue": {"numberValue": 3.14}}
+
+
+def test_to_cell_value_formula():
+    assert _to_cell_value("=[@Due]-TODAY()") == {"userEnteredValue": {"formulaValue": "=[@Due]-TODAY()"}}
+
+
+def test_to_cell_value_string():
+    assert _to_cell_value("hello") == {"userEnteredValue": {"stringValue": "hello"}}
+    assert _to_cell_value("") == {"userEnteredValue": {"stringValue": ""}}
+    assert _to_cell_value(None) == {"userEnteredValue": {"stringValue": ""}}
+
+
+# --------------------------------------------------------------------------- #
 # write_tab — table-backed tabs (Tasks, UserEdits, Possible Duplicates)
 # --------------------------------------------------------------------------- #
 
 
-def _batch_update_bodies(sink: GspreadGoldSink) -> list[dict]:
-    """Return the body kwargs from each batchUpdate call on the discovery mock."""
+def _single_batch_requests(sink: GspreadGoldSink) -> list[dict]:
+    """Return the requests list from the single batchUpdate call."""
     calls = sink._discovery.spreadsheets.return_value.batchUpdate.call_args_list
-    return [c.kwargs["body"] for c in calls]
+    assert len(calls) == 1, f"Expected 1 batchUpdate call, got {len(calls)}"
+    return calls[0].kwargs["body"]["requests"]
 
 
-def test_write_table_tab_deletes_data_rows_then_appends():
-    """For table-backed tabs, write_tab deletes existing data rows then appends."""
+def test_write_table_tab_single_batchupdate_with_all_requests():
+    """All three operations (deleteDimension, updateCells, updateTable) go in
+    one batchUpdate call for efficiency."""
     header = ["subject", "title", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
-    ws = FakeWorksheet("Tasks", rows=[header, ["", "", "", "", "", "", False, "", "", "", ""]], ws_id=1)
+    ws = FakeWorksheet("Tasks", rows=[header, [""]*11], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [("Maths", "Chapter 3", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1")]
+    rows = [("Maths", "Chapter 3", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
     assert ws.cleared == []
     assert ws.updates == []
+    assert ws.appended == []  # append_rows no longer used
 
-    bodies = _batch_update_bodies(sink)
-    assert len(bodies) == 2
-
-    # First call: deleteDimension
-    del_req = bodies[0]["requests"][0]["deleteDimension"]["range"]
-    assert del_req["sheetId"] == 1
-    assert del_req["dimension"] == "ROWS"
-    assert del_req["startIndex"] == 1
-    assert del_req["endIndex"] == 2  # ws had 2 rows
-
-    # Second call: updateTable with endRowIndex = 1 header + 1 data row
-    upd_table = bodies[1]["requests"][0]["updateTable"]
-    assert upd_table["fields"] == "range"
-    r = upd_table["table"]["range"]
-    assert r["sheetId"] == 1
-    assert r["startRowIndex"] == 0
-    assert r["endRowIndex"] == 2  # 1 + 1 row
-    assert r["endColumnIndex"] == len(TASKS_TAB.columns)
-
-    assert len(ws.appended) == 1
-    assert ws.appended[0][0][0] == "Maths"
+    reqs = _single_batch_requests(sink)
+    req_kinds = [list(r.keys())[0] for r in reqs]
+    assert req_kinds == ["deleteDimension", "updateCells", "updateTable"]
 
 
-def test_write_table_tab_skips_delete_when_header_only():
-    """If the sheet has only the header row, skip deleteDimension."""
-    ws = FakeWorksheet("Tasks", rows=[["subject"]], ws_id=1)
+def test_write_table_tab_delete_covers_all_existing_rows():
+    ws = FakeWorksheet("Tasks", rows=[["h"]] + [[""] * 11] * 5, ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1")])
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    reqs = _single_batch_requests(sink)
+    del_range = reqs[0]["deleteDimension"]["range"]
+    assert del_range["startIndex"] == 1
+    assert del_range["endIndex"] == 6  # ws had 6 rows total
 
-    bodies = _batch_update_bodies(sink)
-    assert len(bodies) == 1  # only updateTable, no deleteDimension
-    assert "updateTable" in bodies[0]["requests"][0]
-    assert len(ws.appended) == 1
 
-
-def test_write_table_tab_empty_rows_skips_append():
-    """Empty rows: deleteDimension fires if rows existed, then updateTable with endRowIndex=1."""
-    ws = FakeWorksheet("Tasks", rows=[["subject"], [""]], ws_id=1)
+def test_write_table_tab_updatecells_uses_correct_value_types():
+    """Booleans, formulas, numbers and strings each get the right cell type."""
+    ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
+    rows = [("Maths", "HW", 46143, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
+    sink.write_tab("sheet-id", TASKS_TAB, rows)
 
-    bodies = _batch_update_bodies(sink)
-    assert len(bodies) == 2
-
-    # deleteDimension fires because row_count > 1
-    assert "deleteDimension" in bodies[0]["requests"][0]
-    # updateTable with endRowIndex=1 (header only)
-    r = bodies[1]["requests"][0]["updateTable"]["table"]["range"]
-    assert r["endRowIndex"] == 1
-
-    assert ws.appended == []
+    reqs = _single_batch_requests(sink)
+    cells = reqs[1]["updateCells"]["rows"][0]["values"]
+    assert cells[2] == {"userEnteredValue": {"numberValue": 46143}}    # due (date serial)
+    assert cells[3] == {"userEnteredValue": {"formulaValue": "=[@Due]-TODAY()"}}  # days
+    assert cells[6] == {"userEnteredValue": {"boolValue": False}}       # done
+    assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}  # subject
 
 
-def test_write_table_tab_empty_header_only_no_delete_updatetable_endrow_1():
-    """Header-only sheet + empty rows: only updateTable (endRowIndex=1), no delete."""
-    ws = FakeWorksheet("Tasks", rows=[["subject"]], ws_id=1)
+def test_write_table_tab_updatetable_endrow_covers_data_rows():
+    ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
-
-    bodies = _batch_update_bodies(sink)
-    assert len(bodies) == 1
-    assert "updateTable" in bodies[0]["requests"][0]
-    r = bodies[0]["requests"][0]["updateTable"]["table"]["range"]
-    assert r["endRowIndex"] == 1
-    assert ws.appended == []
-
-
-def test_write_table_tab_update_table_covers_all_rows():
-    """updateTable endRowIndex equals 1 + number of appended rows."""
-    ws = FakeWorksheet("UserEdits", rows=[["task_uid"]], ws_id=2)
-    sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
     rows = [
-        ("uid-1", "priority", "High", "2026-04-26"),
-        ("uid-2", "done", "TRUE", "2026-04-26"),
-        ("uid-3", "notes", "hello", "2026-04-26"),
+        ("Maths", "HW1", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1"),
+        ("English", "Essay", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Compass", "", "uid-2"),
+        ("Science", "Lab", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Compass", "", "uid-3"),
     ]
-    sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
+    sink.write_tab("sheet-id", TASKS_TAB, rows)
+    reqs = _single_batch_requests(sink)
+    upd = reqs[2]["updateTable"]["table"]
+    assert upd["tableId"] == TASKS_TAB.table_id
+    assert upd["range"]["endRowIndex"] == 4   # 1 header + 3 data rows
+    assert upd["range"]["endColumnIndex"] == len(TASKS_TAB.columns)
 
-    bodies = _batch_update_bodies(sink)
-    upd = bodies[-1]["requests"][0]["updateTable"]["table"]["range"]
-    assert upd["endRowIndex"] == 4  # 1 header + 3 data rows
+
+def test_write_table_tab_empty_rows_no_updatecells_endrow_1():
+    """Empty rows: deleteDimension + updateTable(endRow=1), no updateCells."""
+    ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
+
+    reqs = _single_batch_requests(sink)
+    req_kinds = [list(r.keys())[0] for r in reqs]
+    assert req_kinds == ["deleteDimension", "updateTable"]
+    assert reqs[1]["updateTable"]["table"]["range"]["endRowIndex"] == 1
+
+
+def test_write_table_tab_header_only_no_delete():
+    """Header-only sheet: no deleteDimension, just updateCells + updateTable."""
+    ws = FakeWorksheet("Tasks", rows=[["h"]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=[@Due]-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    reqs = _single_batch_requests(sink)
+    req_kinds = [list(r.keys())[0] for r in reqs]
+    assert req_kinds == ["updateCells", "updateTable"]
+
+
+def test_write_table_tab_header_only_empty_rows_only_updatetable():
+    """Header-only sheet + empty rows: only updateTable(endRow=1)."""
+    ws = FakeWorksheet("Tasks", rows=[["h"]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
+    reqs = _single_batch_requests(sink)
+    assert len(reqs) == 1
+    assert "updateTable" in reqs[0]
+    assert reqs[0]["updateTable"]["table"]["range"]["endRowIndex"] == 1
 
 
 def test_write_table_tab_encodes_values_correctly():
-    """Rows passed to append_rows are fully encoded."""
-    ws = FakeWorksheet("UserEdits", rows=[["task_uid"]], ws_id=2)
+    """Rows are encoded before being turned into cell value dicts."""
+    ws = FakeWorksheet("UserEdits", rows=[["h"]], ws_id=2)
     sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
     rows = [
         ("uid-1", "priority", "High", datetime(2026, 4, 26, 10, 0, tzinfo=UTC)),
         ("uid-2", "done", True, None),
     ]
     sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
-    assert ws.appended == [
-        [
-            ["uid-1", "priority", "High", "2026-04-26"],
-            ["uid-2", "done", True, ""],
-        ]
-    ]
+    reqs = _single_batch_requests(sink)
+    update_rows = reqs[0]["updateCells"]["rows"]  # no delete (header-only)
+    assert update_rows[0]["values"][2] == {"userEnteredValue": {"stringValue": "High"}}
+    assert update_rows[0]["values"][3] == {"userEnteredValue": {"stringValue": "2026-04-26"}}
+    assert update_rows[1]["values"][2] == {"userEnteredValue": {"boolValue": True}}
+    assert update_rows[1]["values"][3] == {"userEnteredValue": {"stringValue": ""}}
 
 
 # --------------------------------------------------------------------------- #
