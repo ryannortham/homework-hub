@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+.python-version
+
+# Test/lint
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets / runtime state — NEVER commit
+.env
+.env.*
+!.env.example
+tokens/
+state.db
+state.db-*
+logs/
+*.log
+
+# Local config overrides
+config/children.yaml
+!config/children.yaml.example

@@ -1,0 +1,28 @@
+# Per-child configuration. Copy to children.yaml and edit.
+# Secrets live in Vaultwarden, not here.
+
+children:
+  james:
+    display_name: James
+    sources:
+      classroom:
+        enabled: true
+      compass:
+        enabled: true
+        subdomain: mcsc-vic        # https://mcsc-vic.compass.education
+      edrolo:
+        enabled: true
+    # sheet_id is populated by `homework-hub bootstrap-sheet --child james`
+    sheet_id: null
+
+  tahlia:
+    display_name: Tahlia
+    sources:
+      classroom:
+        enabled: true
+      compass:
+        enabled: true
+        subdomain: mcsc-vic
+      edrolo:
+        enabled: true
+    sheet_id: null
