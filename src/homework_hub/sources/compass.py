@@ -51,6 +51,9 @@ _STATUS_MAP: dict[int, Status] = {
     1: Status.SUBMITTED,  # Submitted (on time)
     2: Status.SUBMITTED,  # Submitted late
     3: Status.GRADED,  # Marked / Returned
+    # 4 observed only on inactive enrolments (isActiveEnrolment=False) where
+    # ``submittedTimestamp`` is populated — treat as submitted-but-ungraded.
+    4: Status.SUBMITTED,
 }
 
 
@@ -115,17 +118,27 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
 
 
 def _resolve_student_status(lt: dict[str, Any]) -> int:
-    """Compass returns either an int ``status`` or per-student ``students[].status``.
+    """Compass returns the per-student status under ``students[].submissionStatus``.
 
-    Prefer the explicit per-student value when available, fall back to the
-    top-level status.
+    Live responses don't carry a top-level ``status`` field at all; the only
+    reliable source is the matching ``students[]`` entry (one per cohort
+    member when an admin/parent token is used, one entry when fetched per
+    userId). We accept ``submissionStatus`` (the real field name) and ``status``
+    (defensive fallback in case Compass ever flattens the schema).
     """
     students = lt.get("students")
     if isinstance(students, list) and students:
         for s in students:
-            if isinstance(s, dict) and "status" in s:
-                return int(s["status"])
-    return int(lt.get("status", 0))
+            if not isinstance(s, dict):
+                continue
+            for key in ("submissionStatus", "status"):
+                v = s.get(key)
+                if isinstance(v, int):
+                    return v
+    top = lt.get("status")
+    if isinstance(top, int):
+        return top
+    return 0
 
 
 def _parse_compass_dt(value: Any) -> datetime | None:

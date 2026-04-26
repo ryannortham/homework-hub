@@ -75,26 +75,42 @@ class TestMapping:
         assert t.assigned_at == datetime(2026, 4, 15, 0, 0, 0, tzinfo=UTC)
 
     def test_status_submitted(self, lt):
-        lt["status"] = 1
-        lt["students"] = [{"userId": 1, "status": 1}]
+        lt["students"] = [{"userId": 1, "submissionStatus": 1}]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.status is Status.SUBMITTED
+
+    def test_status_submitted_late(self, lt):
+        lt["students"] = [{"userId": 1, "submissionStatus": 2}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.status is Status.SUBMITTED
 
     def test_status_graded(self, lt):
-        lt["status"] = 3
-        lt["students"] = [{"userId": 1, "status": 3}]
+        lt["students"] = [{"userId": 1, "submissionStatus": 3}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.status is Status.GRADED
 
-    def test_per_student_status_overrides_top_level(self, lt):
-        lt["status"] = 1  # top-level says submitted
-        lt["students"] = [{"userId": 1, "status": 0}]  # student says pending
+    def test_status_4_inactive_enrolment_treated_as_submitted(self, lt):
+        # submissionStatus=4 observed on inactive enrolments with a populated
+        # submittedTimestamp; treated as submitted-but-ungraded.
+        lt["students"] = [{"userId": 1, "submissionStatus": 4}]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.status is Status.SUBMITTED
+
+    def test_legacy_status_field_name_still_honoured(self, lt):
+        # Defensive fallback: if Compass ever flattens the schema and uses
+        # ``status`` on the students[] entry instead of ``submissionStatus``.
+        lt["students"] = [{"userId": 1, "status": 1}]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.status is Status.SUBMITTED
+
+    def test_per_student_status_used_when_top_level_absent(self, lt):
+        lt.pop("status", None)
+        lt["students"] = [{"userId": 1, "submissionStatus": 0}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.status is Status.NOT_STARTED
 
     def test_unknown_status_falls_back_to_not_started(self, lt):
-        lt["status"] = 999
-        lt["students"] = []
+        lt["students"] = [{"userId": 1, "submissionStatus": 999}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.status is Status.NOT_STARTED
         assert t.status_raw == "999"
