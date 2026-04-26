@@ -17,10 +17,13 @@ import click
 
 from homework_hub.config import Settings
 from homework_hub.daemon import run_daemon
-from homework_hub.orchestrator import summarise_for_humans
+from homework_hub.medallion_orchestrator import (
+    replay_silver_from_bronze,
+    summarise_medallion,
+)
 from homework_hub.wiring import (
     _build_sheets_backend,
-    build_orchestrator,
+    build_medallion_orchestrator,
     write_sheet_id_to_config,
 )
 
@@ -41,13 +44,79 @@ def cli(ctx: click.Context) -> None:
 @cli.command()
 @click.option("--child", default=None, help="Child name; omit to sync all.")
 def sync(child: str | None) -> None:
-    """Run a one-shot sync."""
+    """Run a one-shot full medallion sync (ingest \u2192 transform \u2192 detect \u2192 publish)."""
     settings = Settings()
-    orchestrator = build_orchestrator(settings)
+    orchestrator = build_medallion_orchestrator(settings)
     report = orchestrator.run(only_child=child)
-    click.echo(summarise_for_humans(report))
+    click.echo(summarise_medallion(report))
     if report.any_failures:
-        # Non-zero exit so a CI/cron wrapper can detect issues.
+        raise SystemExit(2)
+
+
+@cli.command()
+@click.option("--child", default=None, help="Child name; omit to ingest for all.")
+def ingest(child: str | None) -> None:
+    """Run only the ingest stage (sources \u2192 bronze)."""
+    settings = Settings()
+    orchestrator = build_medallion_orchestrator(settings)
+    report = orchestrator.ingest_only(only_child=child)
+    click.echo(summarise_medallion(report))
+    if report.any_failures:
+        raise SystemExit(2)
+
+
+@cli.command()
+@click.option("--child", default=None, help="Child name; omit to transform for all.")
+def transform(child: str | None) -> None:
+    """Run only the transform stage (bronze \u2192 silver)."""
+    settings = Settings()
+    orchestrator = build_medallion_orchestrator(settings)
+    report = orchestrator.transform_only(only_child=child)
+    click.echo(summarise_medallion(report))
+    if report.any_failures:
+        raise SystemExit(2)
+
+
+@cli.command()
+@click.option("--child", default=None, help="Child name; omit to publish for all.")
+def publish(child: str | None) -> None:
+    """Run only the detect + publish stages."""
+    settings = Settings()
+    orchestrator = build_medallion_orchestrator(settings)
+    report = orchestrator.publish_only(only_child=child)
+    click.echo(summarise_medallion(report))
+    if report.any_failures:
+        raise SystemExit(2)
+
+
+@cli.command()
+@click.option(
+    "--child",
+    default=None,
+    help="Child name; omit to replay for every child currently in bronze.",
+)
+def replay(child: str | None) -> None:
+    """Re-run transform against existing bronze (no source fetches).
+
+    Useful after editing subject rules or transform code: rebuilds
+    ``silver_tasks`` from the ``bronze_records`` already on disk.
+    """
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    state = StateStore(settings.state_db)
+    results = replay_silver_from_bronze(state, only_child=child)
+    if not results:
+        click.echo("No bronze rows found \u2014 run `homework-hub ingest` first.")
+        return
+    failed = False
+    for c, r in results.items():
+        if r.ok:
+            click.echo(f"{c}: +{r.inserted} new, ~{r.updated} changed, ={r.unchanged} unchanged")
+        else:
+            failed = True
+            click.echo(f"{c}: FAILED \u2014 {r.error}")
+    if failed:
         raise SystemExit(2)
 
 

@@ -360,3 +360,96 @@ class TestSchemaCoexistence:
             "silver_task_links",
             "sync_runs",
         }.issubset(names)
+
+
+class TestSyncRunsRecord:
+    """Behaviour tests for ``StateStore.record_sync_run`` /
+    ``recent_sync_runs`` (M6)."""
+
+    def test_record_sync_run_round_trip(self, tmp_path: Path):
+        from datetime import UTC, datetime, timedelta
+
+        store = StateStore(tmp_path / "state.db")
+        started = datetime.now(UTC)
+        finished = started + timedelta(seconds=2)
+        rid = store.record_sync_run(
+            child="james",
+            source="classroom",
+            outcome="ok",
+            started_at=started,
+            finished_at=finished,
+            bronze_inserted=4,
+            silver_upserted=3,
+        )
+        assert rid > 0
+
+        rows = store.recent_sync_runs(child="james")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["source"] == "classroom"
+        assert r["outcome"] == "ok"
+        assert r["bronze_inserted"] == 4
+        assert r["silver_upserted"] == 3
+        assert r["error"] is None
+
+    def test_record_sync_run_failure_stores_error(self, tmp_path: Path):
+        from datetime import UTC, datetime
+
+        store = StateStore(tmp_path / "state.db")
+        store.record_sync_run(
+            child="james",
+            source="compass",
+            outcome="auth_expired",
+            started_at=datetime.now(UTC),
+            error="cookie expired",
+        )
+        rows = store.recent_sync_runs(child="james")
+        assert rows[0]["outcome"] == "auth_expired"
+        assert rows[0]["error"] == "cookie expired"
+        assert rows[0]["finished_at"] is None
+
+    def test_recent_sync_runs_orders_newest_first_and_filters_child(self, tmp_path: Path):
+        from datetime import UTC, datetime, timedelta
+
+        store = StateStore(tmp_path / "state.db")
+        base = datetime.now(UTC)
+        store.record_sync_run(
+            child="james",
+            source="classroom",
+            outcome="ok",
+            started_at=base,
+        )
+        store.record_sync_run(
+            child="james",
+            source="compass",
+            outcome="ok",
+            started_at=base + timedelta(seconds=10),
+        )
+        store.record_sync_run(
+            child="tahlia",
+            source="classroom",
+            outcome="ok",
+            started_at=base + timedelta(seconds=20),
+        )
+
+        rows = store.recent_sync_runs(child="james")
+        assert [r["source"] for r in rows] == ["compass", "classroom"]
+
+        rows_t = store.recent_sync_runs(child="tahlia")
+        assert len(rows_t) == 1
+        assert rows_t[0]["source"] == "classroom"
+
+    def test_recent_sync_runs_respects_limit(self, tmp_path: Path):
+        from datetime import UTC, datetime, timedelta
+
+        store = StateStore(tmp_path / "state.db")
+        base = datetime.now(UTC)
+        for i in range(5):
+            store.record_sync_run(
+                child="james",
+                source="classroom",
+                outcome="ok",
+                started_at=base + timedelta(seconds=i),
+            )
+        rows = store.recent_sync_runs(child="james", limit=2)
+        assert len(rows) == 2

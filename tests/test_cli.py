@@ -11,7 +11,14 @@ import yaml
 from click.testing import CliRunner
 
 from homework_hub.__main__ import cli
-from homework_hub.orchestrator import ChildReport, SourceResult, SyncReport
+from homework_hub.medallion_orchestrator import (
+    DetectStageResult,
+    IngestStageResult,
+    MedallionChildReport,
+    MedallionSyncReport,
+    PublishStageResult,
+    TransformStageResult,
+)
 
 
 def _write_min_config(tmp_path: Path, *, sheet_id: str | None = None) -> dict[str, str]:
@@ -42,50 +49,72 @@ def _write_min_config(tmp_path: Path, *, sheet_id: str | None = None) -> dict[st
     }
 
 
-def _fake_report(*, ok: bool = True) -> SyncReport:
+def _fake_report(*, ok: bool = True) -> MedallionSyncReport:
     now = datetime.now(UTC)
-    result = SourceResult(
+    ingest = IngestStageResult(
         child="james",
         source="classroom",
         ok=ok,
+        bronze_inserted=3 if ok else 0,
+        bronze_skipped=0,
         failure_kind=None if ok else "auth_expired",
         failure_message=None if ok else "token expired",
-        task_count=3 if ok else 0,
     )
-    child = ChildReport(
+    transform = TransformStageResult(
         child="james",
-        source_results=[result],
-        sheet_id="sheet-abc",
-        rows_updated=1,
-        rows_appended=2,
-        rows_unchanged=0,
+        ok=True,
+        inserted=2,
+        updated=1,
+        unchanged=0,
     )
-    return SyncReport(started_at=now, finished_at=now, children=[child])
+    detect = DetectStageResult(child="james", ok=True)
+    publish = PublishStageResult(
+        child="james",
+        ok=True,
+        skipped_reason="no sink wired (M5c pending)",
+    )
+    child = MedallionChildReport(
+        child="james",
+        ingest=[ingest],
+        transform=transform,
+        detect=detect,
+        publish=publish,
+    )
+    return MedallionSyncReport(started_at=now, finished_at=now, children=[child])
 
 
 def test_cli_help_lists_subcommands():
     runner = CliRunner()
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("sync", "auth", "bootstrap-sheet", "status"):
+    for cmd in (
+        "sync",
+        "ingest",
+        "transform",
+        "publish",
+        "replay",
+        "auth",
+        "bootstrap-sheet",
+        "status",
+    ):
         assert cmd in result.output
 
 
 def test_sync_default_all_children(tmp_path: Path):
     env = _write_min_config(tmp_path, sheet_id="sheet-abc")
     runner = CliRunner()
-    with patch("homework_hub.__main__.build_orchestrator") as mock_build:
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
         mock_build.return_value.run.return_value = _fake_report(ok=True)
         result = runner.invoke(cli, ["sync"], env=env)
     assert result.exit_code == 0, result.output
     mock_build.return_value.run.assert_called_once_with(only_child=None)
-    assert "Sync completed" in result.output
+    assert "Medallion sync completed" in result.output
 
 
 def test_sync_with_child(tmp_path: Path):
     env = _write_min_config(tmp_path, sheet_id="sheet-abc")
     runner = CliRunner()
-    with patch("homework_hub.__main__.build_orchestrator") as mock_build:
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
         mock_build.return_value.run.return_value = _fake_report(ok=True)
         result = runner.invoke(cli, ["sync", "--child", "james"], env=env)
     assert result.exit_code == 0, result.output
@@ -95,11 +124,77 @@ def test_sync_with_child(tmp_path: Path):
 def test_sync_exits_2_on_failure(tmp_path: Path):
     env = _write_min_config(tmp_path, sheet_id="sheet-abc")
     runner = CliRunner()
-    with patch("homework_hub.__main__.build_orchestrator") as mock_build:
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
         mock_build.return_value.run.return_value = _fake_report(ok=False)
         result = runner.invoke(cli, ["sync"], env=env)
     assert result.exit_code == 2
     assert "FAIL" in result.output
+
+
+def test_ingest_verb_calls_ingest_only(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
+        mock_build.return_value.ingest_only.return_value = _fake_report(ok=True)
+        result = runner.invoke(cli, ["ingest", "--child", "james"], env=env)
+    assert result.exit_code == 0, result.output
+    mock_build.return_value.ingest_only.assert_called_once_with(only_child="james")
+
+
+def test_transform_verb_calls_transform_only(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
+        mock_build.return_value.transform_only.return_value = _fake_report(ok=True)
+        result = runner.invoke(cli, ["transform"], env=env)
+    assert result.exit_code == 0, result.output
+    mock_build.return_value.transform_only.assert_called_once_with(only_child=None)
+
+
+def test_publish_verb_calls_publish_only(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    with patch("homework_hub.__main__.build_medallion_orchestrator") as mock_build:
+        mock_build.return_value.publish_only.return_value = _fake_report(ok=True)
+        result = runner.invoke(cli, ["publish"], env=env)
+    assert result.exit_code == 0, result.output
+    mock_build.return_value.publish_only.assert_called_once_with(only_child=None)
+
+
+def test_replay_verb_calls_replay_function(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    fake_results = {
+        "james": TransformStageResult(child="james", ok=True, inserted=5, updated=2, unchanged=1),
+    }
+    with patch("homework_hub.__main__.replay_silver_from_bronze") as mock_replay:
+        mock_replay.return_value = fake_results
+        result = runner.invoke(cli, ["replay"], env=env)
+    assert result.exit_code == 0, result.output
+    assert "james: +5 new" in result.output
+
+
+def test_replay_verb_no_bronze_rows(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    with patch("homework_hub.__main__.replay_silver_from_bronze") as mock_replay:
+        mock_replay.return_value = {}
+        result = runner.invoke(cli, ["replay"], env=env)
+    assert result.exit_code == 0, result.output
+    assert "No bronze rows found" in result.output
+
+
+def test_replay_verb_exits_2_on_failure(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    fake_results = {
+        "james": TransformStageResult(child="james", ok=False, error="boom"),
+    }
+    with patch("homework_hub.__main__.replay_silver_from_bronze") as mock_replay:
+        mock_replay.return_value = fake_results
+        result = runner.invoke(cli, ["replay"], env=env)
+    assert result.exit_code == 2
+    assert "FAILED" in result.output
 
 
 def test_auth_compass_saves_token(tmp_path: Path):

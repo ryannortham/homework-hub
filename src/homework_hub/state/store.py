@@ -387,6 +387,56 @@ class StateStore:
             for r in rows
         ]
 
+    # ------------------------------------------------------------------ #
+    # sync_runs
+    # ------------------------------------------------------------------ #
+
+    def record_sync_run(
+        self,
+        *,
+        child: str,
+        source: str,
+        outcome: str,
+        started_at: datetime,
+        finished_at: datetime | None = None,
+        bronze_inserted: int = 0,
+        silver_upserted: int = 0,
+        error: str | None = None,
+    ) -> int:
+        """Append a row to ``sync_runs``. Returns the new row id."""
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                """
+                INSERT INTO sync_runs
+                    (started_at, finished_at, child, source, outcome,
+                     bronze_inserted, silver_upserted, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    started_at.isoformat(),
+                    finished_at.isoformat() if finished_at else None,
+                    child,
+                    source,
+                    outcome,
+                    bronze_inserted,
+                    silver_upserted,
+                    error,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_sync_runs(self, *, child: str, limit: int = 20) -> list[dict]:
+        """Most-recent sync_runs rows for a child, newest first."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT id, started_at, finished_at, child, source, outcome, "
+                "bronze_inserted, silver_upserted, error "
+                "FROM sync_runs WHERE child = ? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (child, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 def _parse_opt_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None

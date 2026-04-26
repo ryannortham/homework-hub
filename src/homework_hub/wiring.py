@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from homework_hub.config import ChildrenConfig, Settings
+from homework_hub.medallion_orchestrator import MedallionOrchestrator
 from homework_hub.orchestrator import Orchestrator
+from homework_hub.pipeline.publish import GoldSink
 from homework_hub.secrets import BitwardenCLI, from_env
 from homework_hub.sinks.sheets_client import (
     SheetsBackend,
@@ -37,9 +39,10 @@ def build_orchestrator(
     sheets_backend: SheetsBackend | None = None,
     bw: BitwardenCLI | None = None,
 ) -> Orchestrator:
-    """Construct an Orchestrator wired from config + tokens on disk.
+    """Construct a (legacy) Orchestrator wired from config + tokens on disk.
 
-    ``sheets_backend`` and ``bw`` are overrideable for tests / dry-runs.
+    Kept for the bootstrap-sheet path (it still uses ``SheetsBackend``)
+    and for callers that have not been migrated to the medallion flow.
     """
     children_config = ChildrenConfig.load(settings.children_yaml)
     sources_for_child = _build_sources(settings, children_config)
@@ -50,6 +53,27 @@ def build_orchestrator(
         sources_for_child=sources_for_child,
         sheets=backend,
         state=state,
+    )
+
+
+def build_medallion_orchestrator(
+    settings: Settings,
+    *,
+    sink: GoldSink | None = None,
+) -> MedallionOrchestrator:
+    """Construct a MedallionOrchestrator wired from config + tokens on disk.
+
+    ``sink`` is left unset by default \u2014 publish skips with a clear
+    ``sync_runs`` row until M5c provides the real ``GoldSink``.
+    """
+    children_config = ChildrenConfig.load(settings.children_yaml)
+    sources_for_child = _build_sources(settings, children_config)
+    state = StateStore(settings.state_db)
+    return MedallionOrchestrator(
+        children_config=children_config,
+        sources_for_child=sources_for_child,
+        state=state,
+        sink=sink,
     )
 
 
@@ -151,6 +175,7 @@ def write_sheet_id_to_config(children_yaml: Path, child: str, sheet_id: str) -> 
 
 # Re-export for convenience.
 __all__: list[str] = [
+    "build_medallion_orchestrator",
     "build_orchestrator",
     "write_sheet_id_to_config",
 ]

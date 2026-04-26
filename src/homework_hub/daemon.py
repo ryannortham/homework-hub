@@ -32,9 +32,13 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
 from homework_hub.config import Settings
-from homework_hub.orchestrator import Orchestrator, summarise_for_humans
+from homework_hub.medallion_orchestrator import (
+    MedallionOrchestrator,
+    summarise_medallion,
+)
+from homework_hub.orchestrator import Orchestrator
 from homework_hub.state.store import StateStore
-from homework_hub.wiring import build_orchestrator
+from homework_hub.wiring import build_medallion_orchestrator
 
 log = logging.getLogger(__name__)
 
@@ -78,20 +82,29 @@ def build_scheduler(
     return scheduler
 
 
-def make_sync_job(orchestrator_factory: Callable[[], Orchestrator]) -> Callable[[], None]:
+def make_sync_job(
+    orchestrator_factory: Callable[[], MedallionOrchestrator | Orchestrator],
+) -> Callable[[], None]:
     """Wrap a fresh-orchestrator-per-tick callable with logging.
 
     Each tick rebuilds the orchestrator so token reloads / config edits
-    take effect without restarting the daemon.
+    take effect without restarting the daemon. Both the legacy
+    ``Orchestrator`` and the medallion variant are accepted; the
+    summary is rendered with the medallion formatter when applicable.
     """
 
     def _tick() -> None:
         try:
             orchestrator = orchestrator_factory()
             report = orchestrator.run()
-            log.info("sync tick complete\n%s", summarise_for_humans(report))
+            if isinstance(orchestrator, MedallionOrchestrator):
+                log.info("sync tick complete\n%s", summarise_medallion(report))
+            else:  # pragma: no cover - legacy path retained for safety
+                from homework_hub.orchestrator import summarise_for_humans
+
+                log.info("sync tick complete\n%s", summarise_for_humans(report))
         except Exception:
-            # Never let an exception propagate out of an APScheduler job —
+            # Never let an exception propagate out of an APScheduler job \u2014
             # it would tear down the scheduler thread.
             log.exception("sync tick crashed")
 
@@ -202,7 +215,7 @@ def run_daemon(settings: Settings) -> None:  # pragma: no cover - integration
     state = StateStore(settings.state_db)
     scheduler = build_scheduler(
         cron_expr=settings.sync_cron,
-        job=make_sync_job(lambda: build_orchestrator(settings)),
+        job=make_sync_job(lambda: build_medallion_orchestrator(settings)),
     )
     app = build_health_app(state=state, scheduler=scheduler)
 
