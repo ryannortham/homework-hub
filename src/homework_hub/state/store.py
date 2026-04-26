@@ -46,6 +46,108 @@ CREATE TABLE IF NOT EXISTS auth_status (
     last_failure_message TEXT,
     PRIMARY KEY (child, source)
 );
+
+-- ------------------------------------------------------------------ --
+-- Medallion architecture (M1) — bronze / silver / dim / links / runs --
+-- ------------------------------------------------------------------ --
+
+-- Bronze: append-only raw upstream payloads. System of record for replay.
+-- payload_hash is a sha256 of the canonical JSON; (child, source, source_id,
+-- payload_hash) is unique so re-fetching an unchanged record is a no-op.
+CREATE TABLE IF NOT EXISTS bronze_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    UNIQUE (child, source, source_id, payload_hash)
+);
+CREATE INDEX IF NOT EXISTS ix_bronze_child_source
+    ON bronze_records (child, source, fetched_at);
+CREATE INDEX IF NOT EXISTS ix_bronze_lookup
+    ON bronze_records (child, source, source_id);
+
+-- Silver: canonical typed tasks. One row per (child, source, source_id);
+-- latest-wins on resync. Replaces seen_tasks for dedup AND for the data body.
+CREATE TABLE IF NOT EXISTS silver_tasks (
+    child TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    subject_raw TEXT NOT NULL DEFAULT '',
+    subject_canonical TEXT NOT NULL DEFAULT '',
+    subject_short TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    assigned_at TEXT,
+    due_at TEXT,
+    status_raw TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    bronze_id INTEGER,
+    last_synced TEXT NOT NULL,
+    PRIMARY KEY (child, source, source_id),
+    FOREIGN KEY (bronze_id) REFERENCES bronze_records(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS ix_silver_child_due
+    ON silver_tasks (child, due_at);
+CREATE INDEX IF NOT EXISTS ix_silver_subject_canonical
+    ON silver_tasks (child, subject_canonical);
+
+-- dim_subjects: subject canonicalisation lookup. Seeded from
+-- config/subjects.yaml; mutable via the `subjects` CLI. Resolution
+-- precedence: exact (priority 100) > prefix (50) > regex (10).
+CREATE TABLE IF NOT EXISTS dim_subjects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_type TEXT NOT NULL CHECK (match_type IN ('exact', 'prefix', 'regex')),
+    pattern TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    short TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (match_type, pattern)
+);
+CREATE INDEX IF NOT EXISTS ix_dim_subjects_priority
+    ON dim_subjects (priority DESC, match_type);
+
+-- silver_task_links: cross-source duplicate links (Compass↔Classroom only).
+-- primary_source is always 'compass' for auto-detected pairs; manual links
+-- may use any combination. state transitions: pending -> confirmed/dismissed.
+CREATE TABLE IF NOT EXISTS silver_task_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child TEXT NOT NULL,
+    primary_source TEXT NOT NULL,
+    primary_source_id TEXT NOT NULL,
+    secondary_source TEXT NOT NULL,
+    secondary_source_id TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('auto_high', 'auto_medium', 'manual')),
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'confirmed', 'dismissed')),
+    score_subject REAL,
+    score_title REAL,
+    score_due INTEGER,
+    detected_at TEXT NOT NULL,
+    UNIQUE (child, primary_source, primary_source_id,
+            secondary_source, secondary_source_id)
+);
+CREATE INDEX IF NOT EXISTS ix_links_child_state
+    ON silver_task_links (child, state);
+
+-- sync_runs: operational ledger. One row per orchestrator tick per
+-- (child, source); powers Settings tab + /health.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    child TEXT NOT NULL,
+    source TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    bronze_inserted INTEGER NOT NULL DEFAULT 0,
+    silver_upserted INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sync_runs_recent
+    ON sync_runs (child, source, started_at DESC);
 """
 
 
