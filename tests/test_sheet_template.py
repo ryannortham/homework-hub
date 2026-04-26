@@ -148,20 +148,34 @@ class TestSeedRow:
 
 
 class TestDropdowns:
-    def test_dropdowns_set_for_dropdown_columns(self):
+    def test_dropdowns_enforced_via_table_column_properties(self):
+        """All dropdowns live in table-backed tabs, so they're enforced
+        via ``addTable.columnProperties[].dataValidationRule`` rather
+        than standalone ``setDataValidation`` requests (which the API
+        rejects on cells inside typed table columns)."""
         reqs = bootstrap_requests()
-        # 3 dropdown columns on Tasks: Status, Priority, Source
-        dropdown_reqs = _by_kind(reqs, "setDataValidation")
-        assert len(dropdown_reqs) == 3
-        for r in dropdown_reqs:
-            cond = r["setDataValidation"]["rule"]["condition"]
+        # No standalone setDataValidation — every dropdown column is in a Table.
+        assert _by_kind(reqs, "setDataValidation") == []
+        # And the Tasks addTable carries 3 DROPDOWN column properties with
+        # ONE_OF_LIST validation rules (Status, Priority, Source).
+        tasks_table = next(
+            r["addTable"]["table"] for r in _by_kind(reqs, "addTable")
+            if r["addTable"]["table"]["name"] == "tbl_tasks"
+        )
+        dropdown_cols = [
+            c for c in tasks_table["columnProperties"]
+            if c.get("columnType") == "DROPDOWN"
+        ]
+        assert len(dropdown_cols) == 3
+        for c in dropdown_cols:
+            cond = c["dataValidationRule"]["condition"]
             assert cond["type"] == "ONE_OF_LIST"
             assert all("userEnteredValue" in v for v in cond["values"])
 
-    def test_dropdown_starts_at_row_2(self):
+    def test_no_setdatavalidation_inside_tables(self):
+        """Sanity check: ``_apply_dropdowns`` must skip table tabs."""
         reqs = bootstrap_requests()
-        for r in _by_kind(reqs, "setDataValidation"):
-            assert r["setDataValidation"]["range"]["startRowIndex"] == 1
+        assert _by_kind(reqs, "setDataValidation") == []
 
 
 class TestColumnFormats:

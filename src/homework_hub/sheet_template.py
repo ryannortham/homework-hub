@@ -254,13 +254,16 @@ def _table_column_properties(index: int, col: ColumnSpec) -> dict[str, Any]:
         "columnType": type_for_kind[col.kind],
     }
     if col.kind is ColumnKind.DROPDOWN:
+        # NOTE: Inside ``addTable.table.columnProperties[].dataValidationRule``
+        # the API only accepts ``condition`` — ``strict`` and ``showCustomUi``
+        # are rejected here even though they're valid on a standalone
+        # ``setDataValidation`` rule. We apply those flags via the separate
+        # ``_apply_dropdowns`` pass below.
         props["dataValidationRule"] = {
             "condition": {
                 "type": "ONE_OF_LIST",
                 "values": [{"userEnteredValue": v} for v in col.dropdown_values],
             },
-            "strict": True,
-            "showCustomUi": True,
         }
     return props
 
@@ -329,9 +332,17 @@ def _apply_column_formats(schema: SheetSchema, sheet_ids: dict[str, int]) -> lis
 
 
 def _apply_dropdowns(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
-    """ONE_OF_LIST DataValidation per DROPDOWN column on row 2 onwards."""
+    """ONE_OF_LIST DataValidation per DROPDOWN column on row 2 onwards.
+
+    Skips tabs backed by a native Table — those columns already enforce
+    dropdown semantics via ``columnType=DROPDOWN`` set in ``addTable``,
+    and the API rejects ``setDataValidation`` on cells inside typed
+    table columns.
+    """
     out: list[dict[str, Any]] = []
     for tab in schema.tabs:
+        if tab.table_id:
+            continue
         for i, col in enumerate(tab.columns):
             if col.kind is not ColumnKind.DROPDOWN:
                 continue
