@@ -246,3 +246,227 @@ def test_bootstrap_sheet_refuses_when_already_set(tmp_path: Path):
     result = runner.invoke(cli, ["bootstrap-sheet", "--child", "james"], env=env)
     assert result.exit_code != 0
     assert "already" in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# subjects subcommands
+# --------------------------------------------------------------------------- #
+
+
+def _write_subjects_yaml(config_dir: Path) -> Path:
+    """Drop a tiny subjects.yaml into config_dir and return its path."""
+    path = config_dir / "subjects.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "rules": [
+                    {
+                        "match": "exact",
+                        "pattern": "9SCI2 (2026 Academic)",
+                        "canonical": "Year 9 Science",
+                        "short": "Sci",
+                    },
+                    {
+                        "match": "prefix",
+                        "pattern": "9SCI",
+                        "canonical": "Year 9 Science",
+                        "short": "Sci",
+                    },
+                    {
+                        "match": "regex",
+                        "pattern": r"^VCE Methods.*",
+                        "canonical": "Year 11 Maths",
+                        "short": "Maths",
+                    },
+                ]
+            }
+        )
+    )
+    return path
+
+
+def test_subjects_list_empty(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["subjects", "list"], env=env)
+    assert result.exit_code == 0, result.output
+    assert "No rules" in result.output
+
+
+def test_subjects_seed_then_list(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    _write_subjects_yaml(Path(env["HOMEWORK_HUB_CONFIG_DIR"]))
+    runner = CliRunner()
+
+    seed_res = runner.invoke(cli, ["subjects", "seed"], env=env)
+    assert seed_res.exit_code == 0, seed_res.output
+    assert "Seeded 3" in seed_res.output
+
+    list_res = runner.invoke(cli, ["subjects", "list"], env=env)
+    assert list_res.exit_code == 0, list_res.output
+    assert "9SCI2 (2026 Academic)" in list_res.output
+    assert "VCE Methods" in list_res.output
+    assert "3 rule(s)" in list_res.output
+
+
+def test_subjects_seed_replace(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    _write_subjects_yaml(Path(env["HOMEWORK_HUB_CONFIG_DIR"]))
+    runner = CliRunner()
+    runner.invoke(cli, ["subjects", "seed"], env=env)
+    # Re-seed with --replace; should still report 3 rules total.
+    res = runner.invoke(cli, ["subjects", "seed", "--replace"], env=env)
+    assert res.exit_code == 0, res.output
+    assert "replaced" in res.output
+
+
+def test_subjects_seed_missing_file(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    res = runner.invoke(cli, ["subjects", "seed"], env=env)
+    assert res.exit_code != 0
+    assert "not found" in res.output.lower()
+
+
+def test_subjects_test_match_and_no_match(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    _write_subjects_yaml(Path(env["HOMEWORK_HUB_CONFIG_DIR"]))
+    runner = CliRunner()
+    runner.invoke(cli, ["subjects", "seed"], env=env)
+
+    hit = runner.invoke(cli, ["subjects", "test", "9SCI Year 9 Science"], env=env)
+    assert hit.exit_code == 0, hit.output
+    assert "Year 9 Science" in hit.output
+    assert "Sci" in hit.output
+
+    miss = runner.invoke(cli, ["subjects", "test", "Quidditch 101"], env=env)
+    assert miss.exit_code == 1
+    assert "no match" in miss.output.lower()
+
+
+def test_subjects_add_and_remove(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+
+    add = runner.invoke(
+        cli,
+        [
+            "subjects",
+            "add",
+            "--type",
+            "exact",
+            "--pattern",
+            "11BIO3",
+            "--canonical",
+            "Year 11 Biology",
+            "--short",
+            "Bio",
+        ],
+        env=env,
+    )
+    assert add.exit_code == 0, add.output
+    assert "Added rule" in add.output
+
+    listing = runner.invoke(cli, ["subjects", "list"], env=env)
+    assert "11BIO3" in listing.output
+
+    rm = runner.invoke(
+        cli,
+        ["subjects", "remove", "--type", "exact", "--pattern", "11BIO3"],
+        env=env,
+    )
+    assert rm.exit_code == 0, rm.output
+    assert "Removed 1" in rm.output
+
+    rm_again = runner.invoke(
+        cli,
+        ["subjects", "remove", "--type", "exact", "--pattern", "11BIO3"],
+        env=env,
+    )
+    assert rm_again.exit_code != 0
+
+
+def test_subjects_add_invalid_regex(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    res = runner.invoke(
+        cli,
+        [
+            "subjects",
+            "add",
+            "--type",
+            "regex",
+            "--pattern",
+            "[unclosed",
+            "--canonical",
+            "Bad",
+            "--short",
+            "B",
+        ],
+        env=env,
+    )
+    assert res.exit_code != 0
+
+
+# --------------------------------------------------------------------------- #
+# links subcommands
+# --------------------------------------------------------------------------- #
+
+
+def _seed_link_pair(state_db: Path) -> None:
+    """Insert a Compass↔Classroom pair for james that the detector will flag."""
+    import sqlite3
+    from contextlib import closing
+    from datetime import UTC, datetime
+
+    from homework_hub.state.store import StateStore
+
+    StateStore(state_db)  # ensure schema
+    due = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+    now = datetime.now(UTC).isoformat()
+    with closing(sqlite3.connect(state_db)) as conn, conn:
+        for source, source_id, title in [
+            ("compass", "C1", "WW1 Benchmark"),
+            ("classroom", "K1", "WW1"),
+        ]:
+            conn.execute(
+                "INSERT INTO silver_tasks "
+                "(child, source, source_id, subject_raw, subject_canonical, "
+                "subject_short, title, status, last_synced, due_at) "
+                "VALUES ('james', ?, ?, '', 'Year 9 Humanities', 'Hum', "
+                "?, 'not_started', ?, ?)",
+                (source, source_id, title, now, due),
+            )
+
+
+def test_links_list_empty(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    res = runner.invoke(cli, ["links", "list"], env=env)
+    assert res.exit_code == 0, res.output
+    assert "No links" in res.output
+
+
+def test_links_detect_then_list(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    _seed_link_pair(Path(env["HOMEWORK_HUB_STATE_DB"]))
+    runner = CliRunner()
+
+    detect = runner.invoke(cli, ["links", "detect"], env=env)
+    assert detect.exit_code == 0, detect.output
+    assert "inserted=1" in detect.output
+
+    listing = runner.invoke(cli, ["links", "list"], env=env)
+    assert listing.exit_code == 0, listing.output
+    assert "auto_high" in listing.output
+    assert "compass:C1" in listing.output
+    assert "classroom:K1" in listing.output
+
+
+def test_links_detect_specific_child(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    _seed_link_pair(Path(env["HOMEWORK_HUB_STATE_DB"]))
+    runner = CliRunner()
+    res = runner.invoke(cli, ["links", "detect", "--child", "james"], env=env)
+    assert res.exit_code == 0, res.output
+    assert "james: inserted=1" in res.output

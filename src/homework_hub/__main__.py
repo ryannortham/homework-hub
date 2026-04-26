@@ -203,6 +203,208 @@ def bootstrap_sheet(child: str, title: str | None, share_with: tuple[str, ...]) 
         click.echo(f"Shared with: {', '.join(share_with)}")
 
 
+@cli.group()
+def subjects() -> None:
+    """Manage the ``dim_subjects`` canonicalisation rule table."""
+
+
+def _build_resolver() -> tuple[Settings, object]:
+    """Construct ``(settings, SubjectResolver)`` for CLI commands.
+
+    Imported lazily so ``homework_hub --help`` stays cheap.
+    """
+    from homework_hub.pipeline.subjects import SubjectResolver
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    store = StateStore(settings.state_db)
+    return settings, SubjectResolver(store)
+
+
+@subjects.command("list")
+def subjects_list() -> None:
+    """List all subject rules in priority order."""
+    _, resolver = _build_resolver()
+    rules = resolver.rules
+    if not rules:
+        click.echo("No rules. Run `homework_hub subjects seed` to load defaults.")
+        return
+    click.echo(f"{'id':>4} {'type':<7} {'prio':>4}  {'pattern':<40} → canonical (short)")
+    for r in rules:
+        click.echo(
+            f"{r.id:>4} {r.match_type:<7} {r.priority:>4}  "
+            f"{r.pattern:<40} → {r.canonical} ({r.short})"
+        )
+    click.echo(f"\n{len(rules)} rule(s).")
+
+
+@subjects.command("seed")
+@click.option(
+    "--from",
+    "from_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="YAML file to seed from. Defaults to <config_dir>/subjects.yaml.",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    default=False,
+    help="Wipe existing rules before seeding (otherwise INSERT OR IGNORE).",
+)
+def subjects_seed(from_path: Path | None, replace: bool) -> None:
+    """Seed ``dim_subjects`` from a YAML file."""
+    settings, resolver = _build_resolver()
+    yaml_path = from_path or settings.config_dir / "subjects.yaml"
+    if not yaml_path.exists():
+        raise click.ClickException(f"Seed file not found: {yaml_path}")
+    count = resolver.seed_from_yaml(yaml_path, replace=replace)
+    verb = "replaced" if replace else "merged"
+    click.echo(f"Seeded {count} rule(s) from {yaml_path} ({verb}).")
+
+
+@subjects.command("test")
+@click.argument("raw")
+def subjects_test(raw: str) -> None:
+    """Test how a raw subject string resolves."""
+    _, resolver = _build_resolver()
+    match = resolver.resolve(raw)
+    if match is None:
+        click.echo(f"{raw!r} → no match (would fall back to raw value)")
+        raise SystemExit(1)
+    click.echo(
+        f"{raw!r} → {match.canonical} ({match.short})  "
+        f"[rule #{match.rule_id}, {match.match_type}]"
+    )
+
+
+@subjects.command("add")
+@click.option(
+    "--type",
+    "match_type",
+    type=click.Choice(["exact", "prefix", "regex"]),
+    required=True,
+)
+@click.option("--pattern", required=True)
+@click.option("--canonical", required=True, help="Human label, e.g. 'Year 9 Science'.")
+@click.option("--short", required=True, help="Kid-facing short, e.g. 'Sci'.")
+@click.option(
+    "--priority",
+    type=int,
+    default=None,
+    help="Override default priority (exact=100, prefix=50, regex=10).",
+)
+def subjects_add(
+    match_type: str,
+    pattern: str,
+    canonical: str,
+    short: str,
+    priority: int | None,
+) -> None:
+    """Add a new rule."""
+    _, resolver = _build_resolver()
+    try:
+        new_id = resolver.add_rule(
+            match_type=match_type,
+            pattern=pattern,
+            canonical=canonical,
+            short=short,
+            priority=priority,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Added rule #{new_id}: {match_type} {pattern!r} → {canonical} ({short})")
+
+
+@subjects.command("remove")
+@click.option(
+    "--type",
+    "match_type",
+    type=click.Choice(["exact", "prefix", "regex"]),
+    required=True,
+)
+@click.option("--pattern", required=True)
+def subjects_remove(match_type: str, pattern: str) -> None:
+    """Remove a rule by (type, pattern)."""
+    _, resolver = _build_resolver()
+    removed = resolver.remove_rule(match_type=match_type, pattern=pattern)
+    if removed == 0:
+        raise click.ClickException(f"No rule matched {match_type} {pattern!r}.")
+    click.echo(f"Removed {removed} rule(s).")
+
+
+@cli.group()
+def links() -> None:
+    """Inspect or re-run cross-source duplicate detection.
+
+    Confirmation/dismissal of pending links is done by kids via the
+    Possible Duplicates sheet checkboxes — there is no CLI verb for it.
+    """
+
+
+def _build_link_detector() -> tuple[Settings, object]:
+    from homework_hub.pipeline.link_detector import LinkDetector
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    store = StateStore(settings.state_db)
+    return settings, LinkDetector(store)
+
+
+@links.command("list")
+@click.option(
+    "--child",
+    default=None,
+    help="Child name; omit to list links for every child in children.yaml.",
+)
+def links_list(child: str | None) -> None:
+    """Print every silver_task_link row, grouped by child."""
+    from homework_hub.config import ChildrenConfig
+
+    settings, detector = _build_link_detector()
+    cfg = ChildrenConfig.load(settings.children_yaml)
+    targets = [child] if child else list(cfg.children.keys())
+
+    any_rows = False
+    for name in targets:
+        rows = detector.list_for_child(name)
+        if not rows:
+            continue
+        any_rows = True
+        click.echo(f"\n== {name} ({len(rows)} link(s)) ==")
+        for r in rows:
+            click.echo(
+                f"  #{r['id']:<4} {r['confidence']:<11} {r['state']:<10} "
+                f"{r['primary_source']}:{r['primary_source_id']} ↔ "
+                f"{r['secondary_source']}:{r['secondary_source_id']} "
+                f"(Δdays={r['score_due']}, title={r['score_title']:.2f})"
+            )
+    if not any_rows:
+        click.echo("No links found.")
+
+
+@links.command("detect")
+@click.option(
+    "--child",
+    default=None,
+    help="Child name; omit to re-detect for every child in children.yaml.",
+)
+def links_detect(child: str | None) -> None:
+    """Re-run the duplicate detector against current silver_tasks."""
+    from homework_hub.config import ChildrenConfig
+
+    settings, detector = _build_link_detector()
+    cfg = ChildrenConfig.load(settings.children_yaml)
+    targets = [child] if child else list(cfg.children.keys())
+
+    for name in targets:
+        result = detector.detect(name)
+        click.echo(
+            f"{name}: inserted={result.inserted} updated={result.updated} "
+            f"unchanged={result.unchanged}"
+        )
+
+
 @cli.command()
 def status() -> None:
     """Print the most recent success/failure per child + source."""
