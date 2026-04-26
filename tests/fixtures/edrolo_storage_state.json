@@ -3,7 +3,7 @@
     {
       "name": "sessionid",
       "value": "fake-session-abc123",
-      "domain": ".edrolo.com.au",
+      "domain": ".app.edrolo.com",
       "path": "/",
       "expires": -1,
       "httpOnly": true,
@@ -13,7 +13,7 @@
     {
       "name": "csrftoken",
       "value": "fake-csrf-xyz789",
-      "domain": ".edrolo.com.au",
+      "domain": ".app.edrolo.com",
       "path": "/",
       "expires": -1,
       "httpOnly": false,
@@ -23,7 +23,7 @@
     {
       "name": "_ga",
       "value": "GA1.2.fake",
-      "domain": ".edrolo.com.au",
+      "domain": ".app.edrolo.com",
       "path": "/",
       "expires": -1,
       "httpOnly": false,

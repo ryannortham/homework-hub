@@ -8,7 +8,7 @@
       "assigned_at": "2026-04-20T08:00:00Z",
       "due_at": "2026-05-02T13:00:00Z",
       "status": "not_started",
-      "url": "https://edrolo.com.au/student/tasks/99821/"
+      "url": "https://app.edrolo.com/student/tasks/99821/"
     },
     {
       "id": 99822,
@@ -18,7 +18,7 @@
       "assigned_at": "2026-04-21T08:00:00Z",
       "due_at": "2026-04-28T13:00:00Z",
       "submitted_at": "2026-04-27T10:15:00Z",
-      "url": "https://edrolo.com.au/student/tasks/99822/"
+      "url": "https://app.edrolo.com/student/tasks/99822/"
     }
   ]
 }

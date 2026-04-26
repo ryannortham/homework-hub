@@ -1,4 +1,4 @@
-"""Edrolo (edrolo.com.au) source.
+"""Edrolo (app.edrolo.com) source.
 
 Edrolo is a paid Australian VCE/HSC platform with no public API. Auth uses
 Google SSO, and headless Chromium is reliably detected by Google's anti-bot
@@ -33,6 +33,7 @@ DEVTOOLS_NEEDED:
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,7 @@ from homework_hub.sources.base import (
 )
 
 # Edrolo serves its app under the apex domain.
-DEFAULT_BASE_URL = "https://edrolo.com.au"
+DEFAULT_BASE_URL = "https://app.edrolo.com"
 
 # Best-guess API path. Common DRF patterns: /api/student/tasks/,
 # /api/v2/students/me/tasks/, /api/studyplanner/tasks/. Verify and update.
@@ -226,7 +227,7 @@ class EdroloStorageState:
         self.path = path
 
     def validate(self) -> None:
-        cookies = self.cookies_for_domain("edrolo.com.au")
+        cookies = self.cookies_for_domain("app.edrolo.com")
         for required in self.REQUIRED_COOKIES:
             if required not in cookies:
                 raise AuthExpiredError(
@@ -243,7 +244,7 @@ class EdroloStorageState:
                 out[c["name"]] = c["value"]
         return out
 
-    def cookie_header(self, domain: str = "edrolo.com.au") -> str:
+    def cookie_header(self, domain: str = "app.edrolo.com") -> str:
         """Render the matching cookies as a single Cookie header value."""
         return "; ".join(f"{k}={v}" for k, v in self.cookies_for_domain(domain).items())
 
@@ -274,8 +275,23 @@ def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> Non
             lambda url: "/account/login" not in url and "accounts.google.com" not in url,
             timeout=300_000,  # 5 min for the human to finish 2FA
         )
-        # Give SPA hydration a moment so cookies are set.
-        page.wait_for_timeout(3_000)
+        # Poll until the SPA has set the ``sessionid`` cookie. Edrolo's hydration
+        # can be slow, especially on first login, so a fixed sleep isn't safe.
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            cookies = {c["name"]: c.get("value") for c in context.cookies()}
+            if cookies.get("sessionid"):
+                break
+            page.wait_for_timeout(500)
+        else:
+            browser.close()
+            raise RuntimeError(
+                "Edrolo headed login finished but no 'sessionid' cookie was set "
+                "within 60s. Try again and ensure the dashboard fully loads "
+                "before closing the browser."
+            )
+        # Tiny extra settle so any sibling cookies (csrftoken, etc.) land too.
+        page.wait_for_timeout(500)
         state = context.storage_state()
         EdroloStorageState(state).save(out_path)
         browser.close()

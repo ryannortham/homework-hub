@@ -16,7 +16,7 @@ children:
         enabled: true
         subdomain: mcsc-vic        # https://mcsc-vic.compass.education
       edrolo:
-        enabled: true
+        enabled: false             # James doesn't use Edrolo
     compass_user_id: null          # populate after capturing James's userId
     # sheet_id is populated by `homework-hub bootstrap-sheet --child james`
     sheet_id: null

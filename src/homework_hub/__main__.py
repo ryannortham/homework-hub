@@ -141,7 +141,7 @@ def auth_compass(subdomain: str, cookie: str | None, token_path: Path | None) ->
 )
 @click.option(
     "--base-url",
-    default="https://edrolo.com.au",
+    default="https://app.edrolo.com",
     help="Override Edrolo base URL (rarely needed).",
 )
 def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:

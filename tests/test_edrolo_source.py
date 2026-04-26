@@ -56,7 +56,7 @@ class TestMapping:
         assert t.subject == "Mathematical Methods 3/4"
         assert t.title == "Chapter 4 — Calculus Practice"
         assert t.status is Status.NOT_STARTED
-        assert t.url == "https://edrolo.com.au/student/tasks/99821/"
+        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
 
     def test_due_date_parsed(self, task):
         t = map_edrolo_task_to_task(child="james", edrolo_task=task)
@@ -104,7 +104,7 @@ class TestMapping:
     def test_default_url_when_missing(self, task):
         del task["url"]
         t = map_edrolo_task_to_task(child="james", edrolo_task=task)
-        assert t.url == "https://edrolo.com.au/student/tasks/99821/"
+        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
 
     def test_alternate_subject_field(self, task):
         del task["course_name"]
@@ -164,7 +164,7 @@ class TestEdroloStorageState:
         path = tmp_path / "edrolo.json"
         EdroloStorageState(storage_raw).save(path)
         loaded = EdroloStorageState.load(path)
-        assert "sessionid" in loaded.cookies_for_domain("edrolo.com.au")
+        assert "sessionid" in loaded.cookies_for_domain("app.edrolo.com")
 
     def test_load_missing_raises_auth_expired(self, tmp_path: Path):
         with pytest.raises(AuthExpiredError):
@@ -190,9 +190,9 @@ class TestEdroloStorageState:
         assert path.exists()
 
     def test_cookies_for_domain_matches_subdomain_cookies(self, storage_raw):
-        # Cookies set with leading-dot domain (.edrolo.com.au) should match.
+        # Cookies set with leading-dot domain (.app.edrolo.com) should match.
         state = EdroloStorageState(storage_raw)
-        cookies = state.cookies_for_domain("edrolo.com.au")
+        cookies = state.cookies_for_domain("app.edrolo.com")
         assert cookies["sessionid"] == "fake-session-abc123"
         assert cookies["csrftoken"] == "fake-csrf-xyz789"
 
