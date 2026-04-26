@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from unittest.mock import patch
+
 from click.testing import CliRunner
 
 from homework_hub.__main__ import cli
@@ -29,12 +33,45 @@ def test_sync_with_child():
     assert "child=james" in result.output
 
 
-def test_auth_subgroup():
+def test_auth_compass_stub():
     runner = CliRunner()
-    for src in ("classroom", "compass", "edrolo"):
-        result = runner.invoke(cli, ["auth", src, "--child", "james"])
-        assert result.exit_code == 0
-        assert src in result.output
+    result = runner.invoke(cli, ["auth", "compass", "--child", "james"])
+    assert result.exit_code == 0
+    assert "compass" in result.output
+
+
+def test_auth_edrolo_stub():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["auth", "edrolo", "--child", "james"])
+    assert result.exit_code == 0
+    assert "edrolo" in result.output
+
+
+def test_auth_classroom_runs_oauth_flow_with_local_secret(tmp_path: Path):
+    secret = tmp_path / "secret.json"
+    secret.write_text(json.dumps({"installed": {"client_id": "x", "client_secret": "y"}}))
+    out_token = tmp_path / "out.json"
+
+    runner = CliRunner()
+    with patch("homework_hub.sources.classroom.run_oauth_flow") as mock_flow:
+        result = runner.invoke(
+            cli,
+            [
+                "auth",
+                "classroom",
+                "--child",
+                "james",
+                "--client-secret-file",
+                str(secret),
+                "--token-path",
+                str(out_token),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    mock_flow.assert_called_once()
+    args = mock_flow.call_args[0]
+    assert "installed" in args[0]
+    assert args[1] == out_token
 
 
 def test_auth_requires_child():

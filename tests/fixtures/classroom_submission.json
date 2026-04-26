@@ -1,0 +1,12 @@
+{
+  "courseId": "course-123",
+  "courseWorkId": "cw-456",
+  "id": "sub-789",
+  "userId": "student-1",
+  "creationTime": "2026-04-20T08:00:00Z",
+  "updateTime": "2026-04-20T08:00:00Z",
+  "state": "CREATED",
+  "late": false,
+  "courseWorkType": "ASSIGNMENT",
+  "alternateLink": "https://classroom.google.com/c/course-123/a/cw-456/submissions/sub-789"
+}
