@@ -440,3 +440,74 @@ class TestClassroomSource:
         src = ClassroomSource({"james": tmp_path / "nope.json"})
         with pytest.raises(AuthExpiredError):
             src.fetch("james")
+
+
+class TestClassroomFetchRaw:
+    """fetch_raw — raw payloads for the bronze layer (M2)."""
+
+    def test_returns_one_record_per_card_per_view(self, storage_path: Path):
+        canned = {
+            "assigned": [CARD_FULL_DATE],
+            "missing": [CARD_NO_YEAR],
+            "done": [CARD_HANDED_IN],
+        }
+        src = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _s: FakeScraper(canned),
+        )
+        records = src.fetch_raw("james")
+        assert len(records) == 3
+        assert {r.source for r in records} == {"classroom"}
+        assert {r.payload["view"] for r in records} == {"assigned", "missing", "done"}
+
+    def test_source_id_is_course_plus_stream_item(self, storage_path: Path):
+        canned = {"assigned": [CARD_FULL_DATE], "missing": [], "done": []}
+        src = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _s: FakeScraper(canned),
+        )
+        rec = src.fetch_raw("james")[0]
+        expected = f"{CARD_FULL_DATE['course_id']}:{CARD_FULL_DATE['stream_item_id']}"
+        assert rec.source_id == expected
+
+    def test_card_appearing_in_two_views_emits_two_records(self, storage_path: Path):
+        # Bronze keeps both — silver-layer dedup picks the winner.
+        canned = {
+            "assigned": [CARD_FULL_DATE],
+            "missing": [CARD_FULL_DATE],
+            "done": [],
+        }
+        src = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _s: FakeScraper(canned),
+        )
+        records = src.fetch_raw("james")
+        assert len(records) == 2
+        views = sorted(r.payload["view"] for r in records)
+        assert views == ["assigned", "missing"]
+
+    def test_payload_carries_card_view_and_base_url(self, storage_path: Path):
+        canned = {"assigned": [CARD_FULL_DATE], "missing": [], "done": []}
+        src = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _s: FakeScraper(canned),
+        )
+        rec = src.fetch_raw("james")[0]
+        assert rec.payload["card"] == CARD_FULL_DATE
+        assert rec.payload["view"] == "assigned"
+        assert rec.payload["base_url"].startswith("http")
+
+    def test_unknown_child_raises_schema_break(self, storage_path: Path):
+        src = ClassroomSource({"james": storage_path})
+        with pytest.raises(SchemaBreakError):
+            src.fetch_raw("tahlia")
+
+    def test_missing_id_fields_raise_schema_break(self, storage_path: Path):
+        broken = {**CARD_FULL_DATE, "course_id": ""}
+        canned = {"assigned": [broken], "missing": [], "done": []}
+        src = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _s: FakeScraper(canned),
+        )
+        with pytest.raises(SchemaBreakError):
+            src.fetch_raw("james")

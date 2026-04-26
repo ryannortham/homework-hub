@@ -403,3 +403,62 @@ class TestEdroloSource:
         assert by_id["99821"].status is Status.NOT_STARTED
         assert by_id["99822"].status is Status.SUBMITTED  # completion_status COMPLETED
         assert by_id["99823"].status is Status.SUBMITTED  # resolved_stage ARCHIVED
+
+
+class TestEdroloFetchRaw:
+    """fetch_raw — raw payloads for the bronze layer (M2)."""
+
+    def _save_storage(self, tmp_path: Path, storage_raw, name: str) -> Path:
+        path = tmp_path / name
+        EdroloStorageState(storage_raw).save(path)
+        return path
+
+    def test_returns_one_record_per_task(self, tmp_path: Path, task, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        courses = _load("edrolo_courses.json")
+        source = EdroloSource(
+            {"james": path},
+            client_factory=lambda _s: FakeEdroloClient([task], courses),
+        )
+        records = source.fetch_raw("james")
+        assert len(records) == 1
+        assert records[0].source == "edrolo"
+        assert records[0].child == "james"
+        assert records[0].source_id == "99821"
+
+    def test_payload_carries_task_and_course_titles(self, tmp_path: Path, task, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        courses = _load("edrolo_courses.json")
+        source = EdroloSource(
+            {"james": path},
+            client_factory=lambda _s: FakeEdroloClient([task], courses),
+        )
+        rec = source.fetch_raw("james")[0]
+        assert rec.payload["task"] == task
+        assert isinstance(rec.payload["course_titles"], dict)
+        assert rec.payload["course_titles"]  # non-empty
+
+    def test_soft_deleted_filtered_out(self, tmp_path: Path, task, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        deleted = {**task, "id": 99999, "soft_deleted": True}
+        source = EdroloSource(
+            {"james": path},
+            client_factory=lambda _s: FakeEdroloClient([task, deleted], []),
+        )
+        records = source.fetch_raw("james")
+        assert {r.source_id for r in records} == {"99821"}
+
+    def test_unknown_child_raises_schema_break(self, tmp_path: Path, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        source = EdroloSource({"james": path}, client_factory=lambda _s: FakeEdroloClient([]))
+        with pytest.raises(SchemaBreakError, match="storage state"):
+            source.fetch_raw("nobody")
+
+    def test_missing_id_raises_schema_break(self, tmp_path: Path, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        source = EdroloSource(
+            {"james": path},
+            client_factory=lambda _s: FakeEdroloClient([{"title": "x"}], []),
+        )
+        with pytest.raises(SchemaBreakError, match="missing id"):
+            source.fetch_raw("james")

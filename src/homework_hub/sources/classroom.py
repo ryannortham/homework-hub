@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 
 from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Status, Task
+from homework_hub.pipeline.ingest import RawRecord
 from homework_hub.sources.base import (
     AuthExpiredError,
     SchemaBreakError,
@@ -565,6 +566,44 @@ class ClassroomSource(Source):
                         )
                     )
         return _dedupe_by_source_id(tasks)
+
+    def fetch_raw(self, child: str) -> list[RawRecord]:
+        """Scrape Classroom views and emit raw card payloads for bronze.
+
+        One ``RawRecord`` per (course_id, stream_item_id, view). The view is
+        embedded in the payload so the silver mapper can resolve status
+        without re-scraping. Cards that appear in multiple views (e.g.
+        ``/missing`` and ``/not-turned-in``) generate one bronze row per
+        view; silver-layer dedup picks the last-write-wins.
+        """
+        if child not in self.storage_path_for_child:
+            raise SchemaBreakError(f"No Classroom storage state path configured for {child}.")
+        storage = ClassroomStorageState.load(self.storage_path_for_child[child])
+        records: list[RawRecord] = []
+        with self._scraper_factory(storage) as scraper:
+            for view in VIEW_PATHS:
+                result = scraper.fetch_view(view)
+                for card in result.cards:
+                    course_id = card.get("course_id") or ""
+                    stream_item_id = card.get("stream_item_id") or ""
+                    if not course_id or not stream_item_id:
+                        raise SchemaBreakError(
+                            f"Classroom card missing id fields: {sorted(card.keys())}"
+                        )
+                    source_id = f"{course_id}:{stream_item_id}"
+                    records.append(
+                        RawRecord(
+                            child=child,
+                            source=SourceEnum.CLASSROOM.value,
+                            source_id=source_id,
+                            payload={
+                                "card": card,
+                                "view": view,
+                                "base_url": self.base_url,
+                            },
+                        )
+                    )
+        return records
 
 
 def _dedupe_by_source_id(tasks: list[Task]) -> list[Task]:

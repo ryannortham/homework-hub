@@ -50,6 +50,7 @@ import httpx
 
 from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Status, Task
+from homework_hub.pipeline.ingest import RawRecord
 from homework_hub.sources.base import (
     AuthExpiredError,
     SchemaBreakError,
@@ -460,3 +461,41 @@ class EdroloSource(Source):
             map_edrolo_task_to_task(child=child, edrolo_task=t, course_titles=course_titles)
             for t in raw_tasks
         ]
+
+    def fetch_raw(self, child: str) -> list[RawRecord]:
+        """Fetch Edrolo student-tasks as raw payloads for the bronze layer.
+
+        Course titles are resolved once and embedded in each task's payload
+        so the silver mapper doesn't need a second API call. ``soft_deleted``
+        tasks are filtered out at fetch time — they're upstream tombstones,
+        not study items, and we never showed them in the sheet.
+        """
+        if child not in self.storage_path_for_child:
+            raise SchemaBreakError(f"No Edrolo storage state path configured for {child}.")
+        path = self.storage_path_for_child[child]
+        storage = EdroloStorageState.load(path)
+        with self._client_factory(storage) as client:
+            raw_tasks = client.get_tasks()
+            raw_courses = client.get_courses()
+
+        course_titles = {
+            str(c["id"]): c.get("title", "")
+            for c in raw_courses
+            if isinstance(c, dict) and "id" in c
+        }
+        records: list[RawRecord] = []
+        for t in raw_tasks:
+            if t.get("soft_deleted"):
+                continue
+            task_id = t.get("id")
+            if task_id is None:
+                raise SchemaBreakError(f"Edrolo task missing id: keys={sorted(t.keys())}")
+            records.append(
+                RawRecord(
+                    child=child,
+                    source=SourceEnum.EDROLO.value,
+                    source_id=str(task_id),
+                    payload={"task": t, "course_titles": course_titles},
+                )
+            )
+        return records

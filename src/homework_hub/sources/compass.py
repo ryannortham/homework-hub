@@ -32,6 +32,7 @@ import httpx
 
 from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Status, Task
+from homework_hub.pipeline.ingest import RawRecord
 from homework_hub.sources.base import (
     AuthExpiredError,
     SchemaBreakError,
@@ -346,3 +347,34 @@ class CompassSource(Source):
             map_learning_task_to_task(child=child, learning_task=lt, subdomain=token.subdomain)
             for lt in raw_tasks
         ]
+
+    def fetch_raw(self, child: str) -> list[RawRecord]:
+        """Fetch Compass Learning Tasks as raw payloads for the bronze layer.
+
+        Each ``RawRecord`` wraps one Learning Task dict verbatim from the
+        Compass API. ``source_id`` is the Learning Task's numeric id; the
+        subdomain is captured alongside so the silver mapper can rebuild
+        the per-task URL without re-loading the token.
+        """
+        if child not in self.user_id_for_child:
+            raise SchemaBreakError(
+                f"No compass_user_id configured for {child}. Add it to children.yaml."
+            )
+        user_id = self.user_id_for_child[child]
+        token = CompassToken.load(self.token_path)
+        with self._client_factory(token) as client:
+            raw_tasks = client.get_learning_tasks(user_id)
+        records: list[RawRecord] = []
+        for lt in raw_tasks:
+            task_id = lt.get("id")
+            if task_id is None:
+                raise SchemaBreakError(f"Compass LearningTask missing id: keys={sorted(lt.keys())}")
+            records.append(
+                RawRecord(
+                    child=child,
+                    source=SourceEnum.COMPASS.value,
+                    source_id=str(task_id),
+                    payload={"learning_task": lt, "subdomain": token.subdomain},
+                )
+            )
+        return records

@@ -329,3 +329,60 @@ class TestCompassSource:
         )
         with pytest.raises(AuthExpiredError):
             source.fetch("james")
+
+
+class TestCompassFetchRaw:
+    """fetch_raw — raw payloads for the bronze layer (M2)."""
+
+    def test_returns_one_record_per_learning_task(self, tmp_path: Path, lt):
+        token = CompassToken(subdomain="mcsc-vic", cookie="ABC")
+        token_path = tmp_path / "compass.json"
+        token.save(token_path)
+        fake = FakeCompassClient([lt, {**lt, "id": 9999}])
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 12345},
+            client_factory=lambda _t: fake,
+        )
+        records = source.fetch_raw("james")
+        assert len(records) == 2
+        assert {r.source_id for r in records} == {"8842", "9999"}
+        assert all(r.source == "compass" for r in records)
+        assert all(r.child == "james" for r in records)
+
+    def test_payload_carries_subdomain_and_full_lt(self, tmp_path: Path, lt):
+        token = CompassToken(subdomain="mcsc-vic", cookie="ABC")
+        token_path = tmp_path / "compass.json"
+        token.save(token_path)
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 1},
+            client_factory=lambda _t: FakeCompassClient([lt]),
+        )
+        rec = source.fetch_raw("james")[0]
+        assert rec.payload["subdomain"] == "mcsc-vic"
+        assert rec.payload["learning_task"] == lt
+
+    def test_unknown_child_raises_schema_break(self, tmp_path: Path):
+        token = CompassToken(subdomain="mcsc-vic", cookie="ABC")
+        token_path = tmp_path / "compass.json"
+        token.save(token_path)
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 1},
+            client_factory=lambda _t: FakeCompassClient([]),
+        )
+        with pytest.raises(SchemaBreakError, match="compass_user_id"):
+            source.fetch_raw("nobody")
+
+    def test_missing_id_raises_schema_break(self, tmp_path: Path):
+        token = CompassToken(subdomain="mcsc-vic", cookie="ABC")
+        token_path = tmp_path / "compass.json"
+        token.save(token_path)
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 1},
+            client_factory=lambda _t: FakeCompassClient([{"name": "x"}]),
+        )
+        with pytest.raises(SchemaBreakError, match="missing id"):
+            source.fetch_raw("james")

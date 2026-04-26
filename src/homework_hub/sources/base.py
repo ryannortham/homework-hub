@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from homework_hub.models import Task
+from homework_hub.pipeline.ingest import RawRecord
 
 
 class SourceError(Exception):
@@ -37,3 +38,12 @@ class Source(ABC):
     @abstractmethod
     def fetch(self, child: str) -> list[Task]:
         """Return the current set of homework tasks for a single child."""
+
+    def fetch_raw(self, child: str) -> list[RawRecord]:
+        """Return raw upstream payloads for the bronze layer.
+
+        Default implementation raises ``NotImplementedError`` so legacy
+        sources keep working until they migrate. Once the medallion
+        pipeline is the only path, this becomes ``@abstractmethod``.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.fetch_raw not implemented")
