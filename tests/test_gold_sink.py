@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import gspread
 import pytest
 
-from homework_hub.schema import TASKS_TAB, USER_EDITS_TAB
+from homework_hub.schema import SETTINGS_TAB, TASKS_TAB, TODAY_TAB, USER_EDITS_TAB
 from homework_hub.sinks.gold_sink import (
     GoldSinkError,
     GspreadGoldSink,
@@ -113,6 +113,11 @@ class FakeWorksheet:
         self._rows = rows or []
         self.cleared: list[list[str]] = []
         self.updates: list[dict] = []
+        self.appended: list[list[list[object]]] = []
+
+    @property
+    def row_count(self) -> int:
+        return len(self._rows)
 
     def get_all_values(self) -> list[list[str]]:
         return [list(r) for r in self._rows]
@@ -128,6 +133,16 @@ class FakeWorksheet:
                 "value_input_option": value_input_option,
             }
         )
+
+    def append_rows(
+        self,
+        values: list[list[object]],
+        *,
+        value_input_option: str = "RAW",
+        insert_data_option: str = "INSERT_ROWS",
+        table_range: str = "A1",
+    ) -> None:
+        self.appended.append(values)
 
 
 class FakeSpreadsheet:
@@ -150,10 +165,15 @@ class FakeGspreadClient:
         return self._sh
 
 
-def _make_sink(worksheets: dict[str, FakeWorksheet]) -> tuple[GspreadGoldSink, FakeGspreadClient]:
+def _make_sink(
+    worksheets: dict[str, FakeWorksheet],
+    with_discovery: bool = False,
+) -> tuple[GspreadGoldSink, FakeGspreadClient]:
     sink = GspreadGoldSink(credentials=MagicMock())
     fake_client = FakeGspreadClient(FakeSpreadsheet(worksheets))
     sink._gspread = fake_client  # type: ignore[assignment]
+    if with_discovery:
+        sink._discovery = MagicMock()  # type: ignore[assignment]
     return sink, fake_client
 
 
@@ -234,37 +254,106 @@ def test_read_duplicate_checkboxes_parses_columns_correctly():
 # --------------------------------------------------------------------------- #
 
 
-def test_write_tab_clears_data_area_when_rows_empty():
-    ws = FakeWorksheet("Tasks", ws_id=1)
-    sink, _ = _make_sink({"Tasks": ws})
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
-    last_col = _col_letter(len(TASKS_TAB.columns))
-    assert ws.cleared == [[f"A2:{last_col}"]]
+# --------------------------------------------------------------------------- #
+# write_tab — table-backed tabs (Tasks, UserEdits, Possible Duplicates)
+# --------------------------------------------------------------------------- #
+
+
+def test_write_table_tab_deletes_data_rows_then_appends():
+    """For table-backed tabs, write_tab deletes existing data rows (keeping
+    the header) then appends new rows so the Table auto-extends."""
+    header = ["subject", "title", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
+    ws = FakeWorksheet("Tasks", rows=[header, ["", "", "", "", "", "", False, "", "", "", ""]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    rows = [
+        ("Maths", "Chapter 3", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1"),
+    ]
+    sink.write_tab("sheet-id", TASKS_TAB, rows)
+
+    # Should NOT use plain clear/update
+    assert ws.cleared == []
     assert ws.updates == []
+    # Should have called deleteDimension via discovery
+    disc = sink._discovery
+    disc.spreadsheets.return_value.batchUpdate.assert_called_once()
+    body = disc.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
+    req = body["requests"][0]["deleteDimension"]["range"]
+    assert req["sheetId"] == 1
+    assert req["dimension"] == "ROWS"
+    assert req["startIndex"] == 1  # 0-based row 2
+    assert req["endIndex"] == 2    # ws had 2 rows total
+    # Should have appended the new row
+    assert len(ws.appended) == 1
+    assert ws.appended[0][0][0] == "Maths"
 
 
-def test_write_tab_writes_encoded_rows_with_user_entered():
-    ws = FakeWorksheet("UserEdits", ws_id=2)
-    sink, _ = _make_sink({"UserEdits": ws})
+def test_write_table_tab_skips_delete_when_header_only():
+    """If the sheet already has only the header row (row_count=1), skip delete."""
+    ws = FakeWorksheet("Tasks", rows=[["subject"]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, None, "Not started", "Medium", False, "", "Classroom", "", "uid-1")])
+    disc = sink._discovery
+    disc.spreadsheets.return_value.batchUpdate.assert_not_called()
+    assert len(ws.appended) == 1
+
+
+def test_write_table_tab_empty_rows_skips_append():
+    """Empty rows: deletes existing data rows but does not call append_rows."""
+    ws = FakeWorksheet("Tasks", rows=[["subject"], [""]], ws_id=1)
+    sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[])
+    disc = sink._discovery
+    disc.spreadsheets.return_value.batchUpdate.assert_called_once()
+    assert ws.appended == []
+
+
+def test_write_table_tab_encodes_values_correctly():
+    """Rows written via append_rows are encoded the same as plain tabs."""
+    ws = FakeWorksheet("UserEdits", rows=[["task_uid"]], ws_id=2)
+    sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
     rows = [
         ("uid-1", "priority", "High", datetime(2026, 4, 26, 10, 0, tzinfo=UTC)),
         ("uid-2", "done", True, None),
     ]
     sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
-    last_col = _col_letter(len(USER_EDITS_TAB.columns))
-    assert ws.cleared == [[f"A2:{last_col}"]]
-    assert len(ws.updates) == 1
-    upd = ws.updates[0]
-    assert upd["value_input_option"] == "USER_ENTERED"
-    assert upd["range_name"] == f"A2:{last_col}3"
-    assert upd["values"] == [
-        ["uid-1", "priority", "High", "2026-04-26"],
-        ["uid-2", "done", True, ""],
+    assert ws.appended == [
+        [
+            ["uid-1", "priority", "High", "2026-04-26"],
+            ["uid-2", "done", True, ""],
+        ]
     ]
 
 
+# --------------------------------------------------------------------------- #
+# write_tab — plain tabs (Today, Settings)
+# --------------------------------------------------------------------------- #
+
+
+def test_write_plain_tab_clears_then_updates():
+    """Plain tabs use batch_clear + update (no deleteDimension, no append_rows)."""
+    ws = FakeWorksheet("Today", ws_id=3)
+    sink, _ = _make_sink({"Today": ws})
+    rows = [("=TODAY()",), ("=A1+1",)]
+    sink.write_tab("sheet-id", TODAY_TAB, rows)
+    last_col = _col_letter(len(TODAY_TAB.columns))
+    assert ws.cleared == [[f"A2:{last_col}"]]
+    assert len(ws.updates) == 1
+    assert ws.updates[0]["range_name"] == f"A2:{last_col}3"
+    assert ws.appended == []
+
+
+def test_write_plain_tab_empty_rows_only_clears():
+    ws = FakeWorksheet("Today", ws_id=3)
+    sink, _ = _make_sink({"Today": ws})
+    sink.write_tab("sheet-id", TODAY_TAB, rows=[])
+    last_col = _col_letter(len(TODAY_TAB.columns))
+    assert ws.cleared == [[f"A2:{last_col}"]]
+    assert ws.updates == []
+    assert ws.appended == []
+
+
 def test_write_tab_raises_when_tab_missing():
-    sink, _ = _make_sink({})
+    sink, _ = _make_sink({}, with_discovery=True)
     with pytest.raises(GoldSinkError, match="bootstrap-sheet"):
         sink.write_tab("sheet-id", TASKS_TAB, rows=[])
 

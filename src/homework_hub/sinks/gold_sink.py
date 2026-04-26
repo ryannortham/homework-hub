@@ -129,9 +129,19 @@ class GspreadGoldSink:
     ) -> None:
         """Replace the data area of ``tab`` with ``rows``.
 
-        Strategy:
-        1. Clear everything below row 1 (preserves the header).
-        2. If ``rows`` is non-empty, write them starting at A2.
+        Plain tabs (no native Table):
+          1. Clear everything below row 1 (preserves the header).
+          2. Write rows starting at A2 via ``values.update``.
+
+        Table-backed tabs (``tab.table_id`` is set):
+          Native Sheets Tables auto-extend only when rows are *appended*
+          below their current range via ``values.append``; writing via
+          ``values.update`` populates the underlying grid cells but the
+          Table widget does not include those rows.  Strategy:
+          1. Delete all data rows (row 2 onward) from the sheet so the
+             Table is reset to header-only.
+          2. Append the new rows via ``append_rows`` (``values.append``),
+             which causes the Table to auto-extend to include them.
 
         ``rows`` are tuples of cell values matching the tab's column order.
         ``None`` becomes an empty string. ``datetime`` objects are
@@ -146,20 +156,72 @@ class GspreadGoldSink:
                 "was it bootstrapped via `homework-hub bootstrap-sheet`?"
             ) from exc
 
-        last_col = _col_letter(len(tab.columns))
-        # Clear everything below the header.
-        ws.batch_clear([f"A2:{last_col}"])
-
-        if not rows:
-            return
-
         encoded = [[_encode_cell(v) for v in row] for row in rows]
+
+        if tab.table_id:
+            self._write_table_tab(spreadsheet_id, ws, encoded)
+        else:
+            self._write_plain_tab(ws, len(tab.columns), encoded)
+
+    def _write_plain_tab(
+        self,
+        ws: gspread.Worksheet,
+        num_cols: int,
+        encoded: list[list[object]],
+    ) -> None:
+        """Clear + range-write for non-Table tabs."""
+        last_col = _col_letter(num_cols)
+        ws.batch_clear([f"A2:{last_col}"])
+        if not encoded:
+            return
         end_row = 1 + len(encoded)
         ws.update(
             range_name=f"A2:{last_col}{end_row}",
             values=encoded,
             value_input_option="USER_ENTERED",
         )
+
+    def _write_table_tab(
+        self,
+        spreadsheet_id: str,
+        ws: gspread.Worksheet,
+        encoded: list[list[object]],
+    ) -> None:
+        """Delete all data rows then append fresh rows for Table-backed tabs.
+
+        Deleting rows (rather than just clearing values) resets the Table's
+        row range back to header-only, so the subsequent ``append_rows``
+        call causes the Table to auto-extend cleanly from row 2.
+        """
+        # How many rows currently exist (including header)?
+        current_row_count = ws.row_count
+        if current_row_count > 1:
+            # Delete rows 2..end via batchUpdate deleteRows request.
+            self._disc().spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "deleteDimension": {
+                                "range": {
+                                    "sheetId": ws.id,
+                                    "dimension": "ROWS",
+                                    "startIndex": 1,  # 0-based → row 2
+                                    "endIndex": current_row_count,
+                                }
+                            }
+                        }
+                    ]
+                },
+            ).execute()
+
+        if encoded:
+            ws.append_rows(
+                encoded,
+                value_input_option="USER_ENTERED",
+                insert_data_option="INSERT_ROWS",
+                table_range="A1",
+            )
 
     def set_tab_hidden(self, spreadsheet_id: str, tab: TabSpec, hidden: bool) -> None:
         """Toggle ``hidden`` on ``tab``."""
