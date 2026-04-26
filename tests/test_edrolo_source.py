@@ -386,17 +386,20 @@ class TestEdroloSource:
         with pytest.raises(AuthExpiredError):
             source.fetch("james")
 
-    def test_archived_and_completed_filtered_out(self, tmp_path: Path, storage_raw):
+    def test_archived_and_completed_pass_through(self, tmp_path: Path, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
         raw_tasks = _load("edrolo_response.json")
         courses = _load("edrolo_courses.json")
-        # Fixture has 3 tasks: one open, one completed, one archived.
-        # Only the open one should survive.
+        # Fixture has 3 tasks: open NOT_STARTED, open COMPLETED, ARCHIVED.
+        # All three should reach the sheet, with archived/completed mapped to
+        # Status.SUBMITTED so the sheet's views grey them out.
         source = EdroloSource(
             {"james": path},
             client_factory=lambda _s: FakeEdroloClient(raw_tasks, courses),
         )
         tasks = source.fetch("james")
-        assert len(tasks) == 1
-        assert tasks[0].source_id == "99821"
-        assert tasks[0].status is Status.NOT_STARTED
+        assert len(tasks) == 3
+        by_id = {t.source_id: t for t in tasks}
+        assert by_id["99821"].status is Status.NOT_STARTED
+        assert by_id["99822"].status is Status.SUBMITTED  # completion_status COMPLETED
+        assert by_id["99823"].status is Status.SUBMITTED  # resolved_stage ARCHIVED

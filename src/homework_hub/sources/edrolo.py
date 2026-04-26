@@ -30,8 +30,12 @@ Task fields we use::
     resolved_stage ('ARCHIVED'|'OPEN'|...), soft_deleted (bool),
     course_ids (list of str), task_assignments[0].completion_status
 
-We surface only **active** tasks: ``resolved_stage != "ARCHIVED"``,
-``not soft_deleted``, and the assignment's ``completion_status != "COMPLETED"``.
+We pass *all* tasks through to the sheet — including ARCHIVED, CLOSED, and
+COMPLETED ones — mapping them to ``Status.SUBMITTED``. The sheet's ``Today``
+and ``Tasks`` views already exclude submitted/graded entries from at-a-glance
+displays, while the ``Raw`` tab keeps the full history. This mirrors how
+Classroom and Compass behave. ``is_active_edrolo_task`` is retained as a
+helper but no longer applied at fetch time.
 """
 
 from __future__ import annotations
@@ -447,8 +451,12 @@ class EdroloSource(Source):
             for c in raw_courses
             if isinstance(c, dict) and "id" in c
         }
-        active_tasks = [t for t in raw_tasks if is_active_edrolo_task(t)]
+        # Pass everything through — completed/archived tasks land in the sheet
+        # mapped to Status.SUBMITTED so they appear greyed-out in the views.
+        # Mirrors Classroom + Compass behaviour. The ``is_active_edrolo_task``
+        # helper is retained for reference / future use but no longer applied
+        # at fetch time.
         return [
             map_edrolo_task_to_task(child=child, edrolo_task=t, course_titles=course_titles)
-            for t in active_tasks
+            for t in raw_tasks
         ]
