@@ -1,15 +1,12 @@
 # Portainer stack for Homework Hub.
 #
-# Built from a custom image -- the Dockerfile lives in this repo and is
-# bind-mounted via the Build/ directory on TrueNAS:
-#   /mnt/tank/Apps/HomeworkHub/Build/Dockerfile  <- this repo's Dockerfile
-#   /mnt/tank/Apps/HomeworkHub/Build/src/        <- this repo's src/
-#   /mnt/tank/Apps/HomeworkHub/Build/pyproject.toml + uv.lock
+# Deployment: Portainer (https://portainer.homelab) → Stacks → Add stack →
+# Build method: Repository (this repo, branch main, compose path
+# docker-compose.yml). Set the four BW_* environment variables in the
+# Portainer UI -- they are stored encrypted in Portainer's DB and injected
+# at runtime (no .env file on the host).
 #
-# (Easiest workflow: `git clone` this repo into Build/ and `git pull` to
-# update; rebuild via `docker compose build` or Portainer's "rebuild" button.)
-#
-# Persistent volumes:
+# Persistent volumes (bind-mounted from TrueNAS):
 #   /mnt/tank/Apps/HomeworkHub/Config/  -> /config  (children.yaml, tokens, state.db)
 #   /mnt/tank/Apps/HomeworkHub/Logs/    -> /logs    (rotating logs)
 
@@ -17,13 +14,13 @@ services:
   homework-hub:
     container_name: homework-hub
     build:
-      context: ./Build
+      context: .
       dockerfile: Dockerfile
     image: homework-hub:latest
     restart: unless-stopped
     user: "568:568"
     environment:
-      # --- Vaultwarden / Bitwarden CLI (required) ---
+      # --- Vaultwarden / Bitwarden CLI (set via Portainer stack env vars) ---
       BW_SERVER: ${BW_SERVER}
       BW_CLIENTID: ${BW_CLIENTID}
       BW_CLIENTSECRET: ${BW_CLIENTSECRET}
@@ -51,7 +48,8 @@ services:
       start_period: 30s
       retries: 3
     labels:
-      # Watchtower / WUD: notify-only, no auto-update for a custom-built image.
+      # WUD: notify-only (custom-built image, GitOps handles rebuilds).
+      # See [[Auto Updates]] for label conventions.
       wud.watch: "true"
       wud.watch.digest: "false"
       wud.tag.include: "^latest$"

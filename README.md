@@ -55,33 +55,31 @@ python -m homework_hub
 ## Deployment (TrueNAS + Portainer)
 
 Custom-built image; the Dockerfile lives in this repo and the compose
-stack is checked in as `docker-compose.yml`. Convention follows
-`HomeworkHub.md` in the vault:
+stack is checked in as `docker-compose.yml`. Deployed as a Portainer
+GitOps stack pulling directly from this repo on `main`. Convention
+follows `HomeworkHub.md` in the vault:
 
 ```
 /mnt/tank/Apps/HomeworkHub/
-├── Build/                 ← `git clone` of this repo (Dockerfile lives here)
 ├── Config/                ← persisted: children.yaml, tokens/, state.db
 └── Logs/                  ← rotating logs
 ```
 
-Build + deploy:
+(No `Build/` directory or `.env` on host — Portainer clones the repo
+into its own working directory and stores the four `BW_*` secrets in
+its encrypted DB.)
 
-```bash
-ssh root@192.168.1.100
-mkdir -p /mnt/tank/Apps/HomeworkHub/{Config/tokens,Logs}
-cd /mnt/tank/Apps/HomeworkHub
-git clone git@github.com:ryannortham/homework-hub.git Build
-cp Build/docker-compose.yml ./docker-compose.yml
-cp Build/.env.example ./.env   # then edit BW_* secrets
-chown -R 568:568 Config Logs
+Deploy:
 
-# Stand up via Portainer (Stacks → Add → Repository or upload the compose file)
-docker compose up -d --build
-```
-
-Updates: `git -C Build pull && docker compose up -d --build` (or use the
-Portainer "Pull and redeploy" button).
+1. Create the persistent dirs once:
+   ```bash
+   ssh root@192.168.1.100 'mkdir -p /mnt/tank/Apps/HomeworkHub/{Config/tokens,Logs} && chown -R 568:568 /mnt/tank/Apps/HomeworkHub'
+   ```
+2. https://portainer.homelab → **Stacks** → **Add stack** → name `homework-hub`.
+3. Build method: **Repository** → URL `https://github.com/ryannortham/homework-hub`, ref `refs/heads/main`, compose path `docker-compose.yml`.
+4. Environment variables (Advanced mode): `BW_SERVER`, `BW_CLIENTID`, `BW_CLIENTSECRET`, `BW_PASSWORD`.
+5. Enable **GitOps updates** (5 min polling) so `git push` auto-redeploys.
+6. **Deploy the stack**.
 
 `/health` is polled by Uptime Kuma at port 30062 — there is no Caddy
 entry and no UI; ops surface only.
