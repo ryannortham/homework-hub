@@ -70,14 +70,6 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     HOMEWORK_HUB_LOG_DIR=/logs \
     PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
-# Install Chromium + its system deps via Playwright. The image gains ~450MB
-# but it's the price of bypassing the school's OAuth block on Classroom.
-# We pin to whatever Chromium ships with the Playwright version in uv.lock.
-RUN set -eux; \
-    mkdir -p /opt/playwright; \
-    /opt/venv/bin/python -m playwright install --with-deps chromium; \
-    chown -R 568:568 /opt/playwright
-
 # Match the homelab convention: PUID/PGID 568 (apps user on TrueNAS).
 RUN groupadd --system --gid 568 app \
     && useradd --system --uid 568 --gid 568 --home /app --shell /usr/sbin/nologin app \
@@ -86,6 +78,16 @@ RUN groupadd --system --gid 568 app \
 
 WORKDIR /app
 COPY --from=builder --chown=568:568 /opt/venv /opt/venv
+
+# Install Chromium + its system deps via Playwright. The image gains ~450MB
+# but it's the price of bypassing the school's OAuth block on Classroom.
+# Chromium is pinned to whatever ships with the Playwright version in uv.lock.
+# Must run after the venv is copied (Playwright is a venv dep), and before
+# the USER switch (apt needs root for --with-deps).
+RUN set -eux; \
+    mkdir -p /opt/playwright; \
+    /opt/venv/bin/python -m playwright install --with-deps chromium; \
+    chown -R 568:568 /opt/playwright
 
 USER 568
 
