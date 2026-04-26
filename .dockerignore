@@ -1,0 +1,47 @@
+# Build context exclusions -- keep the Docker layer cache small + reproducible.
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Python build / cache artefacts
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.eggs
+build
+dist
+.venv
+venv
+
+# Test / lint caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+tests
+
+# Editor / OS
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Secrets / runtime state -- never bake into an image
+.env
+.env.*
+!.env.example
+config/children.yaml
+config/tokens
+state.db
+state.db-*
+logs
+*.log
+
+# Docs / repo metadata not needed inside the image
+Makefile
+docker-compose.yml
+.dockerignore

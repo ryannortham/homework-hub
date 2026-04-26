@@ -45,7 +45,46 @@ python -m homework_hub sync
 
 # Status
 python -m homework_hub status
+
+# Run the daemon (default action when no subcommand is given) — APScheduler
+# hourly cron + FastAPI /health on port 30062. This is what the container
+# runs as its CMD.
+python -m homework_hub
 ```
+
+## Deployment (TrueNAS + Portainer)
+
+Custom-built image; the Dockerfile lives in this repo and the compose
+stack is checked in as `docker-compose.yml`. Convention follows
+`HomeworkHub.md` in the vault:
+
+```
+/mnt/tank/Apps/HomeworkHub/
+├── Build/                 ← `git clone` of this repo (Dockerfile lives here)
+├── Config/                ← persisted: children.yaml, tokens/, state.db
+└── Logs/                  ← rotating logs
+```
+
+Build + deploy:
+
+```bash
+ssh root@192.168.1.100
+mkdir -p /mnt/tank/Apps/HomeworkHub/{Config/tokens,Logs}
+cd /mnt/tank/Apps/HomeworkHub
+git clone git@github.com:ryannortham/homework-hub.git Build
+cp Build/docker-compose.yml ./docker-compose.yml
+cp Build/.env.example ./.env   # then edit BW_* secrets
+chown -R 568:568 Config Logs
+
+# Stand up via Portainer (Stacks → Add → Repository or upload the compose file)
+docker compose up -d --build
+```
+
+Updates: `git -C Build pull && docker compose up -d --build` (or use the
+Portainer "Pull and redeploy" button).
+
+`/health` is polled by Uptime Kuma at port 30062 — there is no Caddy
+entry and no UI; ops surface only.
 
 ## Layout
 

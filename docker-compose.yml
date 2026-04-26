@@ -1,0 +1,58 @@
+# Portainer stack for Homework Hub.
+#
+# Built from a custom image -- the Dockerfile lives in this repo and is
+# bind-mounted via the Build/ directory on TrueNAS:
+#   /mnt/tank/Apps/HomeworkHub/Build/Dockerfile  <- this repo's Dockerfile
+#   /mnt/tank/Apps/HomeworkHub/Build/src/        <- this repo's src/
+#   /mnt/tank/Apps/HomeworkHub/Build/pyproject.toml + uv.lock
+#
+# (Easiest workflow: `git clone` this repo into Build/ and `git pull` to
+# update; rebuild via `docker compose build` or Portainer's "rebuild" button.)
+#
+# Persistent volumes:
+#   /mnt/tank/Apps/HomeworkHub/Config/  -> /config  (children.yaml, tokens, state.db)
+#   /mnt/tank/Apps/HomeworkHub/Logs/    -> /logs    (rotating logs)
+
+services:
+  homework-hub:
+    container_name: homework-hub
+    build:
+      context: ./Build
+      dockerfile: Dockerfile
+    image: homework-hub:latest
+    restart: unless-stopped
+    user: "568:568"
+    environment:
+      # --- Vaultwarden / Bitwarden CLI (required) ---
+      BW_SERVER: ${BW_SERVER}
+      BW_CLIENTID: ${BW_CLIENTID}
+      BW_CLIENTSECRET: ${BW_CLIENTSECRET}
+      BW_PASSWORD: ${BW_PASSWORD}
+      # --- Runtime tunables (defaults match container layout) ---
+      HOMEWORK_HUB_CONFIG_DIR: /config
+      HOMEWORK_HUB_TOKENS_DIR: /config/tokens
+      HOMEWORK_HUB_STATE_DB: /config/state.db
+      HOMEWORK_HUB_LOG_DIR: /logs
+      HOMEWORK_HUB_SYNC_CRON: "7 * * * *"
+      HOMEWORK_HUB_HEALTH_PORT: "30062"
+      LOG_LEVEL: INFO
+      TZ: Australia/Melbourne
+    volumes:
+      - /mnt/tank/Apps/HomeworkHub/Config:/config
+      - /mnt/tank/Apps/HomeworkHub/Logs:/logs
+    ports:
+      # Health endpoint -- Uptime Kuma polls this. NOT exposed via Caddy
+      # (no UI; ops-only surface).
+      - "30062:30062"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:30062/health', timeout=5).status == 200 else 1)"]
+      interval: 5m
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    labels:
+      # Watchtower / WUD: notify-only, no auto-update for a custom-built image.
+      wud.watch: "true"
+      wud.watch.digest: "false"
+      wud.tag.include: "^latest$"
+      wud.trigger.include: "discord.notify"
