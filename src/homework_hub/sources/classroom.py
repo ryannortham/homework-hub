@@ -142,7 +142,15 @@ def map_classroom_card_to_task(
         subject=card.get("subject") or "",
         title=title,
         description="",  # not present on list view; would need per-card fetch
-        assigned_at=None,  # ditto — Classroom doesn't expose it on list cards
+        # Classroom's list-view DOM (cards on /u/0/a/{not-turned-in,missing,
+        # turned-in}/all) does not expose a Posted timestamp at all. It's
+        # only rendered on the per-card detail page (/u/0/c/{course}/m/{id}
+        # /details). Investigated under M7 (2026-04-26): an extra HTTP
+        # round-trip per card would add ~1-2 min per sync and a fresh
+        # rate-limit / flake surface, for a field that's purely
+        # informational on the kid sheet. Documented as upstream-
+        # unavailable; assigned_at stays None for Classroom rows.
+        assigned_at=None,
         due_at=due_at,
         status=status,
         status_raw=status_raw,
