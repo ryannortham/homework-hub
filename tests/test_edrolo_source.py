@@ -227,7 +227,8 @@ class TestEdroloClient:
         client = self._client(handler, storage_raw)
         result = client.get_tasks()
 
-        assert "/api/student/tasks/" in captured["url"]
+        assert "/api/v1/student-tasks/" in captured["url"]
+        assert "task_type=all" in captured["url"]
         assert "sessionid=fake-session-abc123" in captured["headers"]["cookie"]
         assert captured["headers"]["x-requested-with"] == "XMLHttpRequest"
         assert isinstance(result, list)

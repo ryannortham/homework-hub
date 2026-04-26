@@ -52,9 +52,19 @@ from homework_hub.sources.base import (
 # Edrolo serves its app under the apex domain.
 DEFAULT_BASE_URL = "https://app.edrolo.com"
 
-# Best-guess API path. Common DRF patterns: /api/student/tasks/,
-# /api/v2/students/me/tasks/, /api/studyplanner/tasks/. Verify and update.
-API_TASKS_PATH = "/api/student/tasks/"
+# Confirmed via DevTools sniffing on app.edrolo.com (2026-04). The SPA's
+# studyplanner uses /api/v1/student-tasks/ with multi-valued ``assignment_stage``
+# filters and ``task_type=all`` to fetch the full per-student task list. The
+# response is DRF-paginated (``count``/``next``/``results``).
+API_TASKS_PATH = "/api/v1/student-tasks/"
+API_TASKS_QUERY: tuple[tuple[str, str], ...] = (
+    ("page_size", "100"),
+    ("assignment_stage", "NOT_STARTED"),
+    ("assignment_stage", "IN_PROGRESS"),
+    ("assignment_stage", "COMPLETED"),
+    ("assignment_stage", "CLOSED"),
+    ("task_type", "all"),
+)
 
 # Browser-like UA so we don't stand out from a logged-in session.
 DEFAULT_USER_AGENT = (
@@ -332,13 +342,18 @@ class EdroloClient:
 
     def get_tasks(self) -> list[dict[str, Any]]:
         """Fetch all tasks for the logged-in student."""
-        return self._get_json(API_TASKS_PATH)
+        return self._get_json(API_TASKS_PATH, params=API_TASKS_QUERY)
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
 
-    def _get_json(self, path: str) -> list[dict[str, Any]]:
+    def _get_json(
+        self,
+        path: str,
+        *,
+        params: tuple[tuple[str, str], ...] | None = None,
+    ) -> list[dict[str, Any]]:
         url = f"{self.base_url}{path}"
         headers = {
             "User-Agent": self.user_agent,
@@ -349,7 +364,7 @@ class EdroloClient:
             "Referer": f"{self.base_url}/",
         }
         try:
-            resp = self._client.get(url, headers=headers)
+            resp = self._client.get(url, headers=headers, params=params)
         except httpx.TimeoutException as exc:
             raise TransientError(f"Edrolo timeout: {exc}") from exc
         except httpx.HTTPError as exc:
