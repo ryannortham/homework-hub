@@ -318,12 +318,20 @@ def test_status(tmp_path: Path):
 def test_bootstrap_sheet_writes_id_back_to_config(tmp_path: Path):
     env = _write_min_config(tmp_path, sheet_id=None)
     runner = CliRunner()
-    fake_backend = type(
-        "FakeBackend",
-        (),
-        {"create_sheet": lambda self, title, *, share_with=None: "new-sheet-id"},
-    )()
-    with patch("homework_hub.__main__._build_sheets_backend", return_value=fake_backend):
+    captured: dict[str, object] = {}
+
+    class FakeBackend:
+        def create_sheet(self, title: str, *, share_with=None):
+            captured["title"] = title
+            captured["share_with"] = list(share_with or [])
+            return "new-sheet-id"
+
+    fake_backend = FakeBackend()
+    sa_email = "sa@example.iam.gserviceaccount.com"
+    with patch(
+        "homework_hub.wiring.build_bootstrap_sheets_backend",
+        return_value=(fake_backend, sa_email),
+    ):
         result = runner.invoke(
             cli,
             ["bootstrap-sheet", "--child", "james", "--share-with", "kid@example.com"],
@@ -331,6 +339,11 @@ def test_bootstrap_sheet_writes_id_back_to_config(tmp_path: Path):
         )
     assert result.exit_code == 0, result.output
     assert "new-sheet-id" in result.output
+    assert sa_email in result.output
+    assert "kid@example.com" in result.output
+    # SA must be auto-appended to the share list passed to backend.
+    assert sa_email in captured["share_with"]
+    assert "kid@example.com" in captured["share_with"]
     children_yaml = Path(env["HOMEWORK_HUB_CONFIG_DIR"]) / "children.yaml"
     assert "new-sheet-id" in children_yaml.read_text()
 

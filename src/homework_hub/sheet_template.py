@@ -1,288 +1,418 @@
-"""Builds the batchUpdate requests for bootstrapping a new child's Google Sheet.
+"""Bootstrap-sheet batchUpdate builder (M5c).
 
-A fresh sheet (created via Sheets API `presentations.create`) starts with one
-unnamed tab. We:
+Generates the full ``spreadsheets.batchUpdate`` request list to turn a
+freshly-``spreadsheets.create``d sheet into the medallion-shaped, native-
+Sheets-Tables, kid-facing layout described by
+:data:`homework_hub.schema.SCHEMA`.
 
-1. Rename it to `Today` (so the kid sees the dashboard when they open the sheet).
-2. Add `Tasks`, `By Subject`, `Raw` (hidden) and `Settings` tabs.
-3. Populate `Raw` headers (the only tab the script writes data into).
-4. Populate `Tasks` with formulas that pull from `Raw` plus user-editable columns.
-5. Populate `Today` with `QUERY()` formulas grouping by Overdue / Today / Week.
-6. Apply conditional formatting to `Tasks` (red overdue, orange due-soon, etc.)
-   and `Today`.
-7. Hide the `Raw` tab.
-8. Populate `Settings` with last-sync placeholders.
+Designed to be **pure**: this module imports nothing Google-API-related,
+emits plain dicts, and is exhaustively unit-tested against the SCHEMA
+spec. The live API call lives in :mod:`homework_hub.sinks.gold_sink`.
 
-All requests are returned as plain dicts — easy to assert against in tests and
-fed directly into `spreadsheets.batchUpdate`.
+Order of operations is non-trivial because Sheets imposes constraints:
+
+1. Rename the default sheet (id=0) to the first SCHEMA tab.
+2. ``addSheet`` for every other tab with a deterministic sheetId.
+3. ``updateCells`` write the header row of every tab.
+4. Today tab: write the single QUERY formula into A1.
+5. Tasks tab: seed row 2 with formula-column templates and blank cells
+   for the other columns so the new Table will absorb them.
+6. ``addTable`` for every tab whose ``TabSpec.table_id`` is non-empty.
+   (Done after the seed row so the Table picks up at least one data row,
+   which Sheets requires; the kid-facing UI hides the seed once real
+   tasks land.)
+7. Apply per-column metadata: type formats (DATE / NUMBER / CHECKBOX),
+   dropdown DataValidation, column widths, frozen rows, hidden flag.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from homework_hub.sinks.sheets import RAW_HEADERS
+from homework_hub.schema import SCHEMA, ColumnKind, ColumnSpec, SheetSchema
 
-# Stable sheetIds we assign so subsequent batchUpdate requests can target tabs
-# by ID instead of fragile name lookups. The first tab in a new spreadsheet
-# always has sheetId 0; we rename it rather than delete + recreate to avoid
-# the "spreadsheets must have at least one sheet" race.
-TODAY_SHEET_ID = 0
-TASKS_SHEET_ID = 1001
-BY_SUBJECT_SHEET_ID = 1002
-RAW_SHEET_ID = 1003
-SETTINGS_SHEET_ID = 1004
+# --------------------------------------------------------------------------- #
+# sheetId allocation
+# --------------------------------------------------------------------------- #
+#
+# The first sheet in a fresh spreadsheet always has sheetId 0; we rename it
+# to the schema's first tab. Other tabs get deterministic ids starting at
+# 1001 so the batchUpdate body can self-reference them without name lookups.
 
-# Columns on the Tasks tab — formulas pulling from Raw plus editable extras.
-# Column letters: A child, B source, C source_id, D subject, E title,
-#                 F description, G assigned_at, H due_at, I status, J status_raw,
-#                 K url, L last_synced, then editable: M manual_status,
-#                 N priority, O time_estimate, P notes, Q effective_status,
-#                 R days_left.
-TASKS_HEADERS: list[str] = [
-    *RAW_HEADERS,
-    "manual_status",
-    "priority",
-    "time_estimate",
-    "notes",
-    "effective_status",
-    "days_left",
-]
+_FIRST_TAB_SHEET_ID = 0
+_BASE_EXTRA_SHEET_ID = 1001
 
 
-def bootstrap_requests() -> list[dict[str, Any]]:
-    """Return the full list of batchUpdate requests for a fresh sheet."""
+def _allocate_sheet_ids(schema: SheetSchema) -> dict[str, int]:
+    """Map TabSpec.name → sheetId. First tab gets 0; rest get 1001+."""
+    ids: dict[str, int] = {}
+    for i, tab in enumerate(schema.tabs):
+        ids[tab.name] = _FIRST_TAB_SHEET_ID if i == 0 else _BASE_EXTRA_SHEET_ID + (i - 1)
+    return ids
+
+
+# --------------------------------------------------------------------------- #
+# Public entry point
+# --------------------------------------------------------------------------- #
+
+
+def bootstrap_requests(schema: SheetSchema = SCHEMA) -> list[dict[str, Any]]:
+    """Return the full list of batchUpdate requests for a fresh sheet.
+
+    The sole entry point for :class:`SheetsClient.create_sheet`. All
+    helpers below are private.
+    """
+    sheet_ids = _allocate_sheet_ids(schema)
     requests: list[dict[str, Any]] = []
-    requests.extend(_rename_default_tab())
-    requests.extend(_create_extra_tabs())
-    requests.extend(_write_headers())
-    requests.extend(_write_tasks_formulas())
-    requests.extend(_write_today_formulas())
-    requests.extend(_write_settings_seed())
-    requests.extend(_apply_conditional_formatting())
-    requests.extend(_hide_raw_tab())
+    requests.extend(_rename_default_tab(schema, sheet_ids))
+    requests.extend(_add_extra_tabs(schema, sheet_ids))
+    requests.extend(_write_headers(schema, sheet_ids))
+    requests.extend(_write_today_formula(schema, sheet_ids))
+    requests.extend(_seed_table_data_rows(schema, sheet_ids))
+    requests.extend(_add_tables(schema, sheet_ids))
+    requests.extend(_apply_column_formats(schema, sheet_ids))
+    requests.extend(_apply_dropdowns(schema, sheet_ids))
+    requests.extend(_set_column_widths(schema, sheet_ids))
+    requests.extend(_apply_tab_properties(schema, sheet_ids))
     return requests
 
 
 # --------------------------------------------------------------------------- #
-# Tab creation
+# 1. Rename + 2. Add tabs
 # --------------------------------------------------------------------------- #
 
 
-def _rename_default_tab() -> list[dict[str, Any]]:
+def _rename_default_tab(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    first = schema.tabs[0]
     return [
         {
             "updateSheetProperties": {
-                "properties": {"sheetId": TODAY_SHEET_ID, "title": "Today"},
+                "properties": {"sheetId": _FIRST_TAB_SHEET_ID, "title": first.name},
                 "fields": "title",
             }
         }
     ]
 
 
-def _create_extra_tabs() -> list[dict[str, Any]]:
-    return [
-        {"addSheet": {"properties": {"sheetId": TASKS_SHEET_ID, "title": "Tasks"}}},
-        {"addSheet": {"properties": {"sheetId": BY_SUBJECT_SHEET_ID, "title": "By Subject"}}},
-        {"addSheet": {"properties": {"sheetId": RAW_SHEET_ID, "title": "Raw"}}},
-        {"addSheet": {"properties": {"sheetId": SETTINGS_SHEET_ID, "title": "Settings"}}},
-    ]
+def _add_extra_tabs(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs[1:]:
+        out.append(
+            {
+                "addSheet": {
+                    "properties": {
+                        "sheetId": sheet_ids[tab.name],
+                        "title": tab.name,
+                    }
+                }
+            }
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# Headers + formulas
+# 3. Header rows
 # --------------------------------------------------------------------------- #
 
 
-def _write_headers() -> list[dict[str, Any]]:
-    """Header row for Raw and Tasks. Today is dashboard-formatted separately."""
-    return [
-        _values_request(RAW_SHEET_ID, 0, 0, [_string_row(RAW_HEADERS)]),
-        _values_request(TASKS_SHEET_ID, 0, 0, [_string_row(TASKS_HEADERS)]),
-    ]
+def _write_headers(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        if not tab.columns:
+            continue
+        # Today tab has a single empty-header column (it's pure formula).
+        if all(c.header == "" for c in tab.columns):
+            continue
+        out.append(
+            _update_cells(
+                sheet_ids[tab.name],
+                row_index=0,
+                column_index=0,
+                rows=[[_string_cell(c.header) for c in tab.columns]],
+                fields="userEnteredValue,userEnteredFormat",
+            )
+        )
+    return out
 
 
-def _write_tasks_formulas() -> list[dict[str, Any]]:
-    """Tasks tab: row 2 holds array formulas that mirror Raw + compute extras.
+# --------------------------------------------------------------------------- #
+# 4. Today tab QUERY formula
+# --------------------------------------------------------------------------- #
 
-    A1-L1 already populated by _write_headers. Row 2 onward is filled by:
-    - A2:L : ARRAYFORMULA pulling Raw!A2:L (so new Raw rows auto-appear)
-    - M:P : left blank for kids to fill in
-    - Q2 : ARRAYFORMULA effective_status (manual_status if set, else status,
-           with overdue override when due_at < today and status not submitted)
-    - R2 : ARRAYFORMULA days_left = INT(due_at - today)
+
+def _write_today_formula(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """Today tab is a single QUERY formula in A1; no data rows."""
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        if tab.table_id:
+            continue
+        formula_cols = [c for c in tab.columns if c.kind is ColumnKind.FORMULA]
+        if len(tab.columns) == 1 and formula_cols:
+            spec = formula_cols[0]
+            out.append(
+                _update_cells(
+                    sheet_ids[tab.name],
+                    row_index=0,
+                    column_index=0,
+                    rows=[[_formula_cell(spec.formula_template)]],
+                    fields="userEnteredValue",
+                )
+            )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 5. Seed row 2 for table tabs
+# --------------------------------------------------------------------------- #
+
+
+def _seed_table_data_rows(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """Sheets Tables require ≥1 data row at creation. Write a placeholder
+    row (formulas filled in, other columns blank) so ``addTable`` succeeds.
+    The publish layer overwrites this row on first sync.
     """
-    pull = (
-        '=ARRAYFORMULA(IF(Raw!A2:A="",,{'
-        "Raw!A2:A,Raw!B2:B,Raw!C2:C,Raw!D2:D,Raw!E2:E,Raw!F2:F,"
-        "Raw!G2:G,Raw!H2:H,Raw!I2:I,Raw!J2:J,Raw!K2:K,Raw!L2:L"
-        "}))"
-    )
-    effective = (
-        '=ARRAYFORMULA(IF(A2:A="",,IF(M2:M<>"",M2:M,'
-        'IF(AND(H2:H<>"",DATEVALUE(LEFT(H2:H,10))<TODAY(),'
-        'NOT(REGEXMATCH(I2:I,"submitted|graded"))),"overdue",I2:I))))'
-    )
-    days_left = '=ARRAYFORMULA(IF(H2:H="",,DATEVALUE(LEFT(H2:H,10))-TODAY()))'
-    return [
-        _formula_request(TASKS_SHEET_ID, 1, 0, [[pull]]),  # A2
-        _formula_request(TASKS_SHEET_ID, 1, 16, [[effective]]),  # Q2
-        _formula_request(TASKS_SHEET_ID, 1, 17, [[days_left]]),  # R2
-    ]
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        if not tab.table_id:
+            continue
+        cells: list[dict[str, Any]] = []
+        for col in tab.columns:
+            if col.kind is ColumnKind.FORMULA:
+                cells.append(_formula_cell(col.formula_template))
+            elif col.kind is ColumnKind.CHECKBOX:
+                cells.append(_bool_cell(False))
+            else:
+                cells.append(_string_cell(""))
+        out.append(
+            _update_cells(
+                sheet_ids[tab.name],
+                row_index=1,
+                column_index=0,
+                rows=[cells],
+                fields="userEnteredValue",
+            )
+        )
+    return out
 
 
-def _write_today_formulas() -> list[dict[str, Any]]:
-    """Today tab: KPI strip + four QUERY blocks (Overdue/Today/Week/Next)."""
-    rows: list[list[dict[str, Any]]] = [
-        [_string_cell("Today")],
-        [],
-        [_string_cell("Overdue"), _string_cell("Due Today"), _string_cell("Due This Week")],
-        [
-            _formula_cell(
-                "=IFERROR(COUNTA(QUERY(Tasks!A2:R,\"select A where R<0 and Q!='submitted' "
-                "and Q!='graded'\",0)),0)"
-            ),
-            _formula_cell(
-                "=IFERROR(COUNTA(QUERY(Tasks!A2:R,\"select A where R=0 and Q!='submitted' "
-                "and Q!='graded'\",0)),0)"
-            ),
-            _formula_cell(
-                '=IFERROR(COUNTA(QUERY(Tasks!A2:R,"select A where R>=0 and R<=7 '
-                "and Q!='submitted' and Q!='graded'\",0)),0)"
-            ),
-        ],
-        [],
-        [_string_cell("Overdue")],
-        [
-            _formula_cell(
-                "=IFERROR(QUERY(Tasks!A2:R,"
-                "\"select D,E,B,H,Q,R where R<0 and Q!='submitted' and Q!='graded' "
-                "order by R asc label D 'Subject', E 'Task', B 'Source', H 'Due', "
-                "Q 'Status', R 'Days'\",0),\"None — nice work!\")"
-            )
-        ],
-        [],
-        [_string_cell("Due Today")],
-        [
-            _formula_cell(
-                "=IFERROR(QUERY(Tasks!A2:R,"
-                "\"select D,E,B,H,Q where R=0 and Q!='submitted' and Q!='graded' "
-                "order by D asc label D 'Subject', E 'Task', B 'Source', H 'Due', "
-                'Q \'Status\'",0),"Nothing due today")'
-            )
-        ],
-        [],
-        [_string_cell("This Week")],
-        [
-            _formula_cell(
-                "=IFERROR(QUERY(Tasks!A2:R,"
-                "\"select D,E,B,H,Q,R where R>=1 and R<=7 and Q!='submitted' "
-                "and Q!='graded' order by R asc, D asc label D 'Subject', E 'Task', "
-                "B 'Source', H 'Due', Q 'Status', R 'Days'\",0),\"Nothing this week\")"
-            )
-        ],
-        [],
-        [_string_cell("Next Week")],
-        [
-            _formula_cell(
-                "=IFERROR(QUERY(Tasks!A2:R,"
-                "\"select D,E,B,H,Q,R where R>=8 and R<=14 and Q!='submitted' "
-                "and Q!='graded' order by R asc, D asc label D 'Subject', E 'Task', "
-                "B 'Source', H 'Due', Q 'Status', R 'Days'\",0),\"Nothing scheduled\")"
-            )
-        ],
-    ]
-    return [
-        {
-            "updateCells": {
-                "rows": [{"values": row} for row in rows],
-                "fields": "userEnteredValue,userEnteredFormat",
-                "start": {"sheetId": TODAY_SHEET_ID, "rowIndex": 0, "columnIndex": 0},
+# --------------------------------------------------------------------------- #
+# 6. Native Sheets Tables (addTable)
+# --------------------------------------------------------------------------- #
+
+
+def _add_tables(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """One ``addTable`` per tab with a non-empty ``table_id``.
+
+    The Table covers headers + 1 seed row; Sheets auto-extends as rows are
+    appended below. Column types are conveyed via ``columnProperties`` so
+    the Table widget shows the right filter/sort affordances.
+    """
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        if not tab.table_id:
+            continue
+        out.append(
+            {
+                "addTable": {
+                    "table": {
+                        "name": tab.table_id,
+                        "tableId": tab.table_id,
+                        "range": {
+                            "sheetId": sheet_ids[tab.name],
+                            "startRowIndex": 0,
+                            "endRowIndex": 2,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(tab.columns),
+                        },
+                        "columnProperties": [
+                            _table_column_properties(i, c) for i, c in enumerate(tab.columns)
+                        ],
+                    }
+                }
             }
-        }
-    ]
+        )
+    return out
 
 
-def _write_settings_seed() -> list[dict[str, Any]]:
-    rows = [
-        ["Source", "Last sync", "Last error"],
-        ["classroom", "", ""],
-        ["compass", "", ""],
-        ["edrolo", "", ""],
-    ]
-    return [_values_request(SETTINGS_SHEET_ID, 0, 0, [[_string_cell(c) for c in r] for r in rows])]
+def _table_column_properties(index: int, col: ColumnSpec) -> dict[str, Any]:
+    """Map a ColumnSpec to a Sheets Table ``columnProperties`` entry.
 
-
-# --------------------------------------------------------------------------- #
-# Conditional formatting
-# --------------------------------------------------------------------------- #
-
-
-def _apply_conditional_formatting() -> list[dict[str, Any]]:
-    """Colour the Tasks tab by days_left (column R, index 17)."""
-    rng = {
-        "sheetId": TASKS_SHEET_ID,
-        "startRowIndex": 1,
-        "startColumnIndex": 0,
-        "endColumnIndex": 18,
+    Sheets recognises a fixed set of ``columnType`` values:
+    DOUBLE / TEXT / DATE / TIME / DATE_TIME / BOOLEAN / DROPDOWN / TAGS.
+    """
+    type_for_kind: dict[ColumnKind, str] = {
+        ColumnKind.TEXT: "TEXT",
+        ColumnKind.DATE: "DATE",
+        ColumnKind.NUMBER: "DOUBLE",
+        ColumnKind.CHECKBOX: "BOOLEAN",
+        ColumnKind.DROPDOWN: "DROPDOWN",
+        ColumnKind.FORMULA: "DOUBLE",  # Days = numeric; safe default
     }
-    rules: list[dict[str, Any]] = [
-        # Status submitted/graded → grey strike-through (highest priority)
-        _format_rule(
-            rng, '=REGEXMATCH($Q2,"submitted|graded")', bg=(0.93, 0.93, 0.93), strike=True, index=0
-        ),
-        # Days left < 0 → red
-        _format_rule(rng, "=$R2<0", bg=(1.0, 0.85, 0.85), index=1),
-        # Days left = 0 → orange
-        _format_rule(rng, "=$R2=0", bg=(1.0, 0.92, 0.80), index=2),
-        # Days left 1-2 → yellow
-        _format_rule(rng, "=AND($R2>=1,$R2<=2)", bg=(1.0, 0.97, 0.80), index=3),
-    ]
-    return rules
-
-
-def _format_rule(
-    rng: dict[str, Any],
-    formula: str,
-    *,
-    bg: tuple[float, float, float],
-    strike: bool = False,
-    index: int = 0,
-) -> dict[str, Any]:
-    text_format: dict[str, Any] = {}
-    if strike:
-        text_format["strikethrough"] = True
-    fmt: dict[str, Any] = {
-        "backgroundColor": {"red": bg[0], "green": bg[1], "blue": bg[2]},
+    props: dict[str, Any] = {
+        "columnIndex": index,
+        "columnName": col.header,
+        "columnType": type_for_kind[col.kind],
     }
-    if text_format:
-        fmt["textFormat"] = text_format
-    return {
-        "addConditionalFormatRule": {
-            "rule": {
-                "ranges": [rng],
-                "booleanRule": {
-                    "condition": {
-                        "type": "CUSTOM_FORMULA",
-                        "values": [{"userEnteredValue": formula}],
-                    },
-                    "format": fmt,
-                },
+    if col.kind is ColumnKind.DROPDOWN:
+        props["dataValidationRule"] = {
+            "condition": {
+                "type": "ONE_OF_LIST",
+                "values": [{"userEnteredValue": v} for v in col.dropdown_values],
             },
-            "index": index,
+            "strict": True,
+            "showCustomUi": True,
         }
-    }
+    return props
 
 
-def _hide_raw_tab() -> list[dict[str, Any]]:
-    return [
-        {
-            "updateSheetProperties": {
-                "properties": {"sheetId": RAW_SHEET_ID, "hidden": True},
-                "fields": "hidden",
+# --------------------------------------------------------------------------- #
+# 7. Per-column formats (DATE / NUMBER / CHECKBOX)
+# --------------------------------------------------------------------------- #
+
+
+def _apply_column_formats(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """Set ``numberFormat`` (DATE / NUMBER) + ``dataValidation`` (CHECKBOX)
+    on whole columns starting at row 2 so the header row keeps its plain
+    text style.
+    """
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        for i, col in enumerate(tab.columns):
+            if col.kind is ColumnKind.DATE:
+                out.append(
+                    _repeat_cell(
+                        sheet_ids[tab.name],
+                        column_index=i,
+                        cell={
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}
+                            }
+                        },
+                        fields="userEnteredFormat.numberFormat",
+                    )
+                )
+            elif col.kind is ColumnKind.NUMBER or (
+                col.kind is ColumnKind.FORMULA and col.key == "days"
+            ):
+                out.append(
+                    _repeat_cell(
+                        sheet_ids[tab.name],
+                        column_index=i,
+                        cell={
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "NUMBER", "pattern": "0"}
+                            }
+                        },
+                        fields="userEnteredFormat.numberFormat",
+                    )
+                )
+            elif col.kind is ColumnKind.CHECKBOX:
+                out.append(
+                    _repeat_cell(
+                        sheet_ids[tab.name],
+                        column_index=i,
+                        cell={
+                            "dataValidation": {
+                                "condition": {"type": "BOOLEAN"},
+                                "strict": True,
+                            }
+                        },
+                        fields="dataValidation",
+                    )
+                )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 8. Dropdowns
+# --------------------------------------------------------------------------- #
+
+
+def _apply_dropdowns(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    """ONE_OF_LIST DataValidation per DROPDOWN column on row 2 onwards."""
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        for i, col in enumerate(tab.columns):
+            if col.kind is not ColumnKind.DROPDOWN:
+                continue
+            out.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": sheet_ids[tab.name],
+                            "startRowIndex": 1,
+                            "startColumnIndex": i,
+                            "endColumnIndex": i + 1,
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "ONE_OF_LIST",
+                                "values": [{"userEnteredValue": v} for v in col.dropdown_values],
+                            },
+                            "strict": True,
+                            "showCustomUi": True,
+                        },
+                    }
+                }
+            )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 9. Column widths
+# --------------------------------------------------------------------------- #
+
+
+def _set_column_widths(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        for i, col in enumerate(tab.columns):
+            if col.width_px is None:
+                continue
+            out.append(
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_ids[tab.name],
+                            "dimension": "COLUMNS",
+                            "startIndex": i,
+                            "endIndex": i + 1,
+                        },
+                        "properties": {"pixelSize": col.width_px},
+                        "fields": "pixelSize",
+                    }
+                }
+            )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 10. Tab-level properties (frozen rows, hidden)
+# --------------------------------------------------------------------------- #
+
+
+def _apply_tab_properties(schema: SheetSchema, sheet_ids: dict[str, int]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tab in schema.tabs:
+        props: dict[str, Any] = {"sheetId": sheet_ids[tab.name]}
+        fields: list[str] = []
+        if tab.frozen_rows:
+            props["gridProperties"] = {"frozenRowCount": tab.frozen_rows}
+            fields.append("gridProperties.frozenRowCount")
+        if tab.hidden:
+            props["hidden"] = True
+            fields.append("hidden")
+        if not fields:
+            continue
+        out.append(
+            {
+                "updateSheetProperties": {
+                    "properties": props,
+                    "fields": ",".join(fields),
+                }
             }
-        }
-    ]
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -298,30 +428,51 @@ def _formula_cell(formula: str) -> dict[str, Any]:
     return {"userEnteredValue": {"formulaValue": formula}}
 
 
-def _string_row(values: list[str]) -> list[dict[str, Any]]:
-    return [_string_cell(v) for v in values]
+def _bool_cell(value: bool) -> dict[str, Any]:
+    return {"userEnteredValue": {"boolValue": value}}
 
 
-def _values_request(
+def _update_cells(
     sheet_id: int,
+    *,
     row_index: int,
     column_index: int,
     rows: list[list[dict[str, Any]]],
+    fields: str,
 ) -> dict[str, Any]:
     return {
         "updateCells": {
             "rows": [{"values": row} for row in rows],
-            "fields": "userEnteredValue",
-            "start": {"sheetId": sheet_id, "rowIndex": row_index, "columnIndex": column_index},
+            "fields": fields,
+            "start": {
+                "sheetId": sheet_id,
+                "rowIndex": row_index,
+                "columnIndex": column_index,
+            },
         }
     }
 
 
-def _formula_request(
+def _repeat_cell(
     sheet_id: int,
-    row_index: int,
+    *,
     column_index: int,
-    formulas: list[list[str]],
+    cell: dict[str, Any],
+    fields: str,
 ) -> dict[str, Any]:
-    rows = [[_formula_cell(f) for f in row] for row in formulas]
-    return _values_request(sheet_id, row_index, column_index, rows)
+    """Apply ``cell`` formatting to every row (from row 2 down) of a column."""
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,
+                "startColumnIndex": column_index,
+                "endColumnIndex": column_index + 1,
+            },
+            "cell": cell,
+            "fields": fields,
+        }
+    }
+
+
+__all__ = ["bootstrap_requests"]

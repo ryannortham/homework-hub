@@ -22,7 +22,6 @@ from homework_hub.medallion_orchestrator import (
     summarise_medallion,
 )
 from homework_hub.wiring import (
-    _build_sheets_backend,
     build_medallion_orchestrator,
     write_sheet_id_to_config,
 )
@@ -246,11 +245,13 @@ def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
 def bootstrap_sheet(child: str, title: str | None, share_with: tuple[str, ...]) -> None:
     """Create a new Google Sheet for a child and apply the homework-hub template.
 
-    Saves the spreadsheet ID back to children.yaml so subsequent syncs
-    target the correct sheet. Service-account credentials are pulled from
-    Vaultwarden.
+    Authenticates as the human bootstrap user (``ryan.northam@gmail.com``)
+    via OAuth so the sheet is owned by a real account; auto-shares it
+    with the daemon's service account as Editor so subsequent syncs can
+    publish. Saves the spreadsheet ID back to children.yaml.
     """
     from homework_hub.config import ChildrenConfig
+    from homework_hub.wiring import build_bootstrap_sheets_backend
 
     settings = Settings()
     cfg = ChildrenConfig.load(settings.children_yaml)
@@ -263,13 +264,16 @@ def bootstrap_sheet(child: str, title: str | None, share_with: tuple[str, ...]) 
         )
 
     sheet_title = title or f"Homework — {cfg.children[child].display_name}"
-    backend = _build_sheets_backend()
+    click.echo("Authenticating as bootstrap user (browser may open) …")
+    backend, sa_email = build_bootstrap_sheets_backend(settings)
+    share_targets = [*share_with, sa_email]
     click.echo(f"Creating sheet '{sheet_title}' …")
-    sheet_id = backend.create_sheet(sheet_title, share_with=list(share_with) or None)
+    sheet_id = backend.create_sheet(sheet_title, share_with=share_targets)
     write_sheet_id_to_config(settings.children_yaml, child, sheet_id)
     click.echo(f"Created sheet {sheet_id} and saved to children.yaml")
+    click.echo(f"Shared with service account {sa_email} (writer)")
     if share_with:
-        click.echo(f"Shared with: {', '.join(share_with)}")
+        click.echo(f"Also shared with: {', '.join(share_with)}")
 
 
 @cli.group()

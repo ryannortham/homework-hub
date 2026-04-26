@@ -20,6 +20,7 @@ from homework_hub.medallion_orchestrator import MedallionOrchestrator
 from homework_hub.orchestrator import Orchestrator
 from homework_hub.pipeline.publish import GoldSink
 from homework_hub.secrets import BitwardenCLI, from_env
+from homework_hub.sinks.gold_sink import GspreadGoldSink
 from homework_hub.sinks.sheets_client import (
     SheetsBackend,
     SheetsClient,
@@ -60,21 +61,43 @@ def build_medallion_orchestrator(
     settings: Settings,
     *,
     sink: GoldSink | None = None,
+    bw: BitwardenCLI | None = None,
 ) -> MedallionOrchestrator:
     """Construct a MedallionOrchestrator wired from config + tokens on disk.
 
-    ``sink`` is left unset by default \u2014 publish skips with a clear
-    ``sync_runs`` row until M5c provides the real ``GoldSink``.
+    If ``sink`` is not provided, attempts to build a live
+    :class:`GspreadGoldSink` from the service-account credentials in
+    Bitwarden. If that fails (e.g. running tests without ``bw``), publish
+    skips with a clear ``sync_runs`` row instead of crashing the run.
     """
     children_config = ChildrenConfig.load(settings.children_yaml)
     sources_for_child = _build_sources(settings, children_config)
     state = StateStore(settings.state_db)
+    if sink is None:
+        sink = _try_build_gold_sink(bw)
     return MedallionOrchestrator(
         children_config=children_config,
         sources_for_child=sources_for_child,
         state=state,
         sink=sink,
     )
+
+
+def _try_build_gold_sink(bw: BitwardenCLI | None) -> GoldSink | None:
+    """Best-effort construction of the live gold sink.
+
+    Returns ``None`` (and logs a warning) when service-account credentials
+    aren't available, so the daemon and CLI keep working in environments
+    without Bitwarden access (CI, local dev with no creds).
+    """
+    try:
+        bw = bw or from_env()
+        raw = bw.get_notes(SERVICE_ACCOUNT_BW_NAME)
+        creds = load_service_account_credentials(raw)
+        return GspreadGoldSink(creds)
+    except Exception as exc:
+        log.warning("GoldSink unavailable, publish will skip: %s", exc)
+        return None
 
 
 def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[Source]]:
@@ -146,6 +169,26 @@ def _build_sheets_backend(bw: BitwardenCLI | None = None) -> SheetsBackend:
     return SheetsClient(creds)
 
 
+def build_bootstrap_sheets_backend(
+    settings: Settings, *, bw: BitwardenCLI | None = None
+) -> tuple[SheetsBackend, str]:
+    """Build a :class:`SheetsClient` authed as the human bootstrap user.
+
+    Returns ``(backend, sa_email)``. Callers feed ``sa_email`` into
+    ``backend.create_sheet(..., share_with=[..., sa_email])`` so the
+    daemon's service account inherits writer access on the new sheet.
+    """
+    import json as _json
+
+    from homework_hub.auth_bootstrap import load_or_run_bootstrap_flow
+
+    bw = bw or from_env()
+    auth = load_or_run_bootstrap_flow(tokens_dir=settings.tokens_dir, bw=bw)
+    sa_raw = bw.get_notes(SERVICE_ACCOUNT_BW_NAME)
+    sa_email = _json.loads(sa_raw)["client_email"]
+    return SheetsClient(auth.credentials), sa_email
+
+
 # --------------------------------------------------------------------------- #
 # children.yaml mutation (used by bootstrap-sheet)
 # --------------------------------------------------------------------------- #
@@ -175,6 +218,7 @@ def write_sheet_id_to_config(children_yaml: Path, child: str, sheet_id: str) -> 
 
 # Re-export for convenience.
 __all__: list[str] = [
+    "build_bootstrap_sheets_backend",
     "build_medallion_orchestrator",
     "build_orchestrator",
     "write_sheet_id_to_config",
