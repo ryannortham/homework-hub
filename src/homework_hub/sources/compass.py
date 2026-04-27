@@ -101,10 +101,13 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
     status_raw_int, submitted_at = _resolve_student_status(learning_task)
     status = _STATUS_MAP.get(status_raw_int, Status.NOT_STARTED)
 
-    # Fall back to the submission timestamp when no upstream due date is
-    # provided — Compass sometimes omits dueDateTimestamp on older or
-    # inactive-enrolment tasks that have already been submitted/graded.
-    due_at = due_at or submitted_at
+    # When no upstream due date exists, use the best available timestamp so
+    # the sheet always has a date for submitted/graded tasks:
+    #   1. submittedTimestamp — most accurate (when Compass provides it)
+    #   2. assigned_at (activityStart / createdTimestamp) — last resort for
+    #      tasks where showTaskDueDates=False and submittedTimestamp is absent
+    if due_at is None and status in (Status.SUBMITTED, Status.GRADED):
+        due_at = submitted_at or assigned_at
 
     url = f"https://{subdomain}.compass.education/Communicate/LearningTasksStudentDetails.aspx?taskId={task_id}"
 

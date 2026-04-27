@@ -175,6 +175,26 @@ class TestMapping:
         assert t.due_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
         assert t.submitted_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
 
+    def test_due_at_falls_back_to_assigned_at_when_no_due_or_submitted(self, lt):
+        # showTaskDueDates=False pattern: no dueDateTimestamp, empty submittedTimestamp,
+        # but createdTimestamp/activityStart is available. Fall back to assigned_at.
+        del lt["dueDateTimestamp"]
+        lt["students"] = [
+            {"userId": 1, "submissionStatus": 1, "submittedTimestamp": ""}
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        # assigned_at comes from activityStart in the fixture (2026-04-15T00:00:00)
+        assert t.due_at == datetime(2026, 4, 15, 0, 0, 0, tzinfo=UTC)
+        assert t.submitted_at is None
+
+    def test_due_at_fallback_not_applied_to_active_tasks(self, lt):
+        # A not-started task with no due date should stay None — we must not
+        # pollute active tasks with a misleading assigned_at as the due date.
+        del lt["dueDateTimestamp"]
+        lt["students"] = [{"userId": 1, "submissionStatus": 0, "submittedTimestamp": ""}]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.due_at is None
+
     def test_explicit_due_at_takes_precedence_over_submitted_at(self, lt):
         lt["students"] = [
             {"userId": 1, "submissionStatus": 1, "submittedTimestamp": "2026-04-20T09:00:00Z"}
