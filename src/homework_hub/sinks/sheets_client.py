@@ -50,7 +50,7 @@ def load_service_account_credentials(
 ) -> Credentials:
     """Build google-auth Credentials from a service-account key JSON.
 
-    ``raw`` may be the JSON text or a parsed dict (matches the BitwardenCLI
+    ``raw`` may be the JSON text or a parsed dict (matches the VaultwardenCLI
     notes / file-read pattern).
     """
     info = json.loads(raw) if isinstance(raw, str) else raw

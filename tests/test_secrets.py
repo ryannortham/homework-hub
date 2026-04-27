@@ -1,4 +1,4 @@
-"""Tests for the Bitwarden CLI wrapper.
+"""Tests for the Vaultwarden CLI wrapper.
 
 Uses an injected runner so no real `bw` binary is invoked.
 """
@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from homework_hub.secrets import BitwardenCLI, BitwardenError, from_env
+from homework_hub.secrets import VaultwardenCLI, VaultwardenError, from_env
 
 
 class FakeRunner:
@@ -40,8 +40,8 @@ class FakeRunner:
         raise AssertionError(f"Unexpected bw invocation: {list(argv)}")
 
 
-def _cli(runner: FakeRunner) -> BitwardenCLI:
-    return BitwardenCLI(
+def _cli(runner: FakeRunner) -> VaultwardenCLI:
+    return VaultwardenCLI(
         server="https://vaultwarden.test",
         client_id="user.fake",
         client_secret="secret",
@@ -51,9 +51,18 @@ def _cli(runner: FakeRunner) -> BitwardenCLI:
 
 
 class TestUnlock:
+    def _expect_server_already_configured(self, r: FakeRunner) -> None:
+        """Queue the no-arg config server check returning the correct URL."""
+        r.expect(["bw", "config", "server"], 0, "https://vaultwarden.test\n")
+
+    def _expect_server_needs_setting(self, r: FakeRunner) -> None:
+        """Queue the no-arg check returning a different URL, then the set call."""
+        r.expect(["bw", "config", "server"], 0, "https://other.server\n")
+        r.expect(["bw", "config", "server", "https://vaultwarden.test"], 0)
+
     def test_unlock_when_unauthenticated_logs_in_first(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        self._expect_server_needs_setting(r)
         r.expect(["bw", "status"], 0, json.dumps({"status": "unauthenticated"}))
         r.expect(["bw", "login", "--apikey"], 0)
         r.expect(["bw", "unlock", "--passwordenv"], 0, "session-token-abc\n")
@@ -61,11 +70,11 @@ class TestUnlock:
         token = cli.unlock()
         assert token == "session-token-abc"
         called = [c[0][1] for c in r.calls]
-        assert called == ["config", "status", "login", "unlock"]
+        assert called == ["config", "config", "status", "login", "unlock"]
 
     def test_unlock_skips_login_if_already_authenticated(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        self._expect_server_already_configured(r)
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         cli = _cli(r)
@@ -73,9 +82,32 @@ class TestUnlock:
         called = [c[0][1] for c in r.calls]
         assert "login" not in called
 
+    def test_unlock_skips_server_set_when_already_configured(self):
+        # The key fix: if the server URL already matches, no set call is made.
+        # This prevents "Logout required before server config update." on restart.
+        r = FakeRunner()
+        self._expect_server_already_configured(r)
+        r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
+        r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
+        cli = _cli(r)
+        cli.unlock()
+        set_calls = [c for c in r.calls if c[0][:2] == ["bw", "config"] and len(c[0]) == 4]
+        assert set_calls == [], "bw config server <url> should not be called when already set"
+
+    def test_unlock_sets_server_when_url_differs(self):
+        r = FakeRunner()
+        self._expect_server_needs_setting(r)
+        r.expect(["bw", "status"], 0, json.dumps({"status": "unauthenticated"}))
+        r.expect(["bw", "login", "--apikey"], 0)
+        r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
+        cli = _cli(r)
+        cli.unlock()
+        set_calls = [c for c in r.calls if c[0][:3] == ["bw", "config", "server"] and len(c[0]) == 4]
+        assert len(set_calls) == 1
+
     def test_unlock_caches_session(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        self._expect_server_already_configured(r)
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         cli = _cli(r)
@@ -86,33 +118,45 @@ class TestUnlock:
 
     def test_unlock_failure_raises(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        self._expect_server_already_configured(r)
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 1, "", "bad password")
         cli = _cli(r)
-        with pytest.raises(BitwardenError, match="bad password"):
+        with pytest.raises(VaultwardenError, match="bad password"):
             cli.unlock()
 
-    def test_config_server_failure_raises(self):
+    def test_config_server_read_failure_proceeds_to_set(self):
+        # Non-zero from the no-arg check (e.g. fresh install) — fall through
+        # to the set call, which succeeds.
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 1, "", "no network")
+        r.expect(["bw", "config", "server"], 1, "", "no config")
+        r.expect(["bw", "config", "server", "https://vaultwarden.test"], 0)
+        r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
+        r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         cli = _cli(r)
-        with pytest.raises(BitwardenError, match="no network"):
+        cli.unlock()  # should not raise
+
+    def test_config_server_set_failure_raises(self):
+        r = FakeRunner()
+        r.expect(["bw", "config", "server"], 0, "https://other.server\n")
+        r.expect(["bw", "config", "server", "https://vaultwarden.test"], 1, "", "no network")
+        cli = _cli(r)
+        with pytest.raises(VaultwardenError, match="no network"):
             cli.unlock()
 
     def test_status_returning_garbage_raises(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        self._expect_server_already_configured(r)
         r.expect(["bw", "status"], 0, "not json")
         cli = _cli(r)
-        with pytest.raises(BitwardenError, match="non-JSON"):
+        with pytest.raises(VaultwardenError, match="non-JSON"):
             cli.unlock()
 
 
 class TestGetItem:
     def _unlocked(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        r.expect(["bw", "config", "server"], 0, "https://vaultwarden.test\n")
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         return r, _cli(r)
@@ -138,7 +182,7 @@ class TestGetItem:
     def test_get_item_failure_raises(self):
         r, cli = self._unlocked()
         r.expect(["bw", "get", "item", "Missing"], 1, "", "Not found.")
-        with pytest.raises(BitwardenError, match="Not found"):
+        with pytest.raises(VaultwardenError, match="Not found"):
             cli.get_item("Missing")
 
     def test_get_password(self):
@@ -151,7 +195,7 @@ class TestGetItem:
         r, cli = self._unlocked()
         item = {"login": {"username": "u"}}
         r.expect(["bw", "get", "item", "X"], 0, json.dumps(item))
-        with pytest.raises(BitwardenError, match=r"login\.password"):
+        with pytest.raises(VaultwardenError, match=r"login\.password"):
             cli.get_password("X")
 
     def test_get_username(self):
@@ -184,14 +228,14 @@ class TestGetItem:
         r, cli = self._unlocked()
         item = {"fields": [{"name": "other", "value": "x"}]}
         r.expect(["bw", "get", "item", "X"], 0, json.dumps(item))
-        with pytest.raises(BitwardenError, match="custom field 'subdomain'"):
+        with pytest.raises(VaultwardenError, match="custom field 'subdomain'"):
             cli.get_custom_field("X", "subdomain")
 
 
 class TestLock:
     def test_lock_clears_session(self):
         r = FakeRunner()
-        r.expect(["bw", "config", "server"], 0)
+        r.expect(["bw", "config", "server"], 0, "https://vaultwarden.test\n")
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         r.expect(["bw", "lock"], 0)
@@ -199,7 +243,7 @@ class TestLock:
         cli.unlock()
         cli.lock()
         # Re-unlock should hit the bw chain again.
-        r.expect(["bw", "config", "server"], 0)
+        r.expect(["bw", "config", "server"], 0, "https://vaultwarden.test\n")
         r.expect(["bw", "status"], 0, json.dumps({"status": "locked"}))
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok2\n")
         assert cli.unlock() == "tok2"
@@ -224,5 +268,5 @@ class TestFromEnv:
     def test_from_env_missing_raises(self, monkeypatch):
         for k in ("BW_SERVER", "BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"):
             monkeypatch.delenv(k, raising=False)
-        with pytest.raises(BitwardenError, match="Missing required env vars"):
+        with pytest.raises(VaultwardenError, match="Missing required env vars"):
             from_env()

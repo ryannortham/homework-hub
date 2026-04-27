@@ -7,7 +7,7 @@ their study and parents have visibility.
 - One Google Sheet per child (Today / Tasks / By Subject / Settings tabs)
 - Hourly sync, hosted on the homelab as a Portainer stack
 - Discord notifications on new homework and on auth expiry
-- Secrets fetched from Vaultwarden via the Bitwarden CLI
+- Secrets fetched at runtime from Vaultwarden via the `bw` CLI
 
 See `🏠 Personal/🖥️ Homelab/HomeworkHub.md` in the vault for full
 architecture, runbook and onboarding instructions.
@@ -104,7 +104,7 @@ entry and no UI; ops surface only.
 src/homework_hub/
 ├── __main__.py           # CLI entrypoint
 ├── config.py             # children.yaml + env settings
-├── secrets.py            # Bitwarden CLI wrapper
+├── secrets.py            # Vaultwarden CLI wrapper
 ├── models.py             # canonical Task schema
 ├── orchestrator.py       # per-child collect → merge → write → notify
 ├── sources/              # classroom, compass, edrolo

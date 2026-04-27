@@ -6,8 +6,8 @@ construct components directly with fakes.
 
 Kept deliberately simple: read ``children.yaml``, instantiate one Source
 per (child, source) pair from config, load tokens from the ``tokens_dir``,
-build a live :class:`GspreadGoldSink` from BW-stored SA creds (or skip
-gracefully if BW is unavailable).
+build a live :class:`GspreadGoldSink` from Vaultwarden-stored SA creds (or
+skip gracefully if Vaultwarden is unavailable).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 from homework_hub.config import ChildrenConfig, Settings
 from homework_hub.medallion_orchestrator import MedallionOrchestrator
 from homework_hub.pipeline.publish import GoldSink
-from homework_hub.secrets import BitwardenCLI, from_env
+from homework_hub.secrets import VaultwardenCLI, from_env
 from homework_hub.sinks.gold_sink import GspreadGoldSink
 from homework_hub.sinks.sheets_client import (
     SheetsBackend,
@@ -38,13 +38,13 @@ def build_medallion_orchestrator(
     settings: Settings,
     *,
     sink: GoldSink | None = None,
-    bw: BitwardenCLI | None = None,
+    bw: VaultwardenCLI | None = None,
 ) -> MedallionOrchestrator:
     """Construct a MedallionOrchestrator wired from config + tokens on disk.
 
     If ``sink`` is not provided, attempts to build a live
     :class:`GspreadGoldSink` from the service-account credentials in
-    Bitwarden. If that fails (e.g. running tests without ``bw``), publish
+    Vaultwarden. If that fails (e.g. running tests without ``bw``), publish
     skips with a clear ``sync_runs`` row instead of crashing the run.
     """
     children_config = ChildrenConfig.load(settings.children_yaml)
@@ -60,12 +60,12 @@ def build_medallion_orchestrator(
     )
 
 
-def _try_build_gold_sink(bw: BitwardenCLI | None) -> GoldSink | None:
+def _try_build_gold_sink(bw: VaultwardenCLI | None) -> GoldSink | None:
     """Best-effort construction of the live gold sink.
 
     Returns ``None`` (and logs a warning) when service-account credentials
     aren't available, so the daemon and CLI keep working in environments
-    without Bitwarden access (CI, local dev with no creds).
+    without Vaultwarden access (CI, local dev with no creds).
     """
     try:
         bw = bw or from_env()
@@ -140,7 +140,7 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
 
 
 def build_bootstrap_sheets_backend(
-    settings: Settings, *, bw: BitwardenCLI | None = None
+    settings: Settings, *, bw: VaultwardenCLI | None = None
 ) -> tuple[SheetsBackend, str]:
     """Build a :class:`SheetsClient` authed as the human bootstrap user.
 

@@ -9,8 +9,8 @@ the daemon's routine publishes work.
 Two artefacts are involved:
 
 * **Client secret** — the GCP-issued OAuth Client ID JSON. Stored as a
-  Bitwarden secure note named in :data:`OAUTH_CLIENT_BW_NAME`. Looked up
-  via the existing :class:`~homework_hub.secrets.BitwardenCLI` helper.
+  Vaultwarden secure note named in :data:`OAUTH_CLIENT_BW_NAME`. Looked up
+  via the existing :class:`~homework_hub.secrets.VaultwardenCLI` helper.
 * **User token** — the per-user refresh token cache. Saved at
   ``settings.tokens_dir / "ryan-bootstrap.json"`` after the first
   authorise + reused on subsequent runs until revoked.
@@ -32,7 +32,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from homework_hub.secrets import BitwardenCLI, from_env
+from homework_hub.secrets import VaultwardenCLI, from_env
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +64,8 @@ class BootstrapAuth:
     token_path: Path
 
 
-def _load_client_config(bw: BitwardenCLI) -> dict[str, Any]:
-    """Fetch the OAuth client JSON from Bitwarden and parse it.
+def _load_client_config(bw: VaultwardenCLI) -> dict[str, Any]:
+    """Fetch the OAuth client JSON from Vaultwarden and parse it.
 
     Accepts either the ``installed`` or ``web`` client-type JSON shapes —
     ``InstalledAppFlow.from_client_config`` autodetects.
@@ -75,7 +75,7 @@ def _load_client_config(bw: BitwardenCLI) -> dict[str, Any]:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise BootstrapAuthError(
-            f"Bitwarden note '{OAUTH_CLIENT_BW_NAME}' is not valid JSON: {exc}"
+            f"Vaultwarden note '{OAUTH_CLIENT_BW_NAME}' is not valid JSON: {exc}"
         ) from exc
 
 
@@ -98,7 +98,7 @@ def _save_token(token_path: Path, creds: Credentials) -> None:
 def load_or_run_bootstrap_flow(
     *,
     tokens_dir: Path,
-    bw: BitwardenCLI | None = None,
+    bw: VaultwardenCLI | None = None,
     scopes: list[str] | None = None,
     open_browser: bool = True,
 ) -> BootstrapAuth:
@@ -108,12 +108,12 @@ def load_or_run_bootstrap_flow(
 
     1. Load ``tokens_dir / "ryan-bootstrap.json"`` if it exists.
     2. If valid, return as-is. If expired-but-refreshable, refresh + persist.
-    3. Otherwise run :class:`InstalledAppFlow` against the BW-stored client
-       secret, opening a browser for user consent. Persist the new token.
+    3. Otherwise run :class:`InstalledAppFlow` against the Vaultwarden-stored
+       client secret, opening a browser for user consent. Persist the new token.
 
     ``open_browser=False`` switches the flow to printing the URL instead
     (handy for SSH sessions or tests). Tests typically inject a fake
-    ``BitwardenCLI`` and short-circuit by writing a token file directly.
+    ``VaultwardenCLI`` and short-circuit by writing a token file directly.
     """
     bw = bw or from_env()
     scopes = scopes or DEFAULT_SCOPES

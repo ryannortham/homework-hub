@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
     user: "568:568"
     environment:
-      # --- Vaultwarden / Bitwarden CLI (set via Portainer stack env vars) ---
+      # --- Vaultwarden (bw CLI — set via Portainer stack env vars) ---
       BW_SERVER: ${BW_SERVER}
       BW_CLIENTID: ${BW_CLIENTID}
       BW_CLIENTSECRET: ${BW_CLIENTSECRET}

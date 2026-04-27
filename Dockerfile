@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --------------------------------------------------------------------------- #
 FROM python:3.12-slim AS runtime
 
-# Bitwarden CLI is needed at runtime for the BitwardenCLI wrapper.
+# Vaultwarden uses the Bitwarden-compatible `bw` CLI at runtime.
 # `bw` is distributed as a self-contained x86_64 Linux binary; TrueNAS is
 # x86_64 so we don't multi-arch this image. (To build on Apple Silicon
 # locally for testing, pass `--platform=linux/amd64`.)

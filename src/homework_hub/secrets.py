@@ -1,14 +1,15 @@
-"""Bitwarden CLI wrapper for fetching credentials from Vaultwarden at runtime.
+"""Vaultwarden CLI wrapper for fetching credentials at runtime.
 
 Auth model:
-    1. ``bw config server <BW_SERVER>`` — points the CLI at our Vaultwarden.
+    1. ``bw config server <BW_SERVER>`` — points the CLI at our Vaultwarden
+       instance (skipped when the server is already configured correctly).
     2. ``bw login --apikey`` with ``BW_CLIENTID`` + ``BW_CLIENTSECRET`` env vars.
     3. ``bw unlock --passwordenv BW_PASSWORD`` → returns a session token.
     4. All subsequent ``bw get item ...`` calls use ``--session <token>``.
 
 The session token is held in memory for the duration of one sync run only;
-nothing is persisted to disk. The CLI binary is expected to be on PATH inside
-the Docker image.
+nothing is persisted to disk. The ``bw`` CLI binary is expected to be on PATH
+inside the Docker image.
 
 Tests inject a fake runner so no real ``bw`` invocations happen.
 """
@@ -38,13 +39,13 @@ def _default_runner(args: Sequence[str], env: dict[str, str] | None = None) -> t
     return proc.returncode, proc.stdout, proc.stderr
 
 
-class BitwardenError(RuntimeError):
+class VaultwardenError(RuntimeError):
     """Raised when a `bw` invocation fails or returns unexpected output."""
 
 
 @dataclass
-class BitwardenCLI:
-    """Thin wrapper around the Bitwarden CLI."""
+class VaultwardenCLI:
+    """Thin wrapper around the Bitwarden-compatible `bw` CLI pointed at Vaultwarden."""
 
     server: str
     client_id: str
@@ -80,18 +81,18 @@ class BitwardenCLI:
         env = self._env_with_session(session)
         rc, out, err = self.runner([self.binary, "get", "item", name], env)
         if rc != 0:
-            raise BitwardenError(f"bw get item {name!r} failed: {err.strip() or out.strip()}")
+            raise VaultwardenError(f"bw get item {name!r} failed: {err.strip() or out.strip()}")
         try:
             return json.loads(out)
         except json.JSONDecodeError as exc:
-            raise BitwardenError(f"bw get item {name!r} returned non-JSON: {out[:200]}") from exc
+            raise VaultwardenError(f"bw get item {name!r} returned non-JSON: {out[:200]}") from exc
 
     def get_password(self, name: str) -> str:
         item = self.get_item(name)
         login = item.get("login") or {}
         password = login.get("password")
         if not password:
-            raise BitwardenError(f"Item {name!r} has no login.password")
+            raise VaultwardenError(f"Item {name!r} has no login.password")
         return password
 
     def get_username(self, name: str) -> str:
@@ -99,45 +100,52 @@ class BitwardenCLI:
         login = item.get("login") or {}
         username = login.get("username")
         if not username:
-            raise BitwardenError(f"Item {name!r} has no login.username")
+            raise VaultwardenError(f"Item {name!r} has no login.username")
         return username
 
     def get_notes(self, name: str) -> str:
         item = self.get_item(name)
         notes = item.get("notes")
         if not notes:
-            raise BitwardenError(f"Item {name!r} has no notes")
+            raise VaultwardenError(f"Item {name!r} has no notes")
         return notes
 
     def get_custom_field(self, name: str, field_name: str) -> str:
-        """Read a custom field by name from a Bitwarden item."""
+        """Read a custom field by name from a Vaultwarden item."""
         item = self.get_item(name)
         for f in item.get("fields") or []:
             if f.get("name") == field_name:
                 value = f.get("value")
                 if value is None:
-                    raise BitwardenError(f"Item {name!r} field {field_name!r} is empty")
+                    raise VaultwardenError(f"Item {name!r} field {field_name!r} is empty")
                 return value
-        raise BitwardenError(f"Item {name!r} has no custom field {field_name!r}")
+        raise VaultwardenError(f"Item {name!r} has no custom field {field_name!r}")
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
 
     def _configure_server(self) -> None:
+        # Read the currently configured server URL (no-arg form just prints it).
+        # Skip the set if it already matches — `bw config server <url>` fails
+        # with "Logout required before server config update." when the CLI is
+        # already authenticated, causing every post-restart sync to abort.
+        rc, out, _ = self.runner([self.binary, "config", "server"], None)
+        if rc == 0 and out.strip() == self.server:
+            return
         rc, _out, err = self.runner([self.binary, "config", "server", self.server], None)
         if rc != 0:
-            raise BitwardenError(f"bw config server failed: {err.strip()}")
+            raise VaultwardenError(f"bw config server failed: {err.strip()}")
 
     def _login_if_needed(self) -> None:
         # Check status; if unauthenticated, log in via API key.
         rc, out, err = self.runner([self.binary, "status"], None)
         if rc != 0:
-            raise BitwardenError(f"bw status failed: {err.strip()}")
+            raise VaultwardenError(f"bw status failed: {err.strip()}")
         try:
             status = json.loads(out).get("status")
         except json.JSONDecodeError as exc:
-            raise BitwardenError(f"bw status returned non-JSON: {out[:200]}") from exc
+            raise VaultwardenError(f"bw status returned non-JSON: {out[:200]}") from exc
         if status == "unauthenticated":
             env = {
                 **os.environ,
@@ -146,7 +154,7 @@ class BitwardenCLI:
             }
             rc, _out, err = self.runner([self.binary, "login", "--apikey"], env)
             if rc != 0:
-                raise BitwardenError(f"bw login --apikey failed: {err.strip()}")
+                raise VaultwardenError(f"bw login --apikey failed: {err.strip()}")
 
     def _unlock(self) -> str:
         env = {**os.environ, "BW_PASSWORD": self.master_password}
@@ -154,10 +162,10 @@ class BitwardenCLI:
             [self.binary, "unlock", "--passwordenv", "BW_PASSWORD", "--raw"], env
         )
         if rc != 0:
-            raise BitwardenError(f"bw unlock failed: {err.strip()}")
+            raise VaultwardenError(f"bw unlock failed: {err.strip()}")
         token = out.strip()
         if not token:
-            raise BitwardenError("bw unlock returned empty session token")
+            raise VaultwardenError("bw unlock returned empty session token")
         return token
 
     def _env_with_session(self, session: str) -> dict[str, str]:
@@ -167,13 +175,13 @@ class BitwardenCLI:
         return self.runner(args, None)
 
 
-def from_env() -> BitwardenCLI:
-    """Construct a BitwardenCLI from process environment variables."""
+def from_env() -> VaultwardenCLI:
+    """Construct a VaultwardenCLI from process environment variables."""
     required = ("BW_SERVER", "BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD")
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
-        raise BitwardenError(f"Missing required env vars: {', '.join(missing)}")
-    return BitwardenCLI(
+        raise VaultwardenError(f"Missing required env vars: {', '.join(missing)}")
+    return VaultwardenCLI(
         server=os.environ["BW_SERVER"],
         client_id=os.environ["BW_CLIENTID"],
         client_secret=os.environ["BW_CLIENTSECRET"],
