@@ -348,7 +348,7 @@ def test_write_table_tab_updatecells_uses_correct_value_types():
     # Due (DATE) — carries format alongside value
     assert cells[2] == {
         "userEnteredValue": {"numberValue": 46143},
-        "userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}},
+        "userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}},
     }
     # Days formula — substituted with row 2
     assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}

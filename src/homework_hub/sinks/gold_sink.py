@@ -329,7 +329,7 @@ _SHEETS_EPOCH = date(1899, 12, 30)
 
 # Date format applied to DATE columns on every write so the format survives
 # deleteDimension wiping bootstrap repeatCell formats.
-_DATE_FORMAT = {"type": "DATE", "pattern": "dd/mm/yyyy"}
+_DATE_FORMAT = {"type": "DATE", "pattern": "dd/MM/yyyy"}
 
 
 def _date_serial(d: date) -> int:
