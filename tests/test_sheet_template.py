@@ -34,6 +34,14 @@ def _addtable_names(reqs: list[dict[str, Any]]) -> list[str]:
 
 
 class TestTabCreation:
+    def test_locale_set_to_en_au(self):
+        """Spreadsheet locale must be en_AU so dd/mm/yyyy patterns render day-first."""
+        reqs = bootstrap_requests()
+        locale_reqs = _by_kind(reqs, "updateSpreadsheetProperties")
+        assert len(locale_reqs) == 1
+        props = locale_reqs[0]["updateSpreadsheetProperties"]["properties"]
+        assert props["locale"] == "en_AU"
+
     def test_default_tab_renamed_to_first_schema_tab(self):
         reqs = bootstrap_requests()
         first_rename = _by_kind(reqs, "updateSheetProperties")[0]

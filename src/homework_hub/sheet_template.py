@@ -55,6 +55,22 @@ def _allocate_sheet_ids(schema: SheetSchema) -> dict[str, int]:
 # Public entry point
 # --------------------------------------------------------------------------- #
 
+# Spreadsheet locale used for all bootstrapped sheets.  en_AU means date
+# format patterns like "dd/mm/yyyy" are interpreted as day/month/year.
+_LOCALE = "en_AU"
+
+
+def _set_spreadsheet_locale() -> list[dict[str, Any]]:
+    """Set the spreadsheet locale so date patterns render day-first (d/m/yyyy)."""
+    return [
+        {
+            "updateSpreadsheetProperties": {
+                "properties": {"locale": _LOCALE},
+                "fields": "locale",
+            }
+        }
+    ]
+
 
 def bootstrap_requests(schema: SheetSchema = SCHEMA) -> list[dict[str, Any]]:
     """Return the full list of batchUpdate requests for a fresh sheet.
@@ -64,6 +80,7 @@ def bootstrap_requests(schema: SheetSchema = SCHEMA) -> list[dict[str, Any]]:
     """
     sheet_ids = _allocate_sheet_ids(schema)
     requests: list[dict[str, Any]] = []
+    requests.extend(_set_spreadsheet_locale())
     requests.extend(_rename_default_tab(schema, sheet_ids))
     requests.extend(_add_extra_tabs(schema, sheet_ids))
     requests.extend(_write_headers(schema, sheet_ids))
