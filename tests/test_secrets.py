@@ -136,7 +136,31 @@ class TestUnlock:
         cli = _cli(r)
         cli.unlock()  # should not raise
 
-    def test_config_server_set_failure_raises(self):
+    def test_login_retries_after_logout_on_failure(self):
+        # First login attempt fails (broken data.json) — should logout then retry.
+        r = FakeRunner()
+        self._expect_server_already_configured(r)
+        r.expect(["bw", "status"], 0, json.dumps({"status": "unauthenticated"}))
+        r.expect(["bw", "login", "--apikey"], 1, "", "Account does not exist")
+        r.expect(["bw", "logout"], 0)
+        r.expect(["bw", "login", "--apikey"], 0)
+        r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
+        cli = _cli(r)
+        token = cli.unlock()
+        assert token == "tok"
+        called = [c[0][1] for c in r.calls]
+        assert called == ["config", "status", "login", "logout", "login", "unlock"]
+
+    def test_login_raises_if_retry_also_fails(self):
+        r = FakeRunner()
+        self._expect_server_already_configured(r)
+        r.expect(["bw", "status"], 0, json.dumps({"status": "unauthenticated"}))
+        r.expect(["bw", "login", "--apikey"], 1, "", "Account does not exist")
+        r.expect(["bw", "logout"], 0)
+        r.expect(["bw", "login", "--apikey"], 1, "", "still broken")
+        cli = _cli(r)
+        with pytest.raises(VaultwardenError, match="still broken"):
+            cli.unlock()
         r = FakeRunner()
         r.expect(["bw", "config", "server"], 0, "https://other.server\n")
         r.expect(["bw", "config", "server", "https://vaultwarden.test"], 1, "", "no network")

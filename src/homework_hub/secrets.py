@@ -154,7 +154,12 @@ class VaultwardenCLI:
             }
             rc, _out, err = self.runner([self.binary, "login", "--apikey"], env)
             if rc != 0:
-                raise VaultwardenError(f"bw login --apikey failed: {err.strip()}")
+                # Login failed — data.json may be in a broken/partial state from
+                # a previous interrupted run. Logout to wipe stale state and retry.
+                self.runner([self.binary, "logout"], None)
+                rc, _out, err = self.runner([self.binary, "login", "--apikey"], env)
+                if rc != 0:
+                    raise VaultwardenError(f"bw login --apikey failed: {err.strip()}")
 
     def _unlock(self) -> str:
         env = {**os.environ, "BW_PASSWORD": self.master_password}
