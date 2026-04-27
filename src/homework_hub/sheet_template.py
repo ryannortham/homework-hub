@@ -306,7 +306,7 @@ def _apply_column_formats(schema: SheetSchema, sheet_ids: dict[str, int]) -> lis
                         column_index=i,
                         cell={
                             "userEnteredFormat": {
-                                "numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}
+                                "numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}
                             }
                         },
                         fields="userEnteredFormat.numberFormat",

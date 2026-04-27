@@ -200,6 +200,10 @@ class TestColumnFormats:
         ]
         # Tasks.Due + Possible Duplicates.compass_due + classroom_due
         assert len(date_formats) == 3
+        # All use dd/MM/yyyy (uppercase MM = months; lowercase mm = minutes)
+        for r in date_formats:
+            pattern = r["repeatCell"]["cell"]["userEnteredFormat"]["numberFormat"]["pattern"]
+            assert pattern == "dd/MM/yyyy", f"Expected dd/MM/yyyy, got {pattern!r}"
 
     def test_checkbox_columns_get_boolean_validation(self):
         reqs = bootstrap_requests()

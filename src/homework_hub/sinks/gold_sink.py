@@ -31,7 +31,7 @@ from google.auth.credentials import Credentials
 from googleapiclient.discovery import build
 
 from homework_hub.pipeline.publish import DuplicateCheckboxState, UserEdit
-from homework_hub.schema import ColumnKind, ColumnSpec, TabSpec
+from homework_hub.schema import TabSpec
 
 log = logging.getLogger(__name__)
 
@@ -250,22 +250,23 @@ class GspreadGoldSink:
         #    correct Sheets API value type — no server-side deduplication.
         #    Formula templates containing ``{row}`` are substituted with the
         #    1-based row number (data starts at row 2 of the sheet).
-        #    DATE columns also carry ``userEnteredFormat.numberFormat`` so the
-        #    dd/mm/yyyy pattern survives the per-sync deleteDimension.
+        #    We do NOT write userEnteredFormat here: the bootstrap repeatCell
+        #    pass applies column formats (e.g. dd/MM/yyyy for DATE) and they
+        #    survive deleteDimension. Writing format via SA credentials would
+        #    normalise dd/MM/yyyy to M/d/yyyy (SA account is en_US).
         if encoded:
             requests.append({
                 "updateCells": {
                     "rows": [
                         {"values": [
-                            _to_cell_with_format(
-                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v,
-                                col,
+                            _to_cell_value(
+                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v
                             )
-                            for v, col in zip(row, tab.columns)
+                            for v in row
                         ]}
                         for i, row in enumerate(encoded)
                     ],
-                    "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+                    "fields": "userEnteredValue",
                     "start": {
                         "sheetId": ws.id,
                         "rowIndex": 1,       # 0-based → row 2
@@ -327,9 +328,18 @@ class GspreadGoldSink:
 # Sheets date serial epoch: days since 30 Dec 1899.
 _SHEETS_EPOCH = date(1899, 12, 30)
 
-# Date format applied to DATE columns on every write so the format survives
-# deleteDimension wiping bootstrap repeatCell formats.
-_DATE_FORMAT = {"type": "DATE", "pattern": "dd/MM/yyyy"}
+
+def _date_serial(d: date) -> int:
+    """Convert a Python date to a Sheets date serial number.
+
+    Sheets stores dates as integer days since 30 Dec 1899.  Writing a
+    ``numberValue`` with this integer (rather than a string like
+    ``"2026-05-01"``) ensures the cell is treated as a native date —
+    enabling chronological TABLE sort rather than lexicographic A-Z sort.
+    The column format (dd/MM/yyyy) is applied once at bootstrap via
+    ``repeatCell`` and survives ``deleteDimension`` automatically.
+    """
+    return (d - _SHEETS_EPOCH).days
 
 
 def _date_serial(d: date) -> int:
@@ -379,17 +389,6 @@ def _to_cell_value(value: object) -> dict[str, Any]:
     if isinstance(value, str) and value.startswith("="):
         return {"userEnteredValue": {"formulaValue": value}}
     return {"userEnteredValue": {"stringValue": str(value) if value is not None else ""}}
-
-
-def _to_cell_with_format(value: object, col: ColumnSpec) -> dict[str, Any]:
-    """Like ``_to_cell_value`` but also sets ``userEnteredFormat`` for DATE
-    columns so the display pattern survives the per-sync deleteDimension.
-    """
-    cell = _to_cell_value(value)
-    if col.kind is ColumnKind.DATE:
-        cell = dict(cell)  # shallow copy so we don't mutate the original
-        cell["userEnteredFormat"] = {"numberFormat": _DATE_FORMAT}
-    return cell
 
 
 def _col_letter(n: int) -> str:

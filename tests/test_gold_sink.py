@@ -25,7 +25,6 @@ from homework_hub.sinks.gold_sink import (
     _col_letter,
     _encode_cell,
     _to_cell_value,
-    _to_cell_with_format,
 )
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +335,7 @@ def test_write_table_tab_delete_covers_all_existing_rows():
 
 def test_write_table_tab_updatecells_uses_correct_value_types():
     """Booleans, formulas, numbers and strings each get the right cell type.
-    DATE columns also carry userEnteredFormat so the pattern survives deleteDimension."""
+    No userEnteredFormat is written — column format from bootstrap repeatCell survives deleteDimension."""
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     rows = [("Maths", "HW", 46143, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
@@ -345,19 +344,16 @@ def test_write_table_tab_updatecells_uses_correct_value_types():
     reqs = _single_batch_requests(sink)
     # order: deleteDimension, updateTable, updateCells
     cells = reqs[2]["updateCells"]["rows"][0]["values"]
-    # Due (DATE) — carries format alongside value
-    assert cells[2] == {
-        "userEnteredValue": {"numberValue": 46143},
-        "userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}},
-    }
+    # Due (DATE serial) — value only, no format (format set by bootstrap repeatCell)
+    assert cells[2] == {"userEnteredValue": {"numberValue": 46143}}
     # Days formula — substituted with row 2
     assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}
     # Done checkbox
     assert cells[6] == {"userEnteredValue": {"boolValue": False}}
-    # Subject text — no format
+    # Subject text
     assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}
-    # fields mask covers both value and format
-    assert reqs[2]["updateCells"]["fields"] == "userEnteredValue,userEnteredFormat.numberFormat"
+    # fields mask covers only value, not format
+    assert reqs[2]["updateCells"]["fields"] == "userEnteredValue"
 
 
 def test_write_table_tab_updatetable_endrow_covers_data_rows():
