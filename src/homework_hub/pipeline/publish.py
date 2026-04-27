@@ -105,10 +105,14 @@ class DuplicateRow:
 def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
     """Project silver tasks into Tasks-tab row data.
 
-    Editable columns (``priority``, ``done``, ``notes``) are written as
-    blank/false defaults; :func:`merge_user_edits` overlays kid overrides
-    afterwards. The ``Days`` column is written as a row-relative formula
-    (``=[@Due]-TODAY()``) so Sheets evaluates it as a number on every open.
+    Editable columns ``priority`` and ``notes`` default to blank.
+    ``done`` is derived from the task's status: ``True`` when the upstream
+    LMS reports the task as Submitted or Graded, ``False`` otherwise.
+    Kids can override it via the sheet; :func:`merge_user_edits` overlays
+    those overrides afterwards.
+
+    The ``Days`` column is written as a row-relative formula
+    (``=C{row}-TODAY()``) so Sheets evaluates it as a number on every open.
     """
     rows: list[TaskRow] = []
     for t in tasks:
@@ -119,7 +123,7 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
             "days": TASKS_TAB.columns[TASKS_TAB.column_index("days")].formula_template,
             "status": _STATUS_DISPLAY.get(t.status.value, t.status.value),
             "priority": "",
-            "done": False,
+            "done": t.status in (Status.SUBMITTED, Status.GRADED),
             "notes": "",
             "source": _SOURCE_DISPLAY.get(t.source.value, t.source.value),
             "link": t.url,
@@ -239,26 +243,43 @@ def merge_user_edits(
 def diff_user_edits(
     rows: list[TaskRow],
     existing: list[UserEdit],
+    projected: list[TaskRow] | None = None,
 ) -> list[UserEdit]:
     """Compute the canonical UserEdits row-set for the Tasks tab.
 
-    For each editable cell that differs from its silver default we emit
-    a ``UserEdit``. Cells that match the default are NOT emitted, so
-    ``UserEdits`` stays small. Existing ``updated_at`` values are
-    preserved when the value didn't change (avoids spurious churn on
-    every publish).
+    For each editable cell that differs from its *projected* (system-derived)
+    value we emit a ``UserEdit`` — this represents a deliberate kid override.
+    Cells that match the projected value are not persisted, so ``UserEdits``
+    stays small.
+
+    ``projected`` is the pre-merge output of :func:`project_tasks_rows`.
+    When omitted (backwards-compat) a static default of ``""`` / ``False``
+    is used, which was the original behaviour before ``done`` became
+    status-derived.  Callers should always supply it.
+
+    Existing ``updated_at`` timestamps are preserved when the value did not
+    change (avoids spurious churn on every publish).
     """
     editable_cols = TASKS_TAB.editable_columns()
-    defaults_by_key: dict[str, object] = {"priority": "", "done": False, "notes": ""}
+    projected_by_uid: dict[str, TaskRow] = (
+        {r.task_uid: r for r in projected} if projected else {}
+    )
+    _static_defaults: dict[str, object] = {"priority": "", "done": False, "notes": ""}
     existing_by_key = {(e.task_uid, e.column): e for e in existing}
 
     out: list[UserEdit] = []
     now = datetime.now(UTC).isoformat()
     for row in rows:
+        proj_row = projected_by_uid.get(row.task_uid)
         for col in editable_cols:
             idx = TASKS_TAB.column_index(col.key)
             value = row.cells[idx]
-            default = defaults_by_key.get(col.key, "")
+            # Use the projected (system-derived) value as the baseline so a
+            # done=True on a Submitted task is not treated as a kid override.
+            if proj_row is not None:
+                default = proj_row.cells[idx]
+            else:
+                default = _static_defaults.get(col.key, "")
             if value == default:
                 continue
             prior = existing_by_key.get((row.task_uid, col.key))
@@ -439,7 +460,7 @@ def publish_for_child(
     settings_rows = project_settings_rows(child=child, last_synced=last_synced)
 
     # 4. Compute UserEdits writeback (canonical row-set).
-    edits_writeback = diff_user_edits(merged_rows, user_edits)
+    edits_writeback = diff_user_edits(merged_rows, user_edits, projected=task_rows)
 
     # 5. Write tabs.
     sink.write_tab(spreadsheet_id, TASKS_TAB, [r.cells for r in merged_rows])

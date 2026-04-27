@@ -25,6 +25,7 @@ from homework_hub.sinks.gold_sink import (
     _col_letter,
     _encode_cell,
     _to_cell_value,
+    _to_cell_with_format,
 )
 
 # --------------------------------------------------------------------------- #
@@ -36,21 +37,28 @@ def test_encode_cell_none_becomes_empty_string():
     assert _encode_cell(None) == ""
 
 
-def test_encode_cell_utc_datetime_becomes_iso_date():
+def test_encode_cell_utc_datetime_becomes_date_serial():
     dt = datetime(2026, 4, 26, 10, 30, tzinfo=UTC)
-    assert _encode_cell(dt) == "2026-04-26"
+    # 2026-04-26 = 46138 days since 30 Dec 1899
+    assert _encode_cell(dt) == 46138
 
 
 def test_encode_cell_non_utc_datetime_is_normalised_to_utc_first():
-    # 23:30 in UTC+10 == 13:30 UTC same day
+    # 23:30 in UTC+10 == 13:30 UTC same day → still 2026-04-26
     aedt = timezone(__import__("datetime").timedelta(hours=10))
     dt = datetime(2026, 4, 26, 23, 30, tzinfo=aedt)
-    assert _encode_cell(dt) == "2026-04-26"
+    assert _encode_cell(dt) == 46138
 
 
 def test_encode_cell_naive_datetime_uses_date_directly():
     dt = datetime(2026, 4, 26, 10, 30)
-    assert _encode_cell(dt) == "2026-04-26"
+    assert _encode_cell(dt) == 46138
+
+
+def test_encode_cell_date_object_becomes_serial():
+    from datetime import date as _date
+    assert _encode_cell(_date(2026, 4, 26)) == 46138
+    assert _encode_cell(_date(2026, 5, 1)) == 46143
 
 
 def test_encode_cell_preserves_bool():
@@ -327,7 +335,8 @@ def test_write_table_tab_delete_covers_all_existing_rows():
 
 
 def test_write_table_tab_updatecells_uses_correct_value_types():
-    """Booleans, formulas, numbers and strings each get the right cell type."""
+    """Booleans, formulas, numbers and strings each get the right cell type.
+    DATE columns also carry userEnteredFormat so the pattern survives deleteDimension."""
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     rows = [("Maths", "HW", 46143, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
@@ -336,11 +345,19 @@ def test_write_table_tab_updatecells_uses_correct_value_types():
     reqs = _single_batch_requests(sink)
     # order: deleteDimension, updateTable, updateCells
     cells = reqs[2]["updateCells"]["rows"][0]["values"]
-    assert cells[2] == {"userEnteredValue": {"numberValue": 46143}}    # due (date serial)
-    # The sink substitutes {row} in formula templates; row index 0 = sheet row 2
-    assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}  # days
-    assert cells[6] == {"userEnteredValue": {"boolValue": False}}       # done
-    assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}  # subject
+    # Due (DATE) — carries format alongside value
+    assert cells[2] == {
+        "userEnteredValue": {"numberValue": 46143},
+        "userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}},
+    }
+    # Days formula — substituted with row 2
+    assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}
+    # Done checkbox
+    assert cells[6] == {"userEnteredValue": {"boolValue": False}}
+    # Subject text — no format
+    assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}
+    # fields mask covers both value and format
+    assert reqs[2]["updateCells"]["fields"] == "userEnteredValue,userEnteredFormat.numberFormat"
 
 
 def test_write_table_tab_updatetable_endrow_covers_data_rows():
@@ -394,11 +411,12 @@ def test_write_table_tab_header_only_empty_rows_only_updatetable():
 
 
 def test_write_table_tab_encodes_values_correctly():
-    """Rows are encoded before being turned into cell value dicts."""
+    """Rows are encoded before being turned into cell value dicts.
+    In real usage updated_at is always a str; date/datetime objects encode to serials."""
     ws = FakeWorksheet("UserEdits", rows=[["h"]], ws_id=2)
     sink, _ = _make_sink({"UserEdits": ws}, with_discovery=True)
     rows = [
-        ("uid-1", "priority", "High", datetime(2026, 4, 26, 10, 0, tzinfo=UTC)),
+        ("uid-1", "priority", "High", "2026-04-26T10:00:00+00:00"),
         ("uid-2", "done", True, None),
     ]
     sink.write_tab("sheet-id", USER_EDITS_TAB, rows)
@@ -406,7 +424,7 @@ def test_write_table_tab_encodes_values_correctly():
     # order: updateTable, updateCells (no delete — header-only)
     update_rows = reqs[1]["updateCells"]["rows"]
     assert update_rows[0]["values"][2] == {"userEnteredValue": {"stringValue": "High"}}
-    assert update_rows[0]["values"][3] == {"userEnteredValue": {"stringValue": "2026-04-26"}}
+    assert update_rows[0]["values"][3] == {"userEnteredValue": {"stringValue": "2026-04-26T10:00:00+00:00"}}
     assert update_rows[1]["values"][2] == {"userEnteredValue": {"boolValue": True}}
     assert update_rows[1]["values"][3] == {"userEnteredValue": {"stringValue": ""}}
 

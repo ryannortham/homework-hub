@@ -101,11 +101,23 @@ class TestProjectTasksRows:
         assert cells[_idx("days")] == "=C{row}-TODAY()"
         assert cells[_idx("status")] == "Not started"
         assert cells[_idx("priority")] == ""
+        # NOT_STARTED → done=False
         assert cells[_idx("done")] is False
         assert cells[_idx("notes")] == ""
         assert cells[_idx("source")] == "Compass"
         assert cells[_idx("link")] == "https://example/test"
         assert cells[_idx("task_uid")] == "compass:T1"
+
+    def test_done_false_for_not_started_and_overdue(self):
+        for status in (Status.NOT_STARTED, Status.IN_PROGRESS, Status.OVERDUE):
+            rows = project_tasks_rows([_task(status=status)])
+            assert rows[0].cells[_idx("done")] is False, f"expected False for {status}"
+
+    def test_done_true_for_submitted_and_graded(self):
+        """Done is auto-derived as True when the LMS reports Submitted or Graded."""
+        for status in (Status.SUBMITTED, Status.GRADED):
+            rows = project_tasks_rows([_task(status=status)])
+            assert rows[0].cells[_idx("done")] is True, f"expected True for {status}"
 
     def test_classroom_source_label(self):
         rows = project_tasks_rows([_task(source=Source.CLASSROOM, source_id="K1")])
@@ -243,39 +255,62 @@ class TestMergeUserEdits:
 
 class TestDiffUserEdits:
     def test_default_values_not_emitted(self):
-        rows = project_tasks_rows([_task()])
-        edits = diff_user_edits(rows, existing=[])
+        projected = project_tasks_rows([_task()])
+        rows = merge_user_edits(projected, [])
+        edits = diff_user_edits(rows, existing=[], projected=projected)
         assert edits == []
 
+    def test_submitted_done_true_not_treated_as_override(self):
+        """done=True on a Submitted task is the system default, not a kid override."""
+        projected = project_tasks_rows([_task(status=Status.SUBMITTED)])
+        rows = merge_user_edits(projected, [])
+        edits = diff_user_edits(rows, existing=[], projected=projected)
+        # done=True is the projected value — should not be emitted as a UserEdit
+        assert not any(e.column == "done" for e in edits)
+
+    def test_kid_unticks_submitted_task_emitted(self):
+        """If a kid overrides done=False on a Submitted task, that IS persisted."""
+        projected = project_tasks_rows([_task(status=Status.SUBMITTED)])
+        rows = merge_user_edits(projected, [UserEdit("compass:T1", "done", False, "now")])
+        edits = diff_user_edits(rows, existing=[], projected=projected)
+        done_edits = [e for e in edits if e.column == "done"]
+        assert len(done_edits) == 1
+        assert done_edits[0].value is False
+
     def test_overridden_priority_emitted(self):
+        projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
-            project_tasks_rows([_task()]),
+            projected,
             [UserEdit("compass:T1", "priority", "High", "old")],
         )
-        out = diff_user_edits(rows, existing=[])
+        out = diff_user_edits(rows, existing=[], projected=projected)
         assert len(out) == 1
         assert out[0].column == "priority"
         assert out[0].value == "High"
 
     def test_unchanged_value_keeps_old_timestamp(self):
+        projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
-            project_tasks_rows([_task()]),
+            projected,
             [UserEdit("compass:T1", "priority", "High", "OLD-TS")],
         )
         out = diff_user_edits(
             rows,
             existing=[UserEdit("compass:T1", "priority", "High", "OLD-TS")],
+            projected=projected,
         )
         assert out[0].updated_at == "OLD-TS"
 
     def test_changed_value_gets_new_timestamp(self):
+        projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
-            project_tasks_rows([_task()]),
+            projected,
             [UserEdit("compass:T1", "priority", "High", "now")],
         )
         out = diff_user_edits(
             rows,
             existing=[UserEdit("compass:T1", "priority", "Low", "OLD-TS")],
+            projected=projected,
         )
         assert out[0].value == "High"
         assert out[0].updated_at != "OLD-TS"

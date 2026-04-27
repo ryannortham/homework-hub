@@ -23,7 +23,7 @@ direct equivalent).
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import gspread
@@ -31,7 +31,7 @@ from google.auth.credentials import Credentials
 from googleapiclient.discovery import build
 
 from homework_hub.pipeline.publish import DuplicateCheckboxState, UserEdit
-from homework_hub.schema import TabSpec
+from homework_hub.schema import ColumnKind, ColumnSpec, TabSpec
 
 log = logging.getLogger(__name__)
 
@@ -250,19 +250,22 @@ class GspreadGoldSink:
         #    correct Sheets API value type — no server-side deduplication.
         #    Formula templates containing ``{row}`` are substituted with the
         #    1-based row number (data starts at row 2 of the sheet).
+        #    DATE columns also carry ``userEnteredFormat.numberFormat`` so the
+        #    dd/mm/yyyy pattern survives the per-sync deleteDimension.
         if encoded:
             requests.append({
                 "updateCells": {
                     "rows": [
                         {"values": [
-                            _to_cell_value(
-                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v
+                            _to_cell_with_format(
+                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v,
+                                col,
                             )
-                            for v in row
+                            for v, col in zip(row, tab.columns)
                         ]}
                         for i, row in enumerate(encoded)
                     ],
-                    "fields": "userEnteredValue",
+                    "fields": "userEnteredValue,userEnteredFormat.numberFormat",
                     "start": {
                         "sheetId": ws.id,
                         "rowIndex": 1,       # 0-based → row 2
@@ -321,16 +324,40 @@ class GspreadGoldSink:
 # Cell encoding
 # --------------------------------------------------------------------------- #
 
+# Sheets date serial epoch: days since 30 Dec 1899.
+_SHEETS_EPOCH = date(1899, 12, 30)
+
+# Date format applied to DATE columns on every write so the format survives
+# deleteDimension wiping bootstrap repeatCell formats.
+_DATE_FORMAT = {"type": "DATE", "pattern": "dd/mm/yyyy"}
+
+
+def _date_serial(d: date) -> int:
+    """Convert a Python date to a Sheets date serial number.
+
+    Sheets stores dates as integer days since 30 Dec 1899.  Writing a
+    ``numberValue`` with this integer (rather than a string like
+    ``"2026-05-01"``) ensures the cell is treated as a native date —
+    enabling chronological TABLE sort rather than lexicographic A-Z sort.
+    """
+    return (d - _SHEETS_EPOCH).days
+
 
 def _encode_cell(value: object) -> object:
-    """Coerce a Python value into something Sheets' USER_ENTERED accepts."""
+    """Coerce a Python value into something Sheets' USER_ENTERED accepts.
+
+    ``date`` / ``datetime`` objects are converted to Sheets date serial
+    numbers (int days since 30 Dec 1899) so the cell is stored as a
+    numeric date rather than a string.
+    """
     if value is None:
         return ""
     if isinstance(value, datetime):
-        # Convert UTC to a naive ISO date for Sheets DATE parsing.
         if value.tzinfo is not None:
             value = value.astimezone(UTC).replace(tzinfo=None)
-        return value.date().isoformat()
+        return _date_serial(value.date())
+    if isinstance(value, date):
+        return _date_serial(value)
     if isinstance(value, bool):
         return value
     if isinstance(value, int | float | str):
@@ -343,10 +370,7 @@ def _to_cell_value(value: object) -> dict[str, Any]:
 
     Used by ``_write_table_tab`` to build ``updateCells`` request bodies so
     that each cell gets the correct value type (formulaValue / boolValue /
-    numberValue / stringValue) rather than the generic USER_ENTERED string
-    parsing used by ``values.append``.  This avoids the Sheets API bug where
-    identical formula strings across multiple rows are deduplicated and only
-    the first row receives the formula.
+    numberValue / stringValue).
     """
     if isinstance(value, bool):
         return {"userEnteredValue": {"boolValue": value}}
@@ -355,6 +379,17 @@ def _to_cell_value(value: object) -> dict[str, Any]:
     if isinstance(value, str) and value.startswith("="):
         return {"userEnteredValue": {"formulaValue": value}}
     return {"userEnteredValue": {"stringValue": str(value) if value is not None else ""}}
+
+
+def _to_cell_with_format(value: object, col: ColumnSpec) -> dict[str, Any]:
+    """Like ``_to_cell_value`` but also sets ``userEnteredFormat`` for DATE
+    columns so the display pattern survives the per-sync deleteDimension.
+    """
+    cell = _to_cell_value(value)
+    if col.kind is ColumnKind.DATE:
+        cell = dict(cell)  # shallow copy so we don't mutate the original
+        cell["userEnteredFormat"] = {"numberFormat": _DATE_FORMAT}
+    return cell
 
 
 def _col_letter(n: int) -> str:
