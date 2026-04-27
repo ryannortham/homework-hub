@@ -154,6 +154,36 @@ class TestMapping:
         assert _strip_html("plain text") == "plain text"
         assert _strip_html("") == ""
 
+    def test_submitted_at_populated_from_submitted_timestamp(self, lt):
+        lt["students"] = [
+            {"userId": 1, "submissionStatus": 1, "submittedTimestamp": "2026-04-20T09:00:00Z"}
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.submitted_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+
+    def test_submitted_at_none_when_timestamp_null(self, lt):
+        # Fixture has submittedTimestamp: null
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.submitted_at is None
+
+    def test_due_at_falls_back_to_submitted_at_when_no_due_date(self, lt):
+        del lt["dueDateTimestamp"]
+        lt["students"] = [
+            {"userId": 1, "submissionStatus": 1, "submittedTimestamp": "2026-04-20T09:00:00Z"}
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.due_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+        assert t.submitted_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+
+    def test_explicit_due_at_takes_precedence_over_submitted_at(self, lt):
+        lt["students"] = [
+            {"userId": 1, "submissionStatus": 1, "submittedTimestamp": "2026-04-20T09:00:00Z"}
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        # dueDateTimestamp from fixture is 2026-04-29T15:00:00 — must win
+        assert t.due_at == datetime(2026, 4, 29, 15, 0, 0, tzinfo=UTC)
+        assert t.submitted_at == datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+
 
 # --------------------------------------------------------------------------- #
 # Token persistence

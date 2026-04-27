@@ -98,8 +98,13 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
         learning_task.get("dueDate")
     )
 
-    status_raw_int = _resolve_student_status(learning_task)
+    status_raw_int, submitted_at = _resolve_student_status(learning_task)
     status = _STATUS_MAP.get(status_raw_int, Status.NOT_STARTED)
+
+    # Fall back to the submission timestamp when no upstream due date is
+    # provided — Compass sometimes omits dueDateTimestamp on older or
+    # inactive-enrolment tasks that have already been submitted/graded.
+    due_at = due_at or submitted_at
 
     url = f"https://{subdomain}.compass.education/Communicate/LearningTasksStudentDetails.aspx?taskId={task_id}"
 
@@ -112,19 +117,23 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
         description=description,
         assigned_at=assigned_at,
         due_at=due_at,
+        submitted_at=submitted_at,
         status=status,
         status_raw=str(status_raw_int),
         url=url,
     )
 
 
-def _resolve_student_status(lt: dict[str, Any]) -> int:
+def _resolve_student_status(lt: dict[str, Any]) -> tuple[int, datetime | None]:
     """Compass returns the per-student status under ``students[].submissionStatus``.
 
     Live responses don't carry a top-level ``status`` field at all; the only
     reliable source is the matching ``students[]`` entry (one per cohort
     member when an admin/parent token is used, one entry when fetched per
     userId).
+
+    Also extracts ``submittedTimestamp`` from the same student entry when
+    present, returning it as a parsed UTC datetime (or ``None``).
     """
     students = lt.get("students")
     if isinstance(students, list) and students:
@@ -133,8 +142,9 @@ def _resolve_student_status(lt: dict[str, Any]) -> int:
                 continue
             v = s.get("submissionStatus")
             if isinstance(v, int):
-                return v
-    return 0
+                submitted_at = _parse_compass_dt(s.get("submittedTimestamp"))
+                return v, submitted_at
+    return 0, None
 
 
 def _parse_compass_dt(value: Any) -> datetime | None:

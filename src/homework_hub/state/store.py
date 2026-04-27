@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS silver_tasks (
     description TEXT NOT NULL DEFAULT '',
     assigned_at TEXT,
     due_at TEXT,
+    submitted_at TEXT,
     status_raw TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     url TEXT NOT NULL DEFAULT '',

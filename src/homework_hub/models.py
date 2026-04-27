@@ -38,12 +38,13 @@ class Task(BaseModel):
     description: str = ""
     assigned_at: datetime | None = None
     due_at: datetime | None = None
+    submitted_at: datetime | None = None
     status_raw: str = ""
     status: Status = Status.NOT_STARTED
     url: str = ""
     last_synced: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    @field_validator("assigned_at", "due_at", "last_synced")
+    @field_validator("assigned_at", "due_at", "submitted_at", "last_synced")
     @classmethod
     def ensure_tz_aware(cls, value: datetime | None) -> datetime | None:
         """All datetimes stored in UTC. Naive values are assumed UTC."""

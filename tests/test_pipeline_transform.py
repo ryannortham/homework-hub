@@ -166,6 +166,7 @@ def _task(
     title: str = "Algebra Q1-5",
     status: Status = Status.NOT_STARTED,
     due: datetime | None = None,
+    submitted_at: datetime | None = None,
 ) -> Task:
     return Task(
         source=source,
@@ -175,6 +176,7 @@ def _task(
         title=title,
         due_at=due or datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
         status=status,
+        submitted_at=submitted_at,
     )
 
 
@@ -275,6 +277,34 @@ class TestSilverWriterUpsert:
         conn.close()
         assert row == ("9MATH", "9MATH", "9MATH")
 
+    def test_submitted_at_persisted_and_round_trips(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        ts = datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many([(_task(source_id="1", submitted_at=ts), None)])
+        import sqlite3
+
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val is not None
+        assert val.startswith("2026-04-20T09:00:00")
+
+    def test_submitted_at_none_stored_as_null(self, writer: SilverWriter, store: StateStore):
+        writer.upsert_many([(_task(source_id="1", submitted_at=None), None)])
+        import sqlite3
+
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val is None
+
+    def test_submitted_at_change_triggers_update(self, writer: SilverWriter):
+        writer.upsert_many([(_task(source_id="1", submitted_at=None), None)])
+        ts = datetime(2026, 4, 21, 10, 0, 0, tzinfo=UTC)
+        result = writer.upsert_many([(_task(source_id="1", submitted_at=ts), None)])
+        assert result.updated == 1
+
 
 class TestSilverWriterAllForChild:
     def test_round_trips_tasks(self, writer: SilverWriter):
@@ -291,3 +321,10 @@ class TestSilverWriterAllForChild:
 
     def test_returns_empty_for_unknown_child(self, writer: SilverWriter):
         assert writer.all_for_child("nobody") == []
+
+    def test_submitted_at_survives_round_trip(self, writer: SilverWriter):
+        ts = datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many([(_task(child="james", source_id="1", submitted_at=ts), None)])
+        tasks = writer.all_for_child("james")
+        assert len(tasks) == 1
+        assert tasks[0].submitted_at == ts

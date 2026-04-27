@@ -107,6 +107,7 @@ class TestSilverTasks:
             "description",
             "assigned_at",
             "due_at",
+            "submitted_at",
             "status_raw",
             "status",
             "url",

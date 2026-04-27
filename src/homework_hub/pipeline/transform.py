@@ -166,7 +166,7 @@ class SilverWriter:
             for task, bronze_id in rows:
                 existing = conn.execute(
                     "SELECT subject_raw, subject_canonical, subject_short, "
-                    "title, description, assigned_at, due_at, "
+                    "title, description, assigned_at, due_at, submitted_at, "
                     "status_raw, status, url "
                     "FROM silver_tasks "
                     "WHERE child = ? AND source = ? AND source_id = ?",
@@ -193,6 +193,7 @@ class SilverWriter:
                     task.description,
                     task.assigned_at.isoformat() if task.assigned_at else None,
                     task.due_at.isoformat() if task.due_at else None,
+                    task.submitted_at.isoformat() if task.submitted_at else None,
                     task.status_raw,
                     task.status.value,
                     task.url,
@@ -203,9 +204,9 @@ class SilverWriter:
                         "INSERT INTO silver_tasks "
                         "(child, source, source_id, subject_raw, "
                         "subject_canonical, subject_short, title, description, "
-                        "assigned_at, due_at, status_raw, status, url, "
+                        "assigned_at, due_at, submitted_at, status_raw, status, url, "
                         "bronze_id, last_synced) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             task.child,
                             task.source.value,
@@ -236,7 +237,7 @@ class SilverWriter:
                         "UPDATE silver_tasks SET "
                         "subject_raw = ?, subject_canonical = ?, "
                         "subject_short = ?, title = ?, description = ?, "
-                        "assigned_at = ?, due_at = ?, status_raw = ?, "
+                        "assigned_at = ?, due_at = ?, submitted_at = ?, status_raw = ?, "
                         "status = ?, url = ?, bronze_id = ?, last_synced = ? "
                         "WHERE child = ? AND source = ? AND source_id = ?",
                         (
@@ -257,7 +258,7 @@ class SilverWriter:
         with closing(_connect(self.store)) as conn:
             rows = conn.execute(
                 "SELECT source, source_id, subject_raw, title, description, "
-                "assigned_at, due_at, status_raw, status, url "
+                "assigned_at, due_at, submitted_at, status_raw, status, url "
                 "FROM silver_tasks WHERE child = ? "
                 "ORDER BY source, source_id",
                 (child,),
@@ -274,6 +275,9 @@ class SilverWriter:
                     datetime.fromisoformat(r["assigned_at"]) if r["assigned_at"] else None
                 ),
                 due_at=(datetime.fromisoformat(r["due_at"]) if r["due_at"] else None),
+                submitted_at=(
+                    datetime.fromisoformat(r["submitted_at"]) if r["submitted_at"] else None
+                ),
                 status_raw=r["status_raw"],
                 status=r["status"],
                 url=r["url"],
