@@ -575,10 +575,11 @@ class TestFilterSupersededEdits:
         edits = [UserEdit("compass:T1", "done", False, "now")]
         assert filter_superseded_edits(edits, [t]) == edits
 
-    def test_due_edit_dropped_when_silver_has_date(self):
+    def test_due_edit_kept_when_silver_has_date(self):
+        # Kid always wins on due — silver date does not override their choice.
         t = _task(due_at=datetime(2026, 5, 1, tzinfo=UTC))
         edits = [UserEdit("compass:T1", "due", date(2026, 6, 1), "now")]
-        assert filter_superseded_edits(edits, [t]) == []
+        assert filter_superseded_edits(edits, [t]) == edits
 
     def test_due_edit_kept_when_silver_has_no_date(self):
         t = _task(due_at=None)

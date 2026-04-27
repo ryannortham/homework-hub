@@ -413,8 +413,7 @@ def filter_superseded_edits(
     - ``status`` — silver ``Graded`` or ``Overdue`` locks the status column;
       kid cannot override these terminal states.
     - ``done``   — silver ``Graded`` locks ``done=True``; kid cannot un-tick.
-    - ``due``    — silver wins whenever ``task.due_at`` is not ``None``; the
-      kid override is only meaningful as a placeholder for a missing date.
+    - ``due``    — kid always wins; they may set or override any due date.
     - ``priority`` / ``notes`` — kid always wins; no silver equivalent.
     """
     task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
@@ -433,9 +432,6 @@ def filter_superseded_edits(
 
         if edit.column == "done" and task.status is Status.GRADED:
             continue  # Graded locks done=True; kid cannot un-tick.
-
-        if edit.column == "due" and task.due_at is not None:
-            continue  # Silver has a real date; kid placeholder is no longer needed.
 
         out.append(edit)
 
