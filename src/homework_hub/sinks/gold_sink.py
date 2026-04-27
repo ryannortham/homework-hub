@@ -117,6 +117,10 @@ class GspreadGoldSink:
             out.append(DuplicateCheckboxState(link_id=link_id, confirm=confirm, dismiss=dismiss))
         return out
 
+    def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
+        """Return raw data rows (header stripped) from any named tab."""
+        return self._read_tab_rows(spreadsheet_id, tab_name)
+
     # ------------------------------------------------------------------ #
     # GoldSink: writes
     # ------------------------------------------------------------------ #
@@ -338,17 +342,6 @@ def _date_serial(d: date) -> int:
     enabling chronological TABLE sort rather than lexicographic A-Z sort.
     The column format (dd/MM/yyyy) is applied once at bootstrap via
     ``repeatCell`` and survives ``deleteDimension`` automatically.
-    """
-    return (d - _SHEETS_EPOCH).days
-
-
-def _date_serial(d: date) -> int:
-    """Convert a Python date to a Sheets date serial number.
-
-    Sheets stores dates as integer days since 30 Dec 1899.  Writing a
-    ``numberValue`` with this integer (rather than a string like
-    ``"2026-05-01"``) ensures the cell is treated as a native date —
-    enabling chronological TABLE sort rather than lexicographic A-Z sort.
     """
     return (d - _SHEETS_EPOCH).days
 

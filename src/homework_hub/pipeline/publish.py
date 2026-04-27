@@ -27,7 +27,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
@@ -298,6 +298,150 @@ def diff_user_edits(
     return out
 
 
+# Sheets date-serial epoch: days since 30 Dec 1899.
+_SHEETS_EPOCH = date(1899, 12, 30)
+
+
+def _parse_tasks_tab_date(raw: str) -> date | None:
+    """Parse a date cell from the Tasks tab as returned by ``get_all_values()``.
+
+    Sheets returns the cell's *display* string, so we expect ``dd/MM/yyyy``
+    (the format applied at bootstrap).  As a fallback we also handle the raw
+    integer serial string that Sheets occasionally returns when the cell was
+    written as a number rather than a formatted date.  Any other value (empty,
+    unparseable) returns ``None`` so the caller can treat it as "no override".
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        pass
+    if raw.isdigit():
+        return _SHEETS_EPOCH + timedelta(days=int(raw))
+    return None
+
+
+def capture_tasks_tab_edits(
+    raw_rows: list[list[str]],
+    projected: list[TaskRow],
+) -> list[UserEdit]:
+    """Detect kid overrides by comparing the live Tasks tab against projected defaults.
+
+    Called with the raw string rows from ``get_all_values()[1:]`` (header
+    stripped) before the tab is overwritten.  Joins each raw row to its
+    projected counterpart by ``task_uid`` (last column), then for every
+    editable column emits a :class:`UserEdit` when the cell value differs
+    from the system default.
+
+    Coercion per column kind:
+    - ``CHECKBOX``  — ``"TRUE"`` → ``True``, ``"FALSE"`` → ``False``.
+    - ``DATE``      — parsed via :func:`_parse_tasks_tab_date`; failures skipped.
+    - ``DROPDOWN`` / ``TEXT`` — raw string; empty string skipped (= no override).
+    """
+    from homework_hub.schema import ColumnKind
+
+    editable_cols = TASKS_TAB.editable_columns()
+    uid_idx = TASKS_TAB.column_index("task_uid")
+    projected_by_uid = {r.task_uid: r for r in projected}
+    now = datetime.now(UTC).isoformat()
+
+    out: list[UserEdit] = []
+    for raw_row in raw_rows:
+        if len(raw_row) <= uid_idx:
+            continue
+        uid = raw_row[uid_idx]
+        proj_row = projected_by_uid.get(uid)
+        if proj_row is None:
+            continue
+
+        for col in editable_cols:
+            col_idx = TASKS_TAB.column_index(col.key)
+            if col_idx >= len(raw_row):
+                continue
+            raw_val = raw_row[col_idx]
+
+            # Coerce raw string to the appropriate Python type.
+            if col.kind is ColumnKind.CHECKBOX:
+                if raw_val not in ("TRUE", "FALSE"):
+                    continue
+                value: object = raw_val == "TRUE"
+            elif col.kind is ColumnKind.DATE:
+                value = _parse_tasks_tab_date(raw_val)
+                if value is None:
+                    continue
+            else:
+                # DROPDOWN / TEXT — empty string means no override.
+                if not raw_val:
+                    continue
+                value = raw_val
+
+            default = proj_row.cells[col_idx]
+            if value == default:
+                continue
+
+            out.append(UserEdit(task_uid=uid, column=col.key, value=value, updated_at=now))
+
+    return out
+
+
+def _merge_edit_sources(
+    live: list[UserEdit],
+    persisted: list[UserEdit],
+) -> list[UserEdit]:
+    """Combine live (Tasks tab) and persisted (UserEdits tab) edit lists.
+
+    Live edits represent the kid's current state in the sheet and always
+    take precedence over what was persisted from a previous sync.
+    """
+    merged: dict[tuple[str, str], UserEdit] = {
+        (e.task_uid, e.column): e for e in persisted
+    }
+    for e in live:
+        merged[(e.task_uid, e.column)] = e
+    return list(merged.values())
+
+
+def filter_superseded_edits(
+    edits: list[UserEdit],
+    tasks: list[Task],
+) -> list[UserEdit]:
+    """Drop kid overrides that silver's current state has superseded.
+
+    Precedence rules:
+    - ``status`` — silver ``Graded`` or ``Overdue`` locks the status column;
+      kid cannot override these terminal states.
+    - ``done``   — silver ``Graded`` locks ``done=True``; kid cannot un-tick.
+    - ``due``    — silver wins whenever ``task.due_at`` is not ``None``; the
+      kid override is only meaningful as a placeholder for a missing date.
+    - ``priority`` / ``notes`` — kid always wins; no silver equivalent.
+    """
+    task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
+    _terminal_status = {Status.GRADED, Status.OVERDUE}
+
+    out: list[UserEdit] = []
+    for edit in edits:
+        task = task_by_uid.get(edit.task_uid)
+        if task is None:
+            # Task no longer in silver — orphan, will be pruned by diff_user_edits.
+            out.append(edit)
+            continue
+
+        if edit.column == "status" and task.status in _terminal_status:
+            continue  # Graded / Overdue lock the status column.
+
+        if edit.column == "done" and task.status is Status.GRADED:
+            continue  # Graded locks done=True; kid cannot un-tick.
+
+        if edit.column == "due" and task.due_at is not None:
+            continue  # Silver has a real date; kid placeholder is no longer needed.
+
+        out.append(edit)
+
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Possible-Duplicates checkbox readback
 # --------------------------------------------------------------------------- #
@@ -411,6 +555,8 @@ class GoldSink(Protocol):
 
     def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[DuplicateCheckboxState]: ...
 
+    def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]: ...
+
     def write_tab(
         self,
         spreadsheet_id: str,
@@ -452,9 +598,14 @@ def publish_for_child(
     # 2. Read silver-derived link projections for the kid.
     link_inputs = load_links_for_publish(store, child)
 
-    # 3. Project rows.
+    # 3. Project rows and capture kid overrides from the live Tasks tab
+    #    *before* it is overwritten.
     task_rows = project_tasks_rows(tasks)
-    user_edits = sink.read_user_edits(spreadsheet_id)
+    persisted_edits = sink.read_user_edits(spreadsheet_id)
+    raw_tasks_rows = sink.read_tab_raw(spreadsheet_id, TASKS_TAB.name)
+    live_edits = capture_tasks_tab_edits(raw_tasks_rows, task_rows)
+    user_edits = _merge_edit_sources(live_edits, persisted_edits)
+    user_edits = filter_superseded_edits(user_edits, tasks)
     merged_rows = merge_user_edits(task_rows, user_edits)
     duplicate_rows = project_duplicates_rows(link_inputs)
     settings_rows = project_settings_rows(child=child, last_synced=last_synced)
@@ -521,7 +672,9 @@ __all__ = [
     "TaskRow",
     "UserEdit",
     "apply_link_state_writebacks",
+    "capture_tasks_tab_edits",
     "diff_user_edits",
+    "filter_superseded_edits",
     "load_links_for_publish",
     "melbourne_local_date",
     "merge_user_edits",

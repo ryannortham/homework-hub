@@ -152,11 +152,11 @@ CONFIRM_DISMISS_VALUES: tuple[str, ...] = ("", "Confirm", "Dismiss")  # unused; 
 TASKS_TAB = TabSpec(
     name="Tasks",
     table_id="tbl_tasks",
-    description="All current homework. Kids can edit Priority and Notes.",
+    description="All current homework. Kids can edit Due, Status, Priority, Done and Notes.",
     columns=(
         ColumnSpec(key="subject", header="Subject", kind=ColumnKind.TEXT, width_px=120),
         ColumnSpec(key="title", header="Title", kind=ColumnKind.TEXT, width_px=320),
-        ColumnSpec(key="due", header="Due", kind=ColumnKind.DATE, width_px=110),
+        ColumnSpec(key="due", header="Due", kind=ColumnKind.DATE, editable=True, width_px=110),
         ColumnSpec(
             key="days",
             header="Days",
@@ -169,6 +169,7 @@ TASKS_TAB = TabSpec(
             header="Status",
             kind=ColumnKind.DROPDOWN,
             dropdown_values=STATUS_VALUES,
+            editable=True,
             width_px=120,
         ),
         ColumnSpec(

@@ -59,7 +59,7 @@ class TestTabSpec:
 
     def test_editable_columns(self):
         keys = {c.key for c in TASKS_TAB.editable_columns()}
-        assert keys == {"priority", "done", "notes"}
+        assert keys == {"due", "status", "priority", "done", "notes"}
 
 
 class TestTasksTab:
@@ -100,10 +100,10 @@ class TestTasksTab:
         assert col.kind is ColumnKind.DROPDOWN
         assert col.dropdown_values == SOURCE_VALUES
 
-    def test_status_dropdown_read_only(self):
+    def test_status_dropdown_editable(self):
         col = TASKS_TAB.columns[TASKS_TAB.column_index("status")]
         assert col.kind is ColumnKind.DROPDOWN
-        assert col.editable is False
+        assert col.editable is True
         assert col.dropdown_values == STATUS_VALUES
 
     def test_task_uid_present_for_useredits_merge(self):

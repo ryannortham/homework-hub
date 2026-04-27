@@ -70,6 +70,9 @@ class _RecordingSink:
     def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[Any]:
         return []
 
+    def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
+        return []
+
     def write_tab(self, spreadsheet_id: str, tab: Any, rows: list[Any]) -> None:
         self.writes.append((spreadsheet_id, tab.name, len(rows)))
 

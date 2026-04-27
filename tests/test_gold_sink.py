@@ -234,6 +234,35 @@ def test_read_duplicate_checkboxes_empty_when_tab_missing():
     assert sink.read_duplicate_checkboxes("sheet-id") == []
 
 
+def test_read_tab_raw_returns_data_rows_only():
+    """read_tab_raw strips the header row and returns raw string rows."""
+    ws = FakeWorksheet(
+        "Tasks",
+        rows=[
+            ["Subject", "Title", "Due"],   # header — must be stripped
+            ["9MATH", "Algebra", "01/05/2026"],
+            ["9ENG", "Essay", ""],
+        ],
+    )
+    sink, _ = _make_sink({"Tasks": ws})
+    result = sink.read_tab_raw("sheet-id", "Tasks")
+    assert result == [
+        ["9MATH", "Algebra", "01/05/2026"],
+        ["9ENG", "Essay", ""],
+    ]
+
+
+def test_read_tab_raw_returns_empty_when_tab_missing():
+    sink, _ = _make_sink({})
+    assert sink.read_tab_raw("sheet-id", "Tasks") == []
+
+
+def test_read_tab_raw_returns_empty_when_only_header():
+    ws = FakeWorksheet("Tasks", rows=[["Subject", "Title"]])
+    sink, _ = _make_sink({"Tasks": ws})
+    assert sink.read_tab_raw("sheet-id", "Tasks") == []
+
+
 def test_read_duplicate_checkboxes_parses_columns_correctly():
     # 9 columns: link_id, ..., confirm at idx 7, dismiss at idx 8
     header = ["link_id", "a", "b", "c", "d", "e", "f", "Confirm", "Dismiss"]
