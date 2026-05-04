@@ -228,6 +228,25 @@ class GspreadGoldSink:
                 }
             })
 
+        # 1b. If we have more data rows than the grid can hold after the delete,
+        #     append the extra rows. After deleteDimension, the grid has 1 row
+        #     (the header). ws.row_count is the total grid capacity, but after
+        #     deletion we only have max(1, ws.row_count - (populated_rows - 1))
+        #     rows. Simpler: always append enough rows to fit all new data.
+        #     appendDimension is safe to call even when rows already exist —
+        #     it adds rows at the end of the grid.
+        if encoded:
+            rows_needed = len(encoded)  # data rows after header
+            # After deletion we have at most ws.row_count - (populated_rows - 1) rows.
+            # To be safe, just always insert the required number of rows.
+            requests.append({
+                "appendDimension": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "length": rows_needed,
+                }
+            })
+
         # 2. Resize the Table *before* writing data so that structured column
         #    references in formula cells (e.g. ``=[@Due]-TODAY()``) resolve
         #    correctly — they only work when the cell is inside a named Table
