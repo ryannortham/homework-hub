@@ -27,6 +27,7 @@ from homework_hub.models import Task
 from homework_hub.pipeline.subjects import SubjectResolver
 from homework_hub.sources.classroom import map_classroom_card_to_task
 from homework_hub.sources.compass import map_learning_task_to_task
+from homework_hub.sources.eduperfect import map_ep_task_to_task
 from homework_hub.sources.edrolo import map_edrolo_task_to_task
 from homework_hub.state.store import StateStore
 
@@ -62,6 +63,15 @@ def bronze_to_silver_classroom(*, child: str, payload: dict[str, Any]) -> Task:
         view=payload["view"],
         card=payload["card"],
         base_url=payload["base_url"],
+    )
+
+
+def bronze_to_silver_eduperfect(*, child: str, payload: dict[str, Any]) -> Task:
+    """Convert an Education Perfect bronze payload to a canonical ``Task``."""
+    return map_ep_task_to_task(
+        child=child,
+        assigned_work=payload["assigned_work"],
+        class_names=payload.get("class_names") or {},
     )
 
 

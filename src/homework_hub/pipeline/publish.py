@@ -48,6 +48,7 @@ MELBOURNE = ZoneInfo("Australia/Melbourne")
 _SOURCE_DISPLAY: dict[str, str] = {
     SourceEnum.COMPASS.value: "Compass",
     SourceEnum.CLASSROOM.value: "Classroom",
+    SourceEnum.EDUPERFECT.value: "EP",
     SourceEnum.EDROLO.value: "Edrolo",
 }
 

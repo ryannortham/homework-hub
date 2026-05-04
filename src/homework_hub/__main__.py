@@ -199,6 +199,38 @@ def auth_compass(subdomain: str, cookie: str | None, token_path: Path | None) ->
     click.echo(f"Compass parent token saved → {out_path}")
 
 
+@auth.command("eduperfect")
+@click.option("--child", required=True)
+@click.option(
+    "--token-path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Override token output path. Defaults to <tokens_dir>/<child>-eduperfect.json.",
+)
+@click.option(
+    "--base-url",
+    default="https://app.educationperfect.com",
+    help="Override EP base URL (rarely needed).",
+)
+def auth_eduperfect(child: str, token_path: Path | None, base_url: str) -> None:
+    """Run a headed Playwright login for Education Perfect and capture the Bearer token.
+
+    Opens a real Chromium window so Google SSO works without bot detection.
+    Intercepts the first GraphQL request to extract the Bearer JWT and saves
+    it alongside the Playwright storage_state to the token file. Re-run when
+    Discord alerts on session expiry.
+    """
+    from homework_hub.sources.eduperfect import run_headed_login
+
+    settings = Settings()
+    out_path = token_path or settings.child_token_path(child, "eduperfect")
+
+    click.echo(f"Opening headed Chromium for {child} (Education Perfect)…")
+    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
+    run_headed_login(out_path, base_url=base_url)
+    click.echo(f"Education Perfect token saved → {out_path}")
+
+
 @auth.command("edrolo")
 @click.option("--child", required=True)
 @click.option(
@@ -492,7 +524,7 @@ def status() -> None:
     for child_name, child_cfg in cfg.children.items():
         click.echo(f"{child_name} ({child_cfg.display_name})")
         click.echo(f"  sheet_id: {child_cfg.sheet_id or '— not bootstrapped —'}")
-        for src in ("classroom", "compass", "edrolo"):
+        for src in ("classroom", "compass", "eduperfect", "edrolo"):
             rec = records.get((child_name, src))
             if rec is None:
                 click.echo(f"  {src:9s}  — never synced —")

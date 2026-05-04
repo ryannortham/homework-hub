@@ -14,6 +14,7 @@ class Source(StrEnum):
 
     CLASSROOM = "classroom"
     COMPASS = "compass"
+    EDUPERFECT = "eduperfect"
     EDROLO = "edrolo"
 
 

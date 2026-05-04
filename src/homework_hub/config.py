@@ -22,7 +22,8 @@ class SimpleSourceConfig(BaseModel):
 class ChildSources(BaseModel):
     classroom: SimpleSourceConfig = SimpleSourceConfig()
     compass: CompassConfig = CompassConfig()
-    edrolo: SimpleSourceConfig = SimpleSourceConfig()
+    eduperfect: SimpleSourceConfig = SimpleSourceConfig(enabled=False)
+    edrolo: SimpleSourceConfig = SimpleSourceConfig(enabled=False)
 
 
 class ChildConfig(BaseModel):

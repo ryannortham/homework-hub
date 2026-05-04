@@ -1,0 +1,14 @@
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "title": "Chapter 5 Reading Quiz",
+  "status": "UPCOMING",
+  "assignedWorkSettings": {
+    "startDate": "2026-04-28T09:00:00.000Z",
+    "endDate": "2026-05-05T23:59:00.000Z"
+  },
+  "assignedActivityType": "QUIZ",
+  "assignedVia": {
+    "classIds": ["cc112233-4455-6677-8899-aabbccddeeff"],
+    "directlyAssigned": false
+  }
+}

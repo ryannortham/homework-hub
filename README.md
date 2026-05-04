@@ -4,7 +4,7 @@ Aggregates homework tasks from Google Classroom, Compass and Edrolo for each
 child and writes a tidy per-child Google Sheet so they have one place to plan
 their study and parents have visibility.
 
-- One Google Sheet per child (Today / Tasks / By Subject / Settings tabs)
+- One Google Sheet per child (Today / Tasks / Possible Duplicates / Settings tabs)
 - Hourly sync, hosted on the homelab as a Portainer stack
 - Discord notifications on new homework and on auth expiry
 - Secrets fetched at runtime from Vaultwarden via the `bw` CLI
@@ -105,12 +105,19 @@ src/homework_hub/
 ├── __main__.py           # CLI entrypoint
 ├── config.py             # children.yaml + env settings
 ├── secrets.py            # Vaultwarden CLI wrapper
-├── models.py             # canonical Task schema
-├── orchestrator.py       # per-child collect → merge → write → notify
-├── sources/              # classroom, compass, edrolo
-├── sinks/                # sheets, discord
-├── state/                # token store, seen-task SQLite
-└── sheet_template.py     # bootstraps tabs/formulas/conditional formatting
+├── models.py             # canonical Task + Status schema
+├── schema.py             # Gold tab/column specs (single source of truth)
+├── medallion_orchestrator.py  # per-child ingest → transform → publish pipeline
+├── sources/              # classroom.py, compass.py, edrolo.py
+├── pipeline/
+│   ├── publish.py        # silver → gold projection + UserEdits merge
+│   └── transform.py      # bronze → silver upsert (SilverWriter)
+├── sinks/
+│   ├── gold_sink.py      # GspreadGoldSink — live Sheets reads/writes
+│   └── sheets_client.py  # bootstrap-sheet creation + SA auth
+├── state/
+│   └── store.py          # SQLite schema init + StateStore
+└── sheet_template.py     # bootstrap batchUpdate requests (tabs, tables, formatting)
 ```
 
 ## Licence

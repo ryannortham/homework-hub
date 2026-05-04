@@ -127,7 +127,7 @@ class TabSpec:
 # Fixed dropdown vocabularies
 # --------------------------------------------------------------------------- #
 
-SOURCE_VALUES: tuple[str, ...] = ("Compass", "Classroom", "Edrolo")
+SOURCE_VALUES: tuple[str, ...] = ("Compass", "Classroom", "EP", "Edrolo")
 
 # Status mirrors homework_hub.models.Status display labels. Read-only on
 # the Tasks tab — the dropdown is informational + visual only.

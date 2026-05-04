@@ -42,6 +42,7 @@ from homework_hub.pipeline.transform import (
     TransformResult,
     bronze_to_silver_classroom,
     bronze_to_silver_compass,
+    bronze_to_silver_eduperfect,
     bronze_to_silver_edrolo,
 )
 from homework_hub.sources.base import (
@@ -58,6 +59,7 @@ log = logging.getLogger(__name__)
 _BRONZE_TO_SILVER = {
     SourceEnum.COMPASS.value: bronze_to_silver_compass,
     SourceEnum.CLASSROOM.value: bronze_to_silver_classroom,
+    SourceEnum.EDUPERFECT.value: bronze_to_silver_eduperfect,
     SourceEnum.EDROLO.value: bronze_to_silver_edrolo,
 }
 

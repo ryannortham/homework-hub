@@ -88,6 +88,7 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
     out: dict[str, list[Source]] = {}
     compass_user_ids: dict[str, int] = {}
     edrolo_paths: dict[str, Path] = {}
+    eduperfect_paths: dict[str, Path] = {}
     classroom_paths: dict[str, Path] = {}
 
     # First pass: collect per-child config knobs that the shared sources need.
@@ -96,6 +97,8 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
             compass_user_ids[child] = child_cfg.compass_user_id
         if child_cfg.sources.edrolo.enabled:
             edrolo_paths[child] = settings.child_token_path(child, "edrolo")
+        if child_cfg.sources.eduperfect.enabled:
+            eduperfect_paths[child] = settings.child_token_path(child, "eduperfect")
         if child_cfg.sources.classroom.enabled:
             classroom_paths[child] = settings.child_token_path(child, "classroom")
 
@@ -114,6 +117,13 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
 
         edrolo_source = EdroloSource(edrolo_paths)
 
+    # Build the shared Education Perfect source once (per-child token file on disk).
+    eduperfect_source = None
+    if eduperfect_paths:
+        from homework_hub.sources.eduperfect import EduPerfectSource
+
+        eduperfect_source = EduPerfectSource(eduperfect_paths)
+
     # Build the shared Classroom source once (per-child storage_state on disk).
     classroom_source = None
     if classroom_paths:
@@ -122,7 +132,7 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
         classroom_source = ClassroomSource(classroom_paths)
 
     # Second pass: assemble the per-child source list in stable order
-    # (classroom, compass, edrolo) so the report ordering is predictable.
+    # (classroom, compass, eduperfect, edrolo) so the report ordering is predictable.
     for child, child_cfg in cfg.children.items():
         sources: list[Source] = []
         if child_cfg.sources.classroom.enabled and classroom_source is not None:
@@ -133,6 +143,8 @@ def _build_sources(settings: Settings, cfg: ChildrenConfig) -> dict[str, list[So
             and compass_source is not None
         ):
             sources.append(compass_source)
+        if child_cfg.sources.eduperfect.enabled and eduperfect_source is not None:
+            sources.append(eduperfect_source)
         if child_cfg.sources.edrolo.enabled and edrolo_source is not None:
             sources.append(edrolo_source)
         out[child] = sources
