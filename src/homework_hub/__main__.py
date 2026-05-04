@@ -264,7 +264,7 @@ def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
 
 
 @cli.command("refresh-ep")
-@click.option("--child", required=True, help="Child name (e.g. james).")
+@click.option("--child", default="james", show_default=True, help="Child name.")
 @click.option(
     "--token-path",
     type=click.Path(dir_okay=False, path_type=Path),
@@ -273,86 +273,140 @@ def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
 )
 @click.option(
     "--host",
-    default=None,
-    envvar="EP_REFRESH_HOST",
-    help="SSH destination to copy token to, e.g. root@192.168.1.100. "
-    "Also read from env var EP_REFRESH_HOST.",
+    default="root@192.168.1.100",
+    show_default=True,
+    help="SSH destination to copy token to.",
 )
 @click.option(
     "--dest",
-    default=None,
-    envvar="EP_REFRESH_TOKEN_DEST",
-    help="Remote directory for the token file, e.g. /mnt/tank/Apps/HomeworkHub/Config/tokens/. "
-    "Also read from env var EP_REFRESH_TOKEN_DEST.",
+    default="/mnt/tank/Apps/HomeworkHub/Config/tokens/",
+    show_default=True,
+    help="Remote directory for the token file.",
 )
 @click.option(
     "--trigger-sync/--no-trigger-sync",
     default=True,
     help="SSH into host and trigger a sync after copying (default: yes).",
 )
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Skip the confirm prompt before killing an existing Zen instance.",
+)
 def refresh_ep(
     child: str,
     token_path: Path | None,
-    host: str | None,
-    dest: str | None,
+    host: str,
+    dest: str,
     trigger_sync: bool,
+    force: bool,
 ) -> None:
-    """Capture a fresh EP token from Zen Browser, copy to TrueNAS, and sync.
+    """Capture a fresh EP token, copy to TrueNAS, and trigger a sync.
 
-    Requires Zen Browser to be running with Marionette enabled.  Run once first:
+    One-command refresh. If Zen Browser is not running with Marionette, this
+    command launches it (prompting first if a non-Marionette Zen is already
+    running — pass --force to skip the prompt).
 
-        bash ~/Code/homework-hub/scripts/start_zen_marionette.sh
-
-    Then run this command to refresh the token end-to-end in one step:
-
-        uv run homework-hub refresh-ep --child james
-
-    Set EP_REFRESH_HOST and EP_REFRESH_TOKEN_DEST in your shell profile to avoid
-    passing --host and --dest every time.
+    Prerequisite: James must have logged into app.educationperfect.com in Zen
+    at least once on this Mac. The FusionAuth SSO cookie persists across
+    reboots, so subsequent refreshes are silent.
     """
     import subprocess
 
     from homework_hub.sources.eduperfect import run_headed_login
+    from homework_hub.zen import (
+        DEFAULT_PORT,
+        find_zen_processes,
+        kill_zen_processes,
+        launch_zen_with_marionette,
+        marionette_reachable,
+        wait_for_marionette,
+    )
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "eduperfect")
 
-    # 1. Capture token from Zen Marionette.
-    click.echo(f"Capturing EP token for {child} from Zen Browser Marionette…")
+    # 1. Ensure Marionette is reachable, launching Zen if needed.
+    if not marionette_reachable(DEFAULT_PORT):
+        existing = find_zen_processes()
+        if existing:
+            click.echo(
+                f"Zen is running (PIDs: {existing}) but Marionette is not "
+                f"reachable on port {DEFAULT_PORT}.\n"
+                "Marionette must be enabled at launch — it cannot be hot-attached."
+            )
+            if not force and not click.confirm(
+                "Kill the running Zen instance and relaunch with Marionette?",
+                default=False,
+            ):
+                raise click.ClickException("Aborted. Quit Zen yourself and re-run, or use --force.")
+            click.echo("Stopping existing Zen…")
+            kill_zen_processes(existing)
+
+        click.echo("Launching Zen with Marionette…")
+        try:
+            launch_zen_with_marionette()
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        click.echo("Waiting for Marionette to come up…")
+        if not wait_for_marionette(DEFAULT_PORT, timeout=20.0):
+            raise click.ClickException(
+                f"Marionette did not become available on port {DEFAULT_PORT} "
+                "within 20 seconds. Check /tmp/zen-marionette.log for details."
+            )
+        # Brief pause for the EP dashboard to start loading before we navigate.
+        import time
+
+        time.sleep(3.0)
+        click.echo("  Marionette ready.")
+
+    # 2. Capture token from Zen Marionette.
+    click.echo(f"Capturing EP token for {child}…")
     try:
         run_headed_login(out_path)
     except RuntimeError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"  Token saved → {out_path}")
-
-    # 2. Copy to remote host if configured.
-    if host and dest:
-        remote = f"{host}:{dest}{out_path.name}"
-        click.echo(f"Copying token to {remote}…")
-        result = subprocess.run(["scp", str(out_path), remote], capture_output=True, text=True)
-        if result.returncode != 0:
+        msg = str(exc)
+        if "no access_token cookie was captured" in msg:
             raise click.ClickException(
-                f"scp failed (exit {result.returncode}): {result.stderr.strip()}"
-            )
-        click.echo("  Token copied.")
-    elif host or dest:
-        click.echo(
-            "Warning: both --host and --dest must be set to copy remotely. "
-            "Token saved locally only.",
-            err=True,
-        )
-    else:
-        click.echo(
-            "  No remote host configured — token saved locally only.\n"
-            "  Set EP_REFRESH_HOST and EP_REFRESH_TOKEN_DEST to enable remote copy.",
-        )
+                "EP token capture failed — James may be logged out of "
+                "Education Perfect.\n"
+                "  1. Switch to the Zen window already open on your desktop.\n"
+                "  2. Navigate to https://app.educationperfect.com and log in.\n"
+                "  3. Re-run: uv run homework-hub refresh-ep"
+            ) from exc
+        raise click.ClickException(msg) from exc
 
-    # 3. Trigger sync on remote host.
-    if trigger_sync and host:
+    # Show token freshness.
+    try:
+        from homework_hub.sources.eduperfect import EduPerfectTokenFile
+
+        tf = EduPerfectTokenFile.load(out_path)
+        from datetime import UTC, datetime
+
+        remaining = tf.expires_at - datetime.now(UTC)
+        mins = max(0, int(remaining.total_seconds() // 60))
+        click.echo(f"  Token saved → {out_path} (expires in ~{mins}m)")
+    except Exception:
+        click.echo(f"  Token saved → {out_path}")
+
+    # 3. Copy to remote host.
+    remote = f"{host}:{dest}{out_path.name}"
+    click.echo(f"Copying token to {remote}…")
+    result = subprocess.run(["scp", str(out_path), remote], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"scp failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    click.echo("  Token copied.")
+
+    # 4. Trigger sync on remote host with live output.
+    if trigger_sync:
         click.echo(f"Triggering sync for {child} on {host}…")
         result = subprocess.run(
             ["ssh", host, f"docker exec homework-hub homework-hub sync --child {child}"],
-            capture_output=False,
             text=True,
         )
         if result.returncode not in (0, 2):  # 2 = sync ran with non-fatal failures

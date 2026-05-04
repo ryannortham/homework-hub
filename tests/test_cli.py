@@ -578,3 +578,144 @@ def test_links_detect_specific_child(tmp_path: Path):
     res = runner.invoke(cli, ["links", "detect", "--child", "james"], env=env)
     assert res.exit_code == 0, res.output
     assert "james: inserted=1" in res.output
+
+
+# ----- refresh-ep ---------------------------------------------------------
+
+
+def _make_token_file(path: Path) -> None:
+    """Write a minimal valid EduPerfectTokenFile to ``path``."""
+    from datetime import timedelta
+
+    payload = {
+        "access_token": "header.payload.sig",
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=28)).isoformat(),
+        "storage_state": {"cookies": [], "origins": []},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def test_refresh_ep_uses_hardcoded_defaults(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+
+    def fake_run_headed_login(path: Path, **_kw):
+        _make_token_file(path)
+
+    runner = CliRunner()
+    with (
+        patch("homework_hub.zen.marionette_reachable", return_value=True) as mock_reach,
+        patch(
+            "homework_hub.sources.eduperfect.run_headed_login",
+            side_effect=fake_run_headed_login,
+        ) as mock_login,
+        patch("subprocess.run") as mock_run,
+    ):
+        # scp + ssh both succeed
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        result = runner.invoke(cli, ["refresh-ep"], env=env)
+
+    assert result.exit_code == 0, result.output
+    mock_reach.assert_called()
+    mock_login.assert_called_once()
+    # scp call should target the hardcoded host:dest
+    scp_call = mock_run.call_args_list[0]
+    scp_args = scp_call.args[0]
+    assert scp_args[0] == "scp"
+    assert "root@192.168.1.100:/mnt/tank/Apps/HomeworkHub/Config/tokens/" in scp_args[2]
+    # ssh call should reference hardcoded host + child=james
+    ssh_call = mock_run.call_args_list[1]
+    ssh_args = ssh_call.args[0]
+    assert ssh_args[0] == "ssh"
+    assert ssh_args[1] == "root@192.168.1.100"
+    assert "--child james" in ssh_args[2]
+    assert "expires in" in result.output.lower()
+
+
+def test_refresh_ep_aborts_when_zen_running_without_marionette_no_force(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    with (
+        patch("homework_hub.zen.marionette_reachable", return_value=False),
+        patch("homework_hub.zen.find_zen_processes", return_value=[12345]),
+        patch("homework_hub.zen.kill_zen_processes") as mock_kill,
+        patch("homework_hub.zen.launch_zen_with_marionette") as mock_launch,
+        patch("homework_hub.sources.eduperfect.run_headed_login"),
+    ):
+        # User answers "n" at the prompt.
+        result = runner.invoke(cli, ["refresh-ep"], input="n\n", env=env)
+
+    assert result.exit_code != 0
+    assert "aborted" in result.output.lower()
+    mock_kill.assert_not_called()
+    mock_launch.assert_not_called()
+
+
+def test_refresh_ep_force_kills_zen_without_prompt(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+
+    def fake_run_headed_login(path: Path, **_kw):
+        _make_token_file(path)
+
+    # marionette_reachable: False initially, then True after launch
+    reach_calls = iter([False, True, True, True])
+    runner = CliRunner()
+    with (
+        patch(
+            "homework_hub.zen.marionette_reachable",
+            side_effect=lambda *a, **kw: next(reach_calls),
+        ),
+        patch("homework_hub.zen.find_zen_processes", return_value=[12345]),
+        patch("homework_hub.zen.kill_zen_processes") as mock_kill,
+        patch("homework_hub.zen.launch_zen_with_marionette") as mock_launch,
+        patch("homework_hub.zen.wait_for_marionette", return_value=True),
+        patch("time.sleep"),
+        patch(
+            "homework_hub.sources.eduperfect.run_headed_login",
+            side_effect=fake_run_headed_login,
+        ),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        result = runner.invoke(cli, ["refresh-ep", "--force"], env=env)
+
+    assert result.exit_code == 0, result.output
+    mock_kill.assert_called_once_with([12345])
+    mock_launch.assert_called_once()
+
+
+def test_refresh_ep_logged_out_message(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    with (
+        patch("homework_hub.zen.marionette_reachable", return_value=True),
+        patch(
+            "homework_hub.sources.eduperfect.run_headed_login",
+            side_effect=RuntimeError(
+                "EP dashboard loaded but no access_token cookie was captured.\n"
+                "Ensure James is logged in."
+            ),
+        ),
+    ):
+        result = runner.invoke(cli, ["refresh-ep"], env=env)
+
+    assert result.exit_code != 0
+    assert "logged out" in result.output.lower()
+    assert "app.educationperfect.com" in result.output
+
+
+def test_refresh_ep_marionette_launch_timeout(tmp_path: Path):
+    env = _write_min_config(tmp_path)
+    runner = CliRunner()
+    with (
+        patch("homework_hub.zen.marionette_reachable", return_value=False),
+        patch("homework_hub.zen.find_zen_processes", return_value=[]),
+        patch("homework_hub.zen.launch_zen_with_marionette"),
+        patch("homework_hub.zen.wait_for_marionette", return_value=False),
+    ):
+        result = runner.invoke(cli, ["refresh-ep"], env=env)
+
+    assert result.exit_code != 0
+    assert "did not become available" in result.output.lower()
