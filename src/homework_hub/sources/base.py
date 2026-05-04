@@ -35,6 +35,12 @@ class Source(ABC):
 
     name: str = ""
 
+    # Set to True on sources whose auth tokens are structurally short-lived
+    # (e.g. EP ~30 min JWTs). When True, the orchestrator silently skips
+    # subsequent syncs after the first auth_expired failure until a successful
+    # ingest resets the clock — avoiding hourly noise for an expected condition.
+    silence_repeated_auth_expired: bool = False
+
     @abstractmethod
     def fetch(self, child: str) -> list[Task]:
         """Return the current set of homework tasks for a single child."""

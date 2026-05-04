@@ -74,6 +74,8 @@ class IngestStageResult:
     child: str
     source: str
     ok: bool
+    skipped: bool = False
+    skip_reason: str | None = None
     bronze_inserted: int = 0
     bronze_skipped: int = 0
     failure_kind: str | None = None
@@ -238,6 +240,29 @@ class MedallionOrchestrator:
 
     def _ingest_one(self, child: str, source: Source) -> IngestStageResult:
         started = datetime.now(UTC)
+
+        # Sources with structurally short-lived tokens (e.g. EP ~30 min JWTs)
+        # opt in to silence_repeated_auth_expired. After the first auth_expired
+        # failure, skip silently until a successful ingest resets the clock.
+        # This prevents hourly [FAIL] noise for an expected condition while still
+        # preserving last known silver data in the sheet.
+        if source.silence_repeated_auth_expired:
+            auth = self.state.get_auth(child, source.name)
+            if auth is not None and auth.last_failure_kind == "auth_expired":
+                last_fail = auth.last_failure_at
+                last_ok = auth.last_success_at
+                if last_fail is not None and (last_ok is None or last_fail > last_ok):
+                    return IngestStageResult(
+                        child=child,
+                        source=source.name,
+                        ok=True,
+                        skipped=True,
+                        skip_reason=(
+                            f"token expired — run "
+                            f"`homework-hub refresh-ep --child {child}` to refresh"
+                        ),
+                    )
+
         try:
             records = source.fetch_raw(child)
         except AuthExpiredError as exc:
@@ -573,7 +598,11 @@ def summarise_medallion(report: MedallionSyncReport) -> str:
     for c in report.children:
         lines.append(f"  {c.child}:")
         for r in c.ingest:
-            if r.ok:
+            if r.skipped:
+                lines.append(
+                    f"    [skip] ingest {r.source}: {r.skip_reason}"
+                )
+            elif r.ok:
                 lines.append(
                     f"    [OK]   ingest {r.source}: "
                     f"+{r.bronze_inserted} bronze ({r.bronze_skipped} skipped)"

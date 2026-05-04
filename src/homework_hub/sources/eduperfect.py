@@ -570,6 +570,11 @@ class EduPerfectSource(Source):
 
     name = "eduperfect"
 
+    # EP access_token JWTs expire every ~30 minutes. After the first auth_expired
+    # failure, subsequent syncs are silently skipped (last known tasks retained
+    # in the sheet) rather than spamming failures every hour.
+    silence_repeated_auth_expired = True
+
     def __init__(
         self,
         token_path_for_child: dict[str, Path],

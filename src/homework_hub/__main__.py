@@ -263,6 +263,102 @@ def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
     click.echo(f"Edrolo storage state saved → {out_path}")
 
 
+@cli.command("refresh-ep")
+@click.option("--child", required=True, help="Child name (e.g. james).")
+@click.option(
+    "--token-path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Override local token output path.",
+)
+@click.option(
+    "--host",
+    default=None,
+    envvar="EP_REFRESH_HOST",
+    help="SSH destination to copy token to, e.g. root@192.168.1.100. "
+    "Also read from env var EP_REFRESH_HOST.",
+)
+@click.option(
+    "--dest",
+    default=None,
+    envvar="EP_REFRESH_TOKEN_DEST",
+    help="Remote directory for the token file, e.g. /mnt/tank/Apps/HomeworkHub/Config/tokens/. "
+    "Also read from env var EP_REFRESH_TOKEN_DEST.",
+)
+@click.option(
+    "--trigger-sync/--no-trigger-sync",
+    default=True,
+    help="SSH into host and trigger a sync after copying (default: yes).",
+)
+def refresh_ep(
+    child: str,
+    token_path: Path | None,
+    host: str | None,
+    dest: str | None,
+    trigger_sync: bool,
+) -> None:
+    """Capture a fresh EP token from Zen Browser, copy to TrueNAS, and sync.
+
+    Requires Zen Browser to be running with Marionette enabled.  Run once first:
+
+        bash ~/Code/homework-hub/scripts/start_zen_marionette.sh
+
+    Then run this command to refresh the token end-to-end in one step:
+
+        uv run homework-hub refresh-ep --child james
+
+    Set EP_REFRESH_HOST and EP_REFRESH_TOKEN_DEST in your shell profile to avoid
+    passing --host and --dest every time.
+    """
+    import subprocess
+
+    from homework_hub.sources.eduperfect import run_headed_login
+
+    settings = Settings()
+    out_path = token_path or settings.child_token_path(child, "eduperfect")
+
+    # 1. Capture token from Zen Marionette.
+    click.echo(f"Capturing EP token for {child} from Zen Browser Marionette…")
+    try:
+        run_headed_login(out_path)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"  Token saved → {out_path}")
+
+    # 2. Copy to remote host if configured.
+    if host and dest:
+        remote = f"{host}:{dest}{out_path.name}"
+        click.echo(f"Copying token to {remote}…")
+        result = subprocess.run(["scp", str(out_path), remote], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise click.ClickException(
+                f"scp failed (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        click.echo("  Token copied.")
+    elif host or dest:
+        click.echo(
+            "Warning: both --host and --dest must be set to copy remotely. "
+            "Token saved locally only.",
+            err=True,
+        )
+    else:
+        click.echo(
+            "  No remote host configured — token saved locally only.\n"
+            "  Set EP_REFRESH_HOST and EP_REFRESH_TOKEN_DEST to enable remote copy.",
+        )
+
+    # 3. Trigger sync on remote host.
+    if trigger_sync and host:
+        click.echo(f"Triggering sync for {child} on {host}…")
+        result = subprocess.run(
+            ["ssh", host, f"docker exec homework-hub homework-hub sync --child {child}"],
+            capture_output=False,
+            text=True,
+        )
+        if result.returncode not in (0, 2):  # 2 = sync ran with non-fatal failures
+            raise click.ClickException(f"Sync command exited with code {result.returncode}")
+
+
 @cli.command("bootstrap-sheet")
 @click.option("--child", required=True)
 @click.option(

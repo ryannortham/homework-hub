@@ -57,6 +57,19 @@ class _AuthExpiredSource(Source):
         raise AuthExpiredError("cookie expired")
 
 
+class _SilentAuthExpiredSource(Source):
+    """Simulates EP: silence_repeated_auth_expired=True, always raises AuthExpiredError."""
+
+    name = "eduperfect"
+    silence_repeated_auth_expired = True
+
+    def fetch(self, child: str) -> list[Task]:  # pragma: no cover
+        return []
+
+    def fetch_raw(self, child: str) -> list[RawRecord]:
+        raise AuthExpiredError("token expired")
+
+
 class _RecordingSink:
     """Minimal GoldSink stub that records calls."""
 
@@ -261,6 +274,100 @@ class TestIngestFailures:
         assert report.any_failures is True
         # But transform still ran successfully against the good source
         assert c.transform is not None and c.transform.ok
+
+    def test_silence_repeated_auth_expired_skips_on_second_run(self, state: StateStore):
+        """After the first auth_expired failure, sources with silence_repeated_auth_expired
+        are silently skipped on subsequent syncs — ok=True, skipped=True, no [FAIL]."""
+        ok_rec = RawRecord(
+            child="james",
+            source="classroom",
+            source_id="abc1",
+            payload=_classroom_payload(),
+        )
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={
+                "james": [
+                    _SilentAuthExpiredSource(),
+                    _FakeSource("classroom", [ok_rec]),
+                ]
+            },
+            state=state,
+            sink=None,
+        )
+
+        # First run — records the failure as normal.
+        report1 = orch.run()
+        ep_r1 = next(r for r in report1.children[0].ingest if r.source == "eduperfect")
+        assert ep_r1.ok is False
+        assert ep_r1.failure_kind == "auth_expired"
+        assert report1.any_failures is True
+
+        # Second run — silently skipped, not a failure.
+        report2 = orch.run()
+        ep_r2 = next(r for r in report2.children[0].ingest if r.source == "eduperfect")
+        assert ep_r2.ok is True
+        assert ep_r2.skipped is True
+        assert ep_r2.skip_reason is not None
+        assert "refresh-ep" in ep_r2.skip_reason
+        # Other sources still run normally.
+        classroom_r = next(r for r in report2.children[0].ingest if r.source == "classroom")
+        assert classroom_r.ok is True
+        # Skipped ingest does NOT count as a failure.
+        assert report2.any_failures is False
+
+    def test_silence_skipped_when_success_resets_clock(self, state: StateStore):
+        """After a successful ingest, the silence window resets and the source
+        is attempted again (falls through to raise AuthExpiredError → [FAIL])."""
+        ok_rec = RawRecord(
+            child="james", source="classroom", source_id="a1", payload=_classroom_payload()
+        )
+
+        # Seed a prior success for eduperfect so last_success_at is populated,
+        # then record a failure *after* it — same condition as a real refresh.
+        state.record_success("james", "eduperfect")
+
+        # Record a failure after the success — the source is now in "broken" state.
+        state.record_failure("james", "eduperfect", kind="auth_expired", message="expired")
+
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={
+                "james": [_SilentAuthExpiredSource(), _FakeSource("classroom", [ok_rec])]
+            },
+            state=state,
+            sink=None,
+        )
+        # Failure is newer than success → skipped.
+        report = orch.run()
+        ep_r = next(r for r in report.children[0].ingest if r.source == "eduperfect")
+        assert ep_r.skipped is True
+
+        # Now record a success (simulates token refresh).
+        state.record_success("james", "eduperfect")
+
+        # Next run: success is now newer than failure → not skipped → raises → [FAIL].
+        report2 = orch.run()
+        ep_r2 = next(r for r in report2.children[0].ingest if r.source == "eduperfect")
+        assert ep_r2.skipped is False
+        assert ep_r2.ok is False
+        assert ep_r2.failure_kind == "auth_expired"
+
+    def test_non_silent_source_auth_expired_still_fails_on_repeat(self, state: StateStore):
+        """Sources without silence_repeated_auth_expired=True always show [FAIL]."""
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={"james": [_AuthExpiredSource()]},
+            state=state,
+            sink=None,
+        )
+        for _ in range(3):
+            report = orch.run()
+            compass_r = next(r for r in report.children[0].ingest if r.source == "compass")
+            assert compass_r.ok is False
+            assert compass_r.skipped is False
+            assert compass_r.failure_kind == "auth_expired"
+            assert report.any_failures is True
 
 
 # --------------------------------------------------------------------------- #
@@ -468,3 +575,42 @@ class TestSummariseMedallion:
         report = orch.run()
         text = summarise_medallion(report)
         assert "[FAIL/auth_expired]" in text
+
+    def test_summary_renders_skip_for_silenced_source(self, state: StateStore):
+        """Silenced sources show [skip] ingest ... in the summary, not [FAIL]."""
+        ok_rec = RawRecord(
+            child="james", source="classroom", source_id="a1", payload=_classroom_payload()
+        )
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={
+                "james": [_SilentAuthExpiredSource(), _FakeSource("classroom", [ok_rec])]
+            },
+            state=state,
+            sink=None,
+        )
+        orch.run()  # first run — records failure
+        report2 = orch.run()  # second run — should be silenced
+        text = summarise_medallion(report2)
+        assert "[skip] ingest eduperfect" in text
+        assert "[FAIL" not in text
+        assert "failures: no" in text
+
+
+# --------------------------------------------------------------------------- #
+# EduPerfectSource silence flag
+# --------------------------------------------------------------------------- #
+
+
+class TestEduPerfectSilenceFlag:
+    def test_eduperfect_source_opts_in_to_silence(self):
+        from homework_hub.sources.eduperfect import EduPerfectSource
+
+        assert EduPerfectSource.silence_repeated_auth_expired is True
+
+    def test_other_sources_do_not_silence(self):
+        from homework_hub.sources.classroom import ClassroomSource
+        from homework_hub.sources.compass import CompassSource
+
+        assert CompassSource.silence_repeated_auth_expired is False
+        assert ClassroomSource.silence_repeated_auth_expired is False
