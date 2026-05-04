@@ -207,27 +207,28 @@ def auth_compass(subdomain: str, cookie: str | None, token_path: Path | None) ->
     default=None,
     help="Override token output path. Defaults to <tokens_dir>/<child>-eduperfect.json.",
 )
-@click.option(
-    "--base-url",
-    default="https://app.educationperfect.com",
-    help="Override EP base URL (rarely needed).",
-)
-def auth_eduperfect(child: str, token_path: Path | None, base_url: str) -> None:
-    """Run a headed Playwright login for Education Perfect and capture the Bearer token.
+def auth_eduperfect(child: str, token_path: Path | None) -> None:
+    """Capture the EP access_token from a running Zen Browser session.
 
-    Opens a real Chromium window so Google SSO works without bot detection.
-    Intercepts the first GraphQL request to extract the Bearer JWT and saves
-    it alongside the Playwright storage_state to the token file. Re-run when
-    Discord alerts on session expiry.
+    Zen Browser must be running with Marionette enabled. Launch it once with::
+
+        /Applications/Zen.app/Contents/MacOS/zen \\
+          --marionette --marionette-port 2828 \\
+          --remote-allow-system-access \\
+          --profile "$HOME/Library/Application Support/zen/Profiles/<profile>"
+
+    Ensure James is logged into app.educationperfect.com in that Zen window,
+    then run this command. The token is captured by observing the HTTP traffic
+    from the existing session.
     """
     from homework_hub.sources.eduperfect import run_headed_login
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "eduperfect")
 
-    click.echo(f"Opening headed Chromium for {child} (Education Perfect)…")
-    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
-    run_headed_login(out_path, base_url=base_url)
+    click.echo(f"Connecting to Zen Browser Marionette for {child} (Education Perfect)…")
+    click.echo("Ensure Zen is running with --marionette and James is logged into EP.")
+    run_headed_login(out_path)
     click.echo(f"Education Perfect token saved → {out_path}")
 
 

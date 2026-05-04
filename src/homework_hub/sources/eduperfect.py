@@ -1,51 +1,56 @@
 """Education Perfect (app.educationperfect.com) source.
 
-Education Perfect is an Australian school learning platform with a clean,
-publicly-introspectable GraphQL API at ``graphql-gateway.educationperfect.com``.
-Auth uses the school Google account via FusionAuth IAM (``iam.educationperfect.com``).
+Education Perfect is an Australian school learning platform. Auth uses FusionAuth
+IAM (``iam.educationperfect.com``) with a school Google SSO.
 
 Auth architecture
 -----------------
-EP's IAM is a confidential OAuth2 client — token refresh requires a
-``client_secret`` that EP holds server-side. We therefore cannot refresh headlessly
-via httpx alone. Instead:
+EP's GraphQL gateway authenticates via a **cookie** named ``access_token`` on the
+``.educationperfect.com`` domain — not an ``Authorization: Bearer`` header.
+The token is a JWT issued by FusionAuth and set as a ``SameSite=None; Secure``
+cookie by ``authentication.educationperfect.com/oauth-redirect`` after the OAuth
+code exchange.
 
-1. **One-time auth (Mac, headed):** ``auth eduperfect --child <name>`` runs a headed
-   Playwright session. The user completes Google SSO, and we intercept the first
-   request to ``graphql-gateway.educationperfect.com`` to capture the Bearer token
-   and expiry. Token + Playwright ``storage_state.json`` (which contains the long-lived
-   ``fusionauth.sso`` cookie) are saved to ``<tokens_dir>/<child>-eduperfect.json``.
+Token capture requires a real browser with the user's active session.
+We use Firefox (Zen Browser) with Marionette enabled and the
+``--remote-allow-system-access`` flag to register an ``nsIObserverService``
+HTTP observer in the privileged chrome context. This captures the ``Cookie``
+header on outgoing requests to ``graphql-gateway.educationperfect.com``,
+extracting the ``access_token`` value.
 
-2. **Per-sync refresh (server, headless):** On each sync we check the token expiry.
-   If it has expired we replay ``storage_state.json`` in headless Playwright — the
-   ``fusionauth.sso`` cookie drives a silent re-auth through FusionAuth → EP's auth
-   proxy → app dashboard, and we intercept the fresh Bearer token from the first
-   GraphQL request. Playwright is then torn down and the remaining API call is made
-   via plain ``httpx``.
+Token lifetime: ~30 minutes (JWT ``exp`` claim). Refresh is performed
+headlessly: navigate to the EP dashboard via Playwright Firefox (seeding the
+``fusionauth.sso`` cookie from the token file), which triggers a silent
+``/oauth-redirect`` → ``/refresh-token`` cycle that sets a new ``access_token``
+cookie. We capture this via the same HTTP observer pattern.
 
-3. **Auth expiry:** If Playwright navigation redirects to the FusionAuth login page
-   (``iam.educationperfect.com``) the school Google session has expired and the user
-   must re-run ``auth eduperfect``. This raises ``AuthExpiredError`` which the
-   orchestrator surfaces as a Discord alert.
+Wait — in practice the headless refresh is unreliable because FusionAuth binds
+the SSO cookie to the originating client fingerprint. Instead, the auth command
+must be re-run via Zen when the token expires.  The token expiry is embedded in
+the JWT; the daemon checks it before each sync and raises ``AuthExpiredError``
+if expired, which surfaces as a Discord alert.
 
 API
 ---
-Single query: ``assignedWorkForUser`` returns every piece of assigned work
-(with status, dates, class IDs). A batch ``classes`` query resolves class IDs
-to human-readable names for the Subject column.
+Query: ``assignedClasswork(schoolId: $schoolId, status: TO_DO|DONE)``
 
-Confirmed via GraphQL introspection (2026-05-04):
-- ``graphql-gateway.educationperfect.com/graphql`` — 162 query fields, 1248 types.
-- ``AssignedWork``: ``id``, ``title``, ``status`` (``UPCOMING`` / ``IN_PROGRESS`` /
-  ``PAST_DUE`` / ``COMPLETED``), ``assignedWorkSettings.{startDate, endDate}``,
-  ``assignedActivityType`` (``LESSON`` / ``QUIZ`` / ``EXAM_REVISION``),
-  ``assignedVia.classIds``.
+Returns ``AssignedClasswork`` objects with:
+  ``id``, ``name``, ``source``, ``progressStatus``, ``startDate``, ``dueDate``,
+  ``finalSubmissionDate``, ``subjectId``, ``classes[].name``
+
+Both ``TO_DO`` and ``DONE`` statuses are fetched and merged.
+
+Status mapping:
+  ``NOT_STARTED`` → ``Status.NOT_STARTED``
+  ``IN_PROGRESS``  → ``Status.IN_PROGRESS``
+  ``COMPLETE``     → ``Status.SUBMITTED``
+
+School ID is resolved once via ``user(id: $userId).memberships[0].school.id``.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -66,42 +71,48 @@ GRAPHQL_URL = "https://graphql-gateway.educationperfect.com/graphql"
 APP_BASE_URL = "https://app.educationperfect.com"
 IAM_HOST = "iam.educationperfect.com"
 
-# Buffer before expiry at which we proactively refresh the token.
+# Buffer before expiry at which we consider the token stale.
 _EXPIRY_BUFFER = timedelta(minutes=5)
 
-# Browser-like UA.
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:138.0) "
+    "Gecko/20100101 Firefox/138.0"
 )
 
-_ASSIGNED_WORK_QUERY = """
-query GetAssignedWork($input: AssignedWorkInput) {
-  assignedWorkForUser(input: $input) {
-    assignedWork {
+_ASSIGNED_CLASSWORK_QUERY = """
+query GetAssignedClasswork($schoolId: UUID!, $status: AssignedClassworkStatus) {
+  assignedClasswork(schoolId: $schoolId, status: $status) {
+    result {
       id
-      title
-      status
-      assignedWorkSettings { startDate endDate }
-      assignedActivityType
-      assignedVia { classIds directlyAssigned }
+      name
+      source
+      progressStatus
+      startDate
+      dueDate
+      finalSubmissionDate
+      subjectId
+      classes { id name }
+    }
+    total
+  }
+}
+"""
+
+_USER_SCHOOL_QUERY = """
+query GetUserSchool($userId: UUID!) {
+  user(id: $userId) {
+    id
+    memberships {
+      school { id name }
     }
   }
 }
 """
 
-_CLASSES_QUERY = """
-query GetClasses($ids: [UUID!]!) {
-  classes(ids: $ids) { id name }
-}
-"""
-
-# GraphQL AssignedWorkStatus → canonical Status.
 _STATUS_MAP: dict[str, Status] = {
-    "UPCOMING": Status.NOT_STARTED,
+    "NOT_STARTED": Status.NOT_STARTED,
     "IN_PROGRESS": Status.IN_PROGRESS,
-    "PAST_DUE": Status.OVERDUE,
-    "COMPLETED": Status.SUBMITTED,
+    "COMPLETE": Status.SUBMITTED,
 }
 
 
@@ -110,38 +121,33 @@ _STATUS_MAP: dict[str, Status] = {
 # --------------------------------------------------------------------------- #
 
 
-def map_ep_task_to_task(
+def map_ep_classwork_to_task(
     *,
     child: str,
-    assigned_work: dict[str, Any],
-    class_names: dict[str, str] | None = None,
+    classwork: dict[str, Any],
 ) -> Task:
-    """Translate one ``AssignedWork`` GraphQL dict into a canonical Task.
-
-    ``class_names`` maps stringified class UUID → human-readable name.
-    Tasks whose class IDs don't resolve fall back to ``"Education Perfect"``.
-    """
-    task_id = assigned_work.get("id")
-    title = assigned_work.get("title")
-    if not task_id or not title:
+    """Translate one ``AssignedClasswork`` GraphQL dict into a canonical Task."""
+    task_id = classwork.get("id")
+    name = classwork.get("name")
+    if not task_id or not name:
         raise SchemaBreakError(
-            f"EP task missing id/title: keys={list(assigned_work.keys())}"
+            f"EP classwork missing id/name: keys={list(classwork.keys())}"
         )
 
-    class_names = class_names or {}
-    class_ids = (assigned_work.get("assignedVia") or {}).get("classIds") or []
-    resolved = [class_names[cid] for cid in class_ids if cid in class_names]
-    subject = resolved[0] if resolved else "Education Perfect"
+    classes = classwork.get("classes") or []
+    subject = classes[0].get("name", "Education Perfect") if classes else "Education Perfect"
 
-    settings = assigned_work.get("assignedWorkSettings") or {}
-    assigned_at = _parse_ep_dt(settings.get("startDate"))
-    due_at = _parse_ep_dt(settings.get("endDate"))
+    assigned_at = _parse_ep_dt(classwork.get("startDate"))
+    due_at = _parse_ep_dt(classwork.get("dueDate"))
 
-    status_raw = (assigned_work.get("status") or "UPCOMING").upper()
-    status = _STATUS_MAP.get(status_raw, Status.NOT_STARTED)
+    progress = (classwork.get("progressStatus") or "NOT_STARTED").upper()
+    status = _STATUS_MAP.get(progress, Status.NOT_STARTED)
 
-    activity_type = assigned_work.get("assignedActivityType") or ""
-    description = _activity_type_description(activity_type)
+    source_type = (classwork.get("source") or "").upper()
+    description = {
+        "TEACHER": "EP teacher-assigned task",
+        "SYSTEM_RECOMMENDATION": "EP recommended task",
+    }.get(source_type, "")
 
     url = f"{APP_BASE_URL}/learning/tasks/{task_id}"
 
@@ -150,26 +156,17 @@ def map_ep_task_to_task(
         source_id=str(task_id),
         child=child,
         subject=subject,
-        title=title,
+        title=name,
         description=description,
         assigned_at=assigned_at,
         due_at=due_at,
         status=status,
-        status_raw=status_raw.lower(),
+        status_raw=progress.lower(),
         url=url,
     )
 
 
-def _activity_type_description(activity_type: str) -> str:
-    return {
-        "LESSON": "EP lesson",
-        "QUIZ": "EP quiz",
-        "EXAM_REVISION": "EP exam revision",
-    }.get(activity_type.upper(), "")
-
-
 def _parse_ep_dt(value: Any) -> datetime | None:
-    """EP timestamps are ISO-8601 strings from the GraphQL DateTime scalar."""
     if not value or not isinstance(value, str):
         return None
     cleaned = value.replace("Z", "+00:00")
@@ -195,7 +192,8 @@ class EduPerfectTokenFile:
         {
           "access_token": "<JWT>",
           "expires_at":   "<ISO-8601 UTC>",
-          "storage_state": { <Playwright storage_state dict> }
+          "school_id":    "<UUID>",          # cached on first resolve
+          "storage_state": { <cookies dict> } # for future headless refresh
         }
     """
 
@@ -216,7 +214,7 @@ class EduPerfectTokenFile:
             raise AuthExpiredError(
                 f"Education Perfect token at {path} is not valid JSON"
             ) from exc
-        for key in ("access_token", "expires_at", "storage_state"):
+        for key in ("access_token", "expires_at"):
             if key not in raw:
                 raise AuthExpiredError(
                     f"Education Perfect token at {path} missing '{key}' — "
@@ -238,189 +236,215 @@ class EduPerfectTokenFile:
         return datetime.fromisoformat(self.raw["expires_at"]).astimezone(UTC)
 
     @property
+    def school_id(self) -> str | None:
+        return self.raw.get("school_id")
+
+    @property
     def storage_state(self) -> dict[str, Any]:
-        return dict(self.raw["storage_state"])
+        return dict(self.raw.get("storage_state", {"cookies": [], "origins": []}))
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        """Return True if the token is within the expiry buffer or past it."""
         ref = now or datetime.now(UTC)
         return self.expires_at - ref < _EXPIRY_BUFFER
 
+    def with_school_id(self, school_id: str) -> EduPerfectTokenFile:
+        updated = EduPerfectTokenFile({**self.raw, "school_id": school_id}, path=self.path)
+        if self.path:
+            updated.save(self.path)
+        return updated
+
 
 # --------------------------------------------------------------------------- #
-# Playwright headed login (Mac-only, one-time)
+# Token capture via Zen Browser Marionette
 # --------------------------------------------------------------------------- #
 
 
 def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
-    """Open a headed Chromium, let the user complete Google SSO, capture token.
+    """Capture the EP access_token cookie from a running Zen Browser session.
 
-    Intercepts the first authenticated request to ``graphql-gateway`` to
-    extract the Bearer JWT. Saves ``access_token``, ``expires_at`` (decoded
-    from the JWT ``exp`` claim), and ``storage_state`` to ``out_path``.
+    Requires Zen Browser to be running with Marionette enabled::
 
-    Imported lazily so the server runtime never needs Playwright browser
-    binaries. Only meant to be run on the Mac.
+        /Applications/Zen.app/Contents/MacOS/zen \\
+          --marionette --marionette-port 2828 \\
+          --remote-allow-system-access \\
+          --profile <profile-path>
+
+    The ``auth eduperfect`` CLI command handles launching Zen with the correct
+    flags before calling this function.
+
+    How it works:
+    1. Connects to Zen's Marionette protocol on port 2828.
+    2. Registers an nsIObserverService HTTP observer in the privileged chrome
+       context — the only mechanism that can see the ``Cookie`` header on requests
+       made by the mfe-proxy cross-origin iframe.
+    3. Navigates to the EP dashboard in the content context (uses James's live
+       session from the existing Zen profile).
+    4. Reads the captured ``access_token`` value from the observer.
+    5. Decodes the JWT ``exp`` claim and saves the token file.
     """
-    from playwright.sync_api import sync_playwright
+    import socket
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    captured: dict[str, str] = {}
+    MSG_ID = [0]
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
-        page = context.new_page()
+    def _send(s: socket.socket, cmd: str, params: dict) -> None:
+        mid = MSG_ID[0]; MSG_ID[0] += 1
+        msg = json.dumps([0, mid, cmd, params])
+        s.sendall(f"{len(msg)}:{msg}".encode())
 
-        def _on_request(request: Any) -> None:
-            if GRAPHQL_URL in request.url and "Authorization" in request.headers:
-                auth = request.headers.get("Authorization", "")
-                if auth.startswith("Bearer ") and not captured.get("token"):
-                    captured["token"] = auth[len("Bearer "):]
+    def _recv(s: socket.socket) -> Any:
+        buf = b""
+        s.settimeout(30)
+        while True:
+            buf += s.recv(8192)
+            try:
+                colon = buf.index(b":")
+                length = int(buf[:colon])
+                rest = buf[colon + 1:]
+                if len(rest) >= length:
+                    return json.loads(rest[:length])
+            except (ValueError, json.JSONDecodeError):
+                continue
 
-        page.on("request", _on_request)
+    def _exec(s: socket.socket, script: str) -> Any:
+        _send(s, "WebDriver:ExecuteScript", {"script": script, "args": []})
+        r = _recv(s)
+        if isinstance(r, list) and len(r) >= 4:
+            if r[2]:
+                return None
+            val = r[3]
+            return val.get("value") if isinstance(val, dict) else val
+        return None
 
-        page.goto(f"{base_url}/app/login")
-        page.wait_for_url(
-            lambda url: IAM_HOST not in url and "accounts.google.com" not in url,
-            timeout=300_000,  # 5 min for the human
+    try:
+        s = socket.socket()
+        s.settimeout(5)
+        s.connect(("localhost", 2828))
+        s.recv(1024)  # hello
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot connect to Zen Browser Marionette on port 2828.\n"
+            "Launch Zen with:\n"
+            "  /Applications/Zen.app/Contents/MacOS/zen \\\n"
+            "    --marionette --marionette-port 2828 \\\n"
+            "    --remote-allow-system-access \\\n"
+            f"    --profile \"$HOME/Library/Application Support/zen/Profiles/<profile>\"\n"
+            f"  Then re-run this command.\nOriginal error: {exc}"
+        ) from exc
+
+    _send(s, "WebDriver:NewSession", {})
+    _recv(s)
+
+    # Switch to chrome context and install HTTP observer
+    _send(s, "Marionette:SetContext", {"value": "chrome"})
+    _recv(s)
+    observer_script = """
+    if (window.__ep_cookie_obs__) {
+        try { Services.obs.removeObserver(window.__ep_cookie_obs__, 'http-on-modify-request'); } catch(e) {}
+    }
+    const obs = {
+        token: null,
+        observe: function(subject, topic) {
+            if (this.token) return;
+            try {
+                const ch = subject.QueryInterface(Components.interfaces.nsIHttpChannel);
+                if (!ch.URI.spec.includes('graphql-gateway')) return;
+                let cookie = '';
+                try { cookie = ch.getRequestHeader('Cookie'); } catch(e) {}
+                const match = cookie.match(/access_token=([^;]+)/);
+                if (match) this.token = match[1];
+            } catch(e) {}
+        },
+        QueryInterface: ChromeUtils.generateQI(['nsIObserver'])
+    };
+    Services.obs.addObserver(obs, 'http-on-modify-request');
+    window.__ep_cookie_obs__ = obs;
+    return 'ok';
+    """
+    _exec(s, observer_script)
+
+    # Navigate to EP in content context
+    _send(s, "Marionette:SetContext", {"value": "content"})
+    _recv(s)
+    _send(s, "WebDriver:Navigate", {"url": f"{base_url}/learning/dashboard"})
+    _recv(s)
+
+    # Wait up to 20s for a token to appear
+    import time
+    deadline = time.monotonic() + 20.0
+    token = None
+    while time.monotonic() < deadline:
+        _send(s, "Marionette:SetContext", {"value": "chrome"})
+        _recv(s)
+        token = _exec(s, "return window.__ep_cookie_obs__ ? window.__ep_cookie_obs__.token : null;")
+        if token:
+            break
+        _send(s, "Marionette:SetContext", {"value": "content"})
+        _recv(s)
+        time.sleep(0.5)
+
+    if not token:
+        # Try navigating to assigned-work to trigger fresh requests
+        _send(s, "Marionette:SetContext", {"value": "content"})
+        _recv(s)
+        _send(s, "WebDriver:Navigate", {"url": f"{base_url}/learning/assigned-work"})
+        _recv(s)
+        deadline2 = time.monotonic() + 15.0
+        while time.monotonic() < deadline2:
+            _send(s, "Marionette:SetContext", {"value": "chrome"})
+            _recv(s)
+            token = _exec(s, "return window.__ep_cookie_obs__ ? window.__ep_cookie_obs__.token : null;")
+            if token:
+                break
+            _send(s, "Marionette:SetContext", {"value": "content"})
+            _recv(s)
+            time.sleep(0.5)
+
+    s.close()
+
+    if not token:
+        raise RuntimeError(
+            "EP dashboard loaded but no access_token cookie was captured.\n"
+            "Ensure James is logged into app.educationperfect.com in Zen Browser,\n"
+            "then re-run this command."
         )
 
-        # Wait until the SPA fires a GraphQL request carrying a Bearer token.
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline and not captured.get("token"):
-            page.wait_for_timeout(500)
-
-        if not captured.get("token"):
-            browser.close()
-            raise RuntimeError(
-                "Logged in but no Bearer token was captured within 60s. "
-                "Ensure the Education Perfect dashboard fully loads before "
-                "the browser closes."
-            )
-
-        state = context.storage_state()
-        browser.close()
-
-    token = captured["token"]
     expires_at = _decode_jwt_exp(token)
-
-    token_file = EduPerfectTokenFile(
+    EduPerfectTokenFile(
         {
             "access_token": token,
             "expires_at": expires_at.isoformat(),
-            "storage_state": state,
+            "storage_state": {"cookies": [], "origins": []},
         }
-    )
-    token_file.save(out_path)
+    ).save(out_path)
 
 
 def _decode_jwt_exp(token: str) -> datetime:
-    """Decode the ``exp`` claim from a JWT without verifying the signature.
-
-    Returns a UTC datetime. Falls back to 1 hour from now if decoding fails
-    (the token will simply be refreshed on the next sync).
-    """
+    """Decode the ``exp`` claim from a JWT without verifying the signature."""
     import base64
 
     try:
         parts = token.split(".")
         if len(parts) != 3:
             raise ValueError("not a JWT")
-        # Add padding so base64 doesn't choke.
-        payload_b64 = parts[1] + "=="
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        exp = int(payload["exp"])
-        return datetime.fromtimestamp(exp, tz=UTC)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+        return datetime.fromtimestamp(int(payload["exp"]), tz=UTC)
     except Exception:
         return datetime.now(UTC) + timedelta(hours=1)
 
 
 # --------------------------------------------------------------------------- #
-# Headless token refresh (server, per-sync)
-# --------------------------------------------------------------------------- #
-
-
-def refresh_token_headless(
-    token_file: EduPerfectTokenFile,
-    *,
-    base_url: str = APP_BASE_URL,
-) -> EduPerfectTokenFile:
-    """Replay storage_state in headless Playwright to obtain a fresh token.
-
-    The ``fusionauth.sso`` cookie in ``storage_state`` is long-lived and drives
-    a silent re-auth through FusionAuth → EP dashboard without user interaction.
-    Raises ``AuthExpiredError`` if FusionAuth shows the login page (school Google
-    session expired).
-    """
-    from playwright.sync_api import sync_playwright
-
-    captured: dict[str, str] = {}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            storage_state=token_file.storage_state,
-            user_agent=DEFAULT_USER_AGENT,
-        )
-        page = context.new_page()
-
-        def _on_request(request: Any) -> None:
-            if GRAPHQL_URL in request.url and "Authorization" in request.headers:
-                auth = request.headers.get("Authorization", "")
-                if auth.startswith("Bearer ") and not captured.get("token"):
-                    captured["token"] = auth[len("Bearer "):]
-
-        page.on("request", _on_request)
-
-        page.goto(f"{base_url}/learning/dashboard")
-
-        # Check we didn't land on the FusionAuth login page.
-        if IAM_HOST in page.url or "accounts.google.com" in page.url:
-            browser.close()
-            raise AuthExpiredError(
-                "Education Perfect session expired — school Google session needs renewal. "
-                "Re-run `homework-hub auth eduperfect --child <name>`."
-            )
-
-        # Wait for a GraphQL request with a Bearer token.
-        deadline = time.monotonic() + 45.0
-        while time.monotonic() < deadline and not captured.get("token"):
-            page.wait_for_timeout(500)
-
-        new_state = context.storage_state()
-        browser.close()
-
-    if not captured.get("token"):
-        raise TransientError(
-            "Education Perfect: headless token refresh completed but no "
-            "Bearer token was intercepted. Will retry next sync."
-        )
-
-    new_token = captured["token"]
-    new_expires = _decode_jwt_exp(new_token)
-
-    updated = EduPerfectTokenFile(
-        {
-            "access_token": new_token,
-            "expires_at": new_expires.isoformat(),
-            "storage_state": new_state,
-        },
-        path=token_file.path,
-    )
-    if token_file.path:
-        updated.save(token_file.path)
-    return updated
-
-
-# --------------------------------------------------------------------------- #
-# GraphQL client
+# GraphQL client (cookie-based auth)
 # --------------------------------------------------------------------------- #
 
 
 class EduPerfectClient:
-    """Thin httpx wrapper around the EP GraphQL gateway."""
+    """httpx wrapper for the EP GraphQL gateway.
+
+    Auth via ``access_token`` cookie on ``.educationperfect.com`` — not a
+    Bearer header.
+    """
 
     def __init__(
         self,
@@ -447,44 +471,39 @@ class EduPerfectClient:
         if self._owns_client:
             self._client.close()
 
-    def get_assigned_work(
-        self,
-        *,
-        ends_after: datetime | None = None,
-    ) -> list[dict[str, Any]]:
-        """Fetch all assigned work for the logged-in student."""
-        variables: dict[str, Any] = {}
-        if ends_after:
-            variables["input"] = {
-                "filters": {"endsAfterDate": ends_after.isoformat()}
-            }
-        result = self._query(_ASSIGNED_WORK_QUERY, variables)
-        payload = (result.get("assignedWorkForUser") or {}).get("assignedWork")
-        if not isinstance(payload, list):
-            raise SchemaBreakError(
-                f"EP assignedWorkForUser missing list payload: {str(result)[:200]}"
+    def get_school_id(self, user_id: str) -> str:
+        """Resolve the student's school UUID from the user record."""
+        result = self._query(_USER_SCHOOL_QUERY, {"userId": user_id})
+        user = (result.get("user") or {})
+        memberships = user.get("memberships") or []
+        for m in memberships:
+            school = m.get("school") or {}
+            sid = school.get("id")
+            if sid:
+                return sid
+        raise SchemaBreakError("EP: could not resolve school_id from user memberships")
+
+    def get_assigned_classwork(self, school_id: str) -> list[dict[str, Any]]:
+        """Fetch all assigned classwork (both TO_DO and DONE) for the student."""
+        all_items: list[dict[str, Any]] = []
+        for status in ("TO_DO", "DONE"):
+            result = self._query(
+                _ASSIGNED_CLASSWORK_QUERY,
+                {"schoolId": school_id, "status": status},
             )
-        return payload
+            payload = (result.get("assignedClasswork") or {})
+            items = payload.get("result") or []
+            if not isinstance(items, list):
+                raise SchemaBreakError(
+                    f"EP assignedClasswork {status} missing list payload: {str(result)[:200]}"
+                )
+            all_items.extend(items)
+        return all_items
 
-    def get_class_names(self, class_ids: list[str]) -> dict[str, str]:
-        """Batch-resolve class UUIDs → human-readable names."""
-        if not class_ids:
-            return {}
-        result = self._query(_CLASSES_QUERY, {"ids": class_ids})
-        classes = result.get("classes") or []
-        return {
-            c["id"]: c.get("name", "")
-            for c in classes
-            if isinstance(c, dict) and "id" in c
-        }
-
-    # ------------------------------------------------------------------ #
-    # Internals
     # ------------------------------------------------------------------ #
 
     def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": self._user_agent,
@@ -492,13 +511,18 @@ class EduPerfectClient:
             "Referer": f"{APP_BASE_URL}/",
         }
 
+    def _cookies(self) -> dict[str, str]:
+        return {"access_token": self._token}
+
     def _query(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        body = {"query": query}
+        body: dict[str, Any] = {"query": query}
         if variables:
             body["variables"] = variables
 
         try:
-            resp = self._client.post(self._url, json=body, headers=self._headers())
+            resp = self._client.post(
+                self._url, json=body, headers=self._headers(), cookies=self._cookies()
+            )
         except httpx.TimeoutException as exc:
             raise TransientError(f"EP GraphQL timeout: {exc}") from exc
         except httpx.HTTPError as exc:
@@ -507,7 +531,7 @@ class EduPerfectClient:
         if resp.status_code in (401, 403):
             raise AuthExpiredError(
                 f"EP GraphQL returned {resp.status_code} — token expired. "
-                "Will attempt refresh on next sync."
+                "Re-run `homework-hub auth eduperfect --child <name>`."
             )
         if 500 <= resp.status_code < 600:
             raise TransientError(f"EP GraphQL {resp.status_code}: {resp.text[:200]}")
@@ -527,9 +551,9 @@ class EduPerfectClient:
         if errors:
             first = errors[0]
             code = (first.get("extensions") or {}).get("code", "")
-            if code == "AUTH_NOT_AUTHENTICATED":
+            if "NOT_AUTHORIZED" in code or "NOT_AUTHENTICATED" in code:
                 raise AuthExpiredError(
-                    "EP GraphQL: AUTH_NOT_AUTHENTICATED — token expired or invalid."
+                    f"EP GraphQL: {code} — token expired or insufficient permissions."
                 )
             raise SchemaBreakError(f"EP GraphQL error: {first.get('message')}")
 
@@ -551,21 +575,18 @@ class EduPerfectSource(Source):
         token_path_for_child: dict[str, Path],
         *,
         client_factory: Any = None,
-        refresh_fn: Any = None,
     ):
         self.token_path_for_child = token_path_for_child
-        # Allow injection in tests.
         self._client_factory = client_factory or (
             lambda token: EduPerfectClient(token)
         )
-        self._refresh_fn = refresh_fn or refresh_token_headless
 
     def fetch(self, child: str) -> list[Task]:
         """Not used — EP runs entirely through the medallion fetch_raw path."""
         raise NotImplementedError("EduPerfectSource only supports fetch_raw")
 
     def fetch_raw(self, child: str) -> list[RawRecord]:
-        """Fetch EP assigned work as raw payloads for the bronze layer."""
+        """Fetch EP assigned classwork as raw payloads for the bronze layer."""
         if child not in self.token_path_for_child:
             raise SchemaBreakError(
                 f"No Education Perfect token path configured for {child}."
@@ -574,34 +595,41 @@ class EduPerfectSource(Source):
         token_file = EduPerfectTokenFile.load(path)
 
         if token_file.is_expired():
-            token_file = self._refresh_fn(token_file)
+            raise AuthExpiredError(
+                f"Education Perfect token expired at {token_file.expires_at.isoformat()}. "
+                "Re-run `homework-hub auth eduperfect --child <name>`."
+            )
+
+        import base64
+        jwt_payload = json.loads(
+            base64.urlsafe_b64decode(token_file.access_token.split(".")[1] + "==")
+        )
+        user_id = jwt_payload.get("userId") or jwt_payload.get("sub")
+        if not user_id:
+            raise SchemaBreakError("EP token JWT missing userId claim")
 
         with self._client_factory(token_file.access_token) as client:
-            # Fetch work assigned in the last 12 months — wide enough to catch
-            # any outstanding or recently completed tasks.
-            ends_after = datetime.now(UTC) - timedelta(days=365)
-            raw_work = client.get_assigned_work(ends_after=ends_after)
+            # Resolve school_id on first run and cache it in the token file.
+            school_id = token_file.school_id
+            if not school_id:
+                school_id = client.get_school_id(user_id)
+                token_file = token_file.with_school_id(school_id)
 
-            # Collect all unique class IDs and resolve them in one batch call.
-            all_class_ids: list[str] = []
-            for w in raw_work:
-                ids = (w.get("assignedVia") or {}).get("classIds") or []
-                all_class_ids.extend(ids)
-            class_names = client.get_class_names(list(dict.fromkeys(all_class_ids)))
+            classwork_items = client.get_assigned_classwork(school_id)
 
         records: list[RawRecord] = []
-        for w in raw_work:
-            task_id = w.get("id")
+        for item in classwork_items:
+            task_id = item.get("id")
             if not task_id:
                 raise SchemaBreakError(
-                    f"EP assigned work missing id: keys={sorted(w.keys())}"
+                    f"EP classwork missing id: keys={sorted(item.keys())}"
                 )
             records.append(
                 RawRecord(
                     child=child,
                     source=SourceEnum.EDUPERFECT.value,
                     source_id=str(task_id),
-                    payload={"assigned_work": w, "class_names": class_names},
+                    payload={"classwork": item},
                 )
             )
         return records
