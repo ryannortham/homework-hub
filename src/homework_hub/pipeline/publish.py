@@ -186,37 +186,39 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
         due = melbourne_local_date(t.due_at)
         upstream_done = t.status in (Status.SUBMITTED, Status.GRADED)
 
-        rows.append(
-            _task_row(
-                uid=uid,
-                subject=t.subject or "",
-                task_type=type_label,
-                title=t.title,
-                description=t.description,
-                due=due,
-                status=status_label,
-                done=upstream_done,
-                source=src_label,
-                link=t.url,
-            )
-        )
-
-        # Expand Compass Checkpoint sub-tasks as individual tickable rows.
-        for cp in t.checkpoints:
-            gi_id = cp.get("id")
-            gi_name = cp.get("name", "").strip()
-            if not gi_id or not gi_name:
-                continue
+        # Tasks with checkpoints are expanded into one row per checkpoint;
+        # the parent row is suppressed (the checkpoints carry all the detail).
+        if t.checkpoints:
+            for cp in t.checkpoints:
+                gi_id = cp.get("id")
+                gi_name = cp.get("name", "").strip()
+                if not gi_id or not gi_name:
+                    continue
+                rows.append(
+                    _task_row(
+                        uid=checkpoint_uid(t, gi_id),
+                        subject=t.subject or "",
+                        task_type=type_label,
+                        title=t.title,
+                        description=gi_name,
+                        due=due,
+                        status=status_label,
+                        done=upstream_done,
+                        source=src_label,
+                        link=t.url,
+                    )
+                )
+        else:
             rows.append(
                 _task_row(
-                    uid=checkpoint_uid(t, gi_id),
+                    uid=uid,
                     subject=t.subject or "",
                     task_type=type_label,
-                    title=f"↳ {gi_name}",
-                    description="",
+                    title=t.title,
+                    description=t.description,
                     due=due,
-                    status="",
-                    done=False,
+                    status=status_label,
+                    done=upstream_done,
                     source=src_label,
                     link=t.url,
                 )

@@ -198,18 +198,17 @@ class TestProjectTasksRows:
             url="https://example/cp",
         )
         rows = project_tasks_rows([t])
-        # Parent + 2 sub-tasks
-        assert len(rows) == 3
-        assert rows[0].task_uid == "compass:CP1"
-        assert rows[1].task_uid == "compass:CP1:gi:101"
-        assert rows[2].task_uid == "compass:CP1:gi:102"
-        # Sub-task titles are prefixed with ↳
-        assert rows[1].cells[_idx("title")] == "↳ Equations"
-        assert rows[2].cells[_idx("title")] == "↳ Inequalities"
-        # Sub-tasks inherit parent subject and due
-        assert rows[1].cells[_idx("subject")] == "11MAM"
-        # Sub-tasks start undone
-        assert rows[1].cells[_idx("done")] is False
+        # Parent row suppressed — one row per checkpoint only
+        assert len(rows) == 2
+        assert rows[0].task_uid == "compass:CP1:gi:101"
+        assert rows[1].task_uid == "compass:CP1:gi:102"
+        # Title is the parent task name; description is the checkpoint name
+        assert rows[0].cells[_idx("title")] == "Chapter 1 Coursework"
+        assert rows[0].cells[_idx("description")] == "Equations"
+        assert rows[1].cells[_idx("title")] == "Chapter 1 Coursework"
+        assert rows[1].cells[_idx("description")] == "Inequalities"
+        # Checkpoints inherit parent subject
+        assert rows[0].cells[_idx("subject")] == "11MAM"
 
     def test_checkpoint_with_no_id_skipped(self):
         t = Task(
@@ -222,7 +221,7 @@ class TestProjectTasksRows:
             url="https://example/cp",
         )
         rows = project_tasks_rows([t])
-        assert len(rows) == 1  # only parent; bad checkpoint dropped
+        assert len(rows) == 0  # parent suppressed, bad checkpoint dropped
 
 
 # --------------------------------------------------------------------------- #
@@ -798,24 +797,18 @@ class TestPropagateParentDone:
         )
 
     def test_parent_done_propagates_to_sub_tasks(self):
+        # With no parent row, propagate_parent_done is a no-op for checkpoint tasks.
         rows = project_tasks_rows([self._checkpoint_task()])
-        # Manually tick parent done
-        done_idx = _idx("done")
-        parent_cells = list(rows[0].cells)
-        parent_cells[done_idx] = True
-        rows[0] = type(rows[0])(task_uid=rows[0].task_uid, cells=tuple(parent_cells))
-
+        assert len(rows) == 2  # checkpoint rows only
         result = propagate_parent_done(rows)
-        assert result[0].cells[done_idx] is True   # parent stays done
-        assert result[1].cells[done_idx] is True   # sub-task 1 propagated
-        assert result[2].cells[done_idx] is True   # sub-task 2 propagated
+        assert result == rows  # unchanged
 
     def test_parent_not_done_leaves_sub_tasks_undone(self):
         rows = project_tasks_rows([self._checkpoint_task()])
         result = propagate_parent_done(rows)
         done_idx = _idx("done")
+        assert result[0].cells[done_idx] is False
         assert result[1].cells[done_idx] is False
-        assert result[2].cells[done_idx] is False
 
     def test_no_checkpoints_returns_unchanged(self):
         rows = project_tasks_rows([_task()])
