@@ -32,7 +32,7 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Status, Task
+from homework_hub.models import Status, Task, TaskType
 from homework_hub.schema import (
     DUPLICATES_TAB,
     SCHEMA,
@@ -58,6 +58,12 @@ _STATUS_DISPLAY: dict[str, str] = {
     Status.SUBMITTED.value: "Submitted",
     Status.GRADED.value: "Graded",
     Status.OVERDUE.value: "Overdue",
+}
+
+_TASK_TYPE_DISPLAY: dict[str, str] = {
+    TaskType.ASSESSMENT.value: "Assessment",
+    TaskType.HOMEWORK.value: "Homework",
+    TaskType.GENERAL.value: "General",
 }
 
 
@@ -87,6 +93,23 @@ def task_uid(task: Task) -> str:
     return f"{task.source.value}:{task.source_id}"
 
 
+def checkpoint_uid(task: Task, gi_id: int) -> str:
+    """Stable identifier for a sub-task row derived from a Compass gradingItem.
+
+    Format: ``<source>:<source_id>:gi:<gi_id>``.  The ``:gi:`` separator
+    lets callers distinguish sub-task uids from parent task uids.
+    """
+    return f"{task.source.value}:{task.source_id}:gi:{gi_id}"
+
+
+def parent_uid_from_checkpoint(uid: str) -> str | None:
+    """Extract the parent task_uid from a checkpoint uid, or ``None`` if not
+    a checkpoint uid."""
+    if ":gi:" in uid:
+        return uid.split(":gi:")[0]
+    return None
+
+
 @dataclass(frozen=True)
 class TaskRow:
     """One projected row for the Tasks tab. Cells are tab-column-ordered."""
@@ -103,8 +126,47 @@ class DuplicateRow:
     cells: tuple[object, ...]
 
 
+def _task_row(
+    *,
+    uid: str,
+    subject: str,
+    task_type: str,
+    title: str,
+    description: str,
+    due: date | None,
+    status: str,
+    done: bool,
+    source: str,
+    link: str,
+) -> TaskRow:
+    """Build one TaskRow with the full TASKS_TAB column order."""
+    days_formula = TASKS_TAB.columns[TASKS_TAB.column_index("days")].formula_template
+    cell_by_key = {
+        "subject": subject,
+        "task_type": task_type,
+        "title": title,
+        "description": description,
+        "due": due,
+        "days": days_formula,
+        "status": status,
+        "priority": "",
+        "done": done,
+        "notes": "",
+        "source": source,
+        "link": link,
+        "task_uid": uid,
+    }
+    cells = tuple(cell_by_key[c.key] for c in TASKS_TAB.columns)
+    return TaskRow(task_uid=uid, cells=cells)
+
+
 def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
     """Project silver tasks into Tasks-tab row data.
+
+    Tasks with Compass ``Checkpoints`` gradingItems are expanded into a
+    parent row followed by one sub-task row per checkpoint.  Sub-task rows
+    share the parent's subject, type, due date, source and link; their title
+    is prefixed with ``↳`` for visual indentation.
 
     Editable columns ``priority`` and ``notes`` default to blank.
     ``done`` is derived from the task's status: ``True`` when the upstream
@@ -112,27 +174,87 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
     Kids can override it via the sheet; :func:`merge_user_edits` overlays
     those overrides afterwards.
 
-    The ``Days`` column is written as a row-relative formula
-    (``=C{row}-TODAY()``) so Sheets evaluates it as a number on every open.
+    The ``Days`` column is written as a row-relative formula so Sheets
+    evaluates it as a number on every open.
     """
     rows: list[TaskRow] = []
     for t in tasks:
-        cell_by_key = {
-            "subject": t.subject or "",
-            "title": t.title,
-            "due": melbourne_local_date(t.due_at),
-            "days": TASKS_TAB.columns[TASKS_TAB.column_index("days")].formula_template,
-            "status": _STATUS_DISPLAY.get(t.status.value, t.status.value),
-            "priority": "",
-            "done": t.status in (Status.SUBMITTED, Status.GRADED),
-            "notes": "",
-            "source": _SOURCE_DISPLAY.get(t.source.value, t.source.value),
-            "link": t.url,
-            "task_uid": task_uid(t),
-        }
-        cells = tuple(cell_by_key[c.key] for c in TASKS_TAB.columns)
-        rows.append(TaskRow(task_uid=task_uid(t), cells=cells))
+        uid = task_uid(t)
+        src_label = _SOURCE_DISPLAY.get(t.source.value, t.source.value)
+        type_label = _TASK_TYPE_DISPLAY.get(t.task_type.value, "Homework")
+        status_label = _STATUS_DISPLAY.get(t.status.value, t.status.value)
+        due = melbourne_local_date(t.due_at)
+        upstream_done = t.status in (Status.SUBMITTED, Status.GRADED)
+
+        rows.append(
+            _task_row(
+                uid=uid,
+                subject=t.subject or "",
+                task_type=type_label,
+                title=t.title,
+                description=t.description,
+                due=due,
+                status=status_label,
+                done=upstream_done,
+                source=src_label,
+                link=t.url,
+            )
+        )
+
+        # Expand Compass Checkpoint sub-tasks as individual tickable rows.
+        for cp in t.checkpoints:
+            gi_id = cp.get("id")
+            gi_name = cp.get("name", "").strip()
+            if not gi_id or not gi_name:
+                continue
+            rows.append(
+                _task_row(
+                    uid=checkpoint_uid(t, gi_id),
+                    subject=t.subject or "",
+                    task_type=type_label,
+                    title=f"↳ {gi_name}",
+                    description="",
+                    due=due,
+                    status="",
+                    done=False,
+                    source=src_label,
+                    link=t.url,
+                )
+            )
+
     return rows
+
+
+def propagate_parent_done(rows: list[TaskRow]) -> list[TaskRow]:
+    """Cascade a parent row's ``Done=True`` to all of its checkpoint sub-rows.
+
+    When a kid ticks the parent task's Done checkbox, the next sync should
+    tick all sub-task rows automatically.  The relationship is identified by
+    ``task_uid`` format: a sub-task uid is ``<parent_uid>:gi:<gi_id>``.
+
+    This runs after ``merge_user_edits`` so the parent's live Done value
+    (potentially a kid override) is already merged in.
+    """
+    done_idx = TASKS_TAB.column_index("done")
+    # Build set of parent uids that are marked done.
+    done_parents: set[str] = {
+        r.task_uid
+        for r in rows
+        if parent_uid_from_checkpoint(r.task_uid) is None and r.cells[done_idx] is True
+    }
+    if not done_parents:
+        return rows
+
+    out: list[TaskRow] = []
+    for row in rows:
+        parent = parent_uid_from_checkpoint(row.task_uid)
+        if parent in done_parents:
+            new_cells = list(row.cells)
+            new_cells[done_idx] = True
+            out.append(TaskRow(task_uid=row.task_uid, cells=tuple(new_cells)))
+        else:
+            out.append(row)
+    return out
 
 
 @dataclass(frozen=True)
@@ -604,6 +726,7 @@ def publish_for_child(
     user_edits = _merge_edit_sources(live_edits, persisted_edits)
     user_edits = filter_superseded_edits(user_edits, tasks)
     merged_rows = merge_user_edits(task_rows, user_edits)
+    merged_rows = propagate_parent_done(merged_rows)
     duplicate_rows = project_duplicates_rows(link_inputs)
     settings_rows = project_settings_rows(child=child, last_synced=last_synced)
 
@@ -670,14 +793,17 @@ __all__ = [
     "UserEdit",
     "apply_link_state_writebacks",
     "capture_tasks_tab_edits",
+    "checkpoint_uid",
     "diff_user_edits",
     "filter_superseded_edits",
     "load_links_for_publish",
     "melbourne_local_date",
     "merge_user_edits",
+    "parent_uid_from_checkpoint",
     "project_duplicates_rows",
     "project_settings_rows",
     "project_tasks_rows",
+    "propagate_parent_done",
     "publish_for_child",
     "reconcile_link_state",
     "task_uid",

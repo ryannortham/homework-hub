@@ -23,6 +23,7 @@ Split architecture:
 
 from __future__ import annotations
 
+import html as _html
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ from typing import Any
 import httpx
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Status, Task
+from homework_hub.models import Status, Task, TaskType
 from homework_hub.pipeline.ingest import RawRecord
 from homework_hub.sources.base import (
     AuthExpiredError,
@@ -55,6 +56,17 @@ _STATUS_MAP: dict[int, Status] = {
     # 4 observed only on inactive enrolments (isActiveEnrolment=False) where
     # ``submittedTimestamp`` is populated — treat as submitted-but-ungraded.
     4: Status.SUBMITTED,
+}
+
+# Compass categoryId → TaskType. Values are school-configured in the Compass
+# admin UI; these mappings reflect Mordialloc College's setup, confirmed by
+# inspecting the badge labels in the Compass web app.
+# Unknown categoryId values fall back to HOMEWORK (safe default).
+_CATEGORY_TYPE_MAP: dict[int, TaskType] = {
+    1: TaskType.GENERAL,    # Coursework, topic tests (no semester report)
+    2: TaskType.HOMEWORK,   # Homework sheets, lesson tasks
+    3: TaskType.GENERAL,    # Projects / advocacy tasks
+    5: TaskType.ASSESSMENT, # BENCHMARKs, SACs, formative assessments
 }
 
 
@@ -109,6 +121,23 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
     if due_at is None and status in (Status.SUBMITTED, Status.GRADED):
         due_at = submitted_at or assigned_at
 
+    task_type = _CATEGORY_TYPE_MAP.get(
+        learning_task.get("categoryId") or 0, TaskType.HOMEWORK
+    )
+
+    # Extract sub-task checkpoints from gradingItems where the teacher has used
+    # the "Checkpoints" grading scheme (measureUniqueId == "Checkpoints").
+    # Primary grade items (isPrimaryGrade=True) are the overall task grade and
+    # are excluded — only the individual checkpoint entries are sub-tasks.
+    checkpoints = [
+        {"id": gi["id"], "name": gi["name"].strip()}
+        for gi in learning_task.get("gradingItems") or []
+        if gi.get("measureUniqueId") == "Checkpoints"
+        and not gi.get("isPrimaryGrade", False)
+        and gi.get("id") is not None
+        and gi.get("name", "").strip()
+    ]
+
     url = f"https://{subdomain}.compass.education/Communicate/LearningTasksStudentDetails.aspx?taskId={task_id}"
 
     return Task(
@@ -123,6 +152,8 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
         submitted_at=submitted_at,
         status=status,
         status_raw=str(status_raw_int),
+        task_type=task_type,
+        checkpoints=checkpoints,
         url=url,
     )
 
@@ -177,10 +208,10 @@ def _parse_compass_dt(value: Any) -> datetime | None:
 
 
 def _strip_html(text: str) -> str:
-    """Best-effort HTML strip for Compass description fields."""
-    if "<" not in text:
-        return text.strip()
-    # Tiny tag stripper — sufficient for Compass's modest HTML.
+    """Best-effort HTML strip + entity decode for Compass description fields."""
+    if not text:
+        return ""
+    # Strip tags first.
     out: list[str] = []
     inside = False
     for ch in text:
@@ -190,7 +221,8 @@ def _strip_html(text: str) -> str:
             inside = False
         elif not inside:
             out.append(ch)
-    return "".join(out).strip()
+    # Decode HTML entities (&nbsp; -> space, &#39; -> ', &ndash; -> en-dash, etc.)
+    return _html.unescape("".join(out)).strip()
 
 
 # --------------------------------------------------------------------------- #

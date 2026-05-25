@@ -14,13 +14,14 @@ import httpx
 import pytest
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Status
+from homework_hub.models import Status, TaskType
 from homework_hub.sources.base import (
     AuthExpiredError,
     SchemaBreakError,
     TransientError,
 )
 from homework_hub.sources.compass import (
+    _CATEGORY_TYPE_MAP,
     CompassClient,
     CompassSource,
     CompassToken,
@@ -153,6 +154,72 @@ class TestMapping:
         assert _strip_html("<p>Hello <b>world</b></p>") == "Hello world"
         assert _strip_html("plain text") == "plain text"
         assert _strip_html("") == ""
+
+    def test_strip_html_unescapes_html_entities(self):
+        assert _strip_html("Don&apos;t forget&nbsp;this") == "Don't forget\xa0this"
+        assert _strip_html("A &amp; B &ndash; C") == "A & B \u2013 C"
+
+    def test_task_type_defaults_to_homework_when_no_category_id(self, lt):
+        lt.pop("categoryId", None)
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.task_type is TaskType.HOMEWORK
+
+    def test_task_type_homework_from_category_2(self, lt):
+        lt["categoryId"] = 2
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.task_type is TaskType.HOMEWORK
+
+    def test_task_type_assessment_from_category_5(self, lt):
+        lt["categoryId"] = 5
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.task_type is TaskType.ASSESSMENT
+
+    def test_task_type_general_from_category_1(self, lt):
+        lt["categoryId"] = 1
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.task_type is TaskType.GENERAL
+
+    def test_unknown_category_id_falls_back_to_homework(self, lt):
+        lt["categoryId"] = 999
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.task_type is TaskType.HOMEWORK
+
+    def test_category_type_map_covers_known_ids(self):
+        assert _CATEGORY_TYPE_MAP[1] is TaskType.GENERAL
+        assert _CATEGORY_TYPE_MAP[2] is TaskType.HOMEWORK
+        assert _CATEGORY_TYPE_MAP[3] is TaskType.GENERAL
+        assert _CATEGORY_TYPE_MAP[5] is TaskType.ASSESSMENT
+
+    def test_checkpoints_extracted_from_grading_items(self, lt):
+        lt["gradingItems"] = [
+            {"id": 201, "name": "Equations", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
+            {"id": 202, "name": "Graphs", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert len(t.checkpoints) == 2
+        assert t.checkpoints[0] == {"id": 201, "name": "Equations"}
+        assert t.checkpoints[1] == {"id": 202, "name": "Graphs"}
+
+    def test_primary_grade_checkpoint_excluded(self, lt):
+        lt["gradingItems"] = [
+            {"id": 301, "name": "Overall", "measureUniqueId": "Checkpoints", "isPrimaryGrade": True},
+            {"id": 302, "name": "Part A", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert len(t.checkpoints) == 1
+        assert t.checkpoints[0]["id"] == 302
+
+    def test_non_checkpoint_grading_items_excluded(self, lt):
+        lt["gradingItems"] = [
+            {"id": 401, "name": "Outcome 1", "measureUniqueId": "LearningOutcomes", "isPrimaryGrade": False},
+        ]
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.checkpoints == []
+
+    def test_no_grading_items_yields_empty_checkpoints(self, lt):
+        lt.pop("gradingItems", None)
+        t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
+        assert t.checkpoints == []
 
     def test_submitted_at_populated_from_submitted_timestamp(self, lt):
         lt["students"] = [

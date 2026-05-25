@@ -15,6 +15,7 @@ that lands, both fields default to ``subject_raw``.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from contextlib import closing
@@ -23,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Task
+from homework_hub.models import Task, TaskType
 from homework_hub.pipeline.subjects import SubjectResolver
 from homework_hub.sources.classroom import map_classroom_card_to_task
 from homework_hub.sources.compass import map_learning_task_to_task
@@ -177,7 +178,7 @@ class SilverWriter:
                 existing = conn.execute(
                     "SELECT subject_raw, subject_canonical, subject_short, "
                     "title, description, assigned_at, due_at, submitted_at, "
-                    "status_raw, status, url "
+                    "status_raw, status, task_type, checkpoints_json, url "
                     "FROM silver_tasks "
                     "WHERE child = ? AND source = ? AND source_id = ?",
                     (task.child, task.source.value, task.source_id),
@@ -206,6 +207,8 @@ class SilverWriter:
                     task.submitted_at.isoformat() if task.submitted_at else None,
                     task.status_raw,
                     task.status.value,
+                    task.task_type.value,
+                    json.dumps(task.checkpoints),
                     task.url,
                 )
 
@@ -214,9 +217,9 @@ class SilverWriter:
                         "INSERT INTO silver_tasks "
                         "(child, source, source_id, subject_raw, "
                         "subject_canonical, subject_short, title, description, "
-                        "assigned_at, due_at, submitted_at, status_raw, status, url, "
-                        "bronze_id, last_synced) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "assigned_at, due_at, submitted_at, status_raw, status, "
+                        "task_type, checkpoints_json, url, bronze_id, last_synced) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             task.child,
                             task.source.value,
@@ -248,7 +251,8 @@ class SilverWriter:
                         "subject_raw = ?, subject_canonical = ?, "
                         "subject_short = ?, title = ?, description = ?, "
                         "assigned_at = ?, due_at = ?, submitted_at = ?, status_raw = ?, "
-                        "status = ?, url = ?, bronze_id = ?, last_synced = ? "
+                        "status = ?, task_type = ?, checkpoints_json = ?, url = ?, "
+                        "bronze_id = ?, last_synced = ? "
                         "WHERE child = ? AND source = ? AND source_id = ?",
                         (
                             *new_row,
@@ -268,7 +272,8 @@ class SilverWriter:
         with closing(_connect(self.store)) as conn:
             rows = conn.execute(
                 "SELECT source, source_id, subject_raw, title, description, "
-                "assigned_at, due_at, submitted_at, status_raw, status, url "
+                "assigned_at, due_at, submitted_at, status_raw, status, "
+                "task_type, checkpoints_json, url "
                 "FROM silver_tasks WHERE child = ? "
                 "ORDER BY source, source_id",
                 (child,),
@@ -290,6 +295,8 @@ class SilverWriter:
                 ),
                 status_raw=r["status_raw"],
                 status=r["status"],
+                task_type=TaskType(r["task_type"]) if r["task_type"] else TaskType.HOMEWORK,
+                checkpoints=json.loads(r["checkpoints_json"] or "[]"),
                 url=r["url"],
             )
             for r in rows

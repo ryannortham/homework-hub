@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import gspread
 import pytest
 
-from homework_hub.schema import SETTINGS_TAB, TASKS_TAB, TODAY_TAB, USER_EDITS_TAB
+from homework_hub.schema import TASKS_TAB, TODAY_TAB, USER_EDITS_TAB
 from homework_hub.sinks.gold_sink import (
     GoldSinkError,
     GspreadGoldSink,
@@ -337,10 +337,10 @@ def test_write_table_tab_single_batchupdate_with_all_requests():
     """deleteDimension, appendDimension, updateTable, updateCells go in one batchUpdate.
     updateTable comes before updateCells so structured column references
     in formula cells resolve correctly (cells must be inside the Table)."""
-    header = ["subject", "title", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
-    ws = FakeWorksheet("Tasks", rows=[header, [""]*11], ws_id=1)
+    header = ["subject", "task_type", "title", "description", "due", "days", "status", "priority", "done", "notes", "source", "link", "task_uid"]
+    ws = FakeWorksheet("Tasks", rows=[header, [""]*13], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [("Maths", "Chapter 3", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
+    rows = [("Maths", "Homework", "Chapter 3", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
     assert ws.cleared == []
@@ -348,14 +348,14 @@ def test_write_table_tab_single_batchupdate_with_all_requests():
     assert ws.appended == []
 
     reqs = _single_batch_requests(sink)
-    req_kinds = [list(r.keys())[0] for r in reqs]
+    req_kinds = [next(iter(r.keys())) for r in reqs]
     assert req_kinds == ["deleteDimension", "appendDimension", "updateTable", "updateCells"]
 
 
 def test_write_table_tab_delete_covers_all_existing_rows():
-    ws = FakeWorksheet("Tasks", rows=[["h"]] + [[""] * 11] * 5, ws_id=1)
+    ws = FakeWorksheet("Tasks", rows=[["h"]] + [[""] * 13] * 5, ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "Homework", "HW", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
     reqs = _single_batch_requests(sink)
     del_range = reqs[0]["deleteDimension"]["range"]
     assert del_range["startIndex"] == 1
@@ -367,18 +367,18 @@ def test_write_table_tab_updatecells_uses_correct_value_types():
     No userEnteredFormat is written — column format from bootstrap repeatCell survives deleteDimension."""
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    rows = [("Maths", "HW", 46143, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
+    rows = [("Maths", "Homework", "HW", "", 46143, "=E{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
 
     reqs = _single_batch_requests(sink)
     # order: deleteDimension, appendDimension, updateTable, updateCells
     cells = reqs[3]["updateCells"]["rows"][0]["values"]
     # Due (DATE serial) — value only, no format (format set by bootstrap repeatCell)
-    assert cells[2] == {"userEnteredValue": {"numberValue": 46143}}
+    assert cells[4] == {"userEnteredValue": {"numberValue": 46143}}
     # Days formula — substituted with row 2
-    assert cells[3] == {"userEnteredValue": {"formulaValue": "=C2-TODAY()"}}
+    assert cells[5] == {"userEnteredValue": {"formulaValue": "=E2-TODAY()"}}
     # Done checkbox
-    assert cells[6] == {"userEnteredValue": {"boolValue": False}}
+    assert cells[8] == {"userEnteredValue": {"boolValue": False}}
     # Subject text
     assert cells[0] == {"userEnteredValue": {"stringValue": "Maths"}}
     # fields mask covers only value, not format
@@ -389,9 +389,9 @@ def test_write_table_tab_updatetable_endrow_covers_data_rows():
     ws = FakeWorksheet("Tasks", rows=[["h"], [""]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
     rows = [
-        ("Maths", "HW1", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1"),
-        ("English", "Essay", None, "=C{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-2"),
-        ("Science", "Lab", None, "=C{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-3"),
+        ("Maths", "Homework", "HW1", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1"),
+        ("English", "Homework", "Essay", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-2"),
+        ("Science", "Homework", "Lab", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Compass", "", "uid-3"),
     ]
     sink.write_tab("sheet-id", TASKS_TAB, rows)
     reqs = _single_batch_requests(sink)
@@ -409,7 +409,7 @@ def test_write_table_tab_empty_rows_no_updatecells_endrow_1():
     sink.write_tab("sheet-id", TASKS_TAB, rows=[])
 
     reqs = _single_batch_requests(sink)
-    req_kinds = [list(r.keys())[0] for r in reqs]
+    req_kinds = [next(iter(r.keys())) for r in reqs]
     assert req_kinds == ["deleteDimension", "updateTable"]
     assert reqs[1]["updateTable"]["table"]["range"]["endRowIndex"] == 1
 
@@ -418,9 +418,9 @@ def test_write_table_tab_header_only_no_delete():
     """Header-only sheet: no deleteDimension, just appendDimension + updateTable + updateCells."""
     ws = FakeWorksheet("Tasks", rows=[["h"]], ws_id=1)
     sink, _ = _make_sink({"Tasks": ws}, with_discovery=True)
-    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "HW", None, "=C{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
+    sink.write_tab("sheet-id", TASKS_TAB, rows=[("Maths", "Homework", "HW", "", None, "=E{row}-TODAY()", "Not started", "", False, "", "Classroom", "", "uid-1")])
     reqs = _single_batch_requests(sink)
-    req_kinds = [list(r.keys())[0] for r in reqs]
+    req_kinds = [next(iter(r.keys())) for r in reqs]
     assert req_kinds == ["appendDimension", "updateTable", "updateCells"]
 
 

@@ -7,21 +7,24 @@ from contextlib import closing
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from homework_hub.models import Source, Status, Task
+from homework_hub.models import Source, Status, Task, TaskType
 from homework_hub.pipeline.publish import (
     DuplicateCheckboxState,
     LinkProjectionInput,
     UserEdit,
     apply_link_state_writebacks,
     capture_tasks_tab_edits,
+    checkpoint_uid,
     diff_user_edits,
     filter_superseded_edits,
     load_links_for_publish,
     melbourne_local_date,
     merge_user_edits,
+    parent_uid_from_checkpoint,
     project_duplicates_rows,
     project_settings_rows,
     project_tasks_rows,
+    propagate_parent_done,
     publish_for_child,
     reconcile_link_state,
     task_uid,
@@ -100,7 +103,7 @@ class TestProjectTasksRows:
         # Due converted to Melbourne local date (May 2).
         assert cells[_idx("due")] == date(2026, 5, 2)
         # Days written as row-relative formula for Sheets to evaluate.
-        assert cells[_idx("days")] == "=C{row}-TODAY()"
+        assert cells[_idx("days")] == "=E{row}-TODAY()"
         assert cells[_idx("status")] == "Not started"
         assert cells[_idx("priority")] == ""
         # NOT_STARTED → done=False
@@ -137,6 +140,89 @@ class TestProjectTasksRows:
     def test_no_due_date(self):
         rows = project_tasks_rows([_task(due_at=None)])
         assert rows[0].cells[_idx("due")] is None
+
+    def test_task_type_defaults_to_homework(self):
+        rows = project_tasks_rows([_task()])
+        assert rows[0].cells[_idx("task_type")] == "Homework"
+
+    def test_task_type_assessment(self):
+        t = Task(
+            source=Source.COMPASS,
+            source_id="X1",
+            child="james",
+            subject="11BIO",
+            title="SAC 1",
+            task_type=TaskType.ASSESSMENT,
+            url="https://example/x",
+        )
+        rows = project_tasks_rows([t])
+        assert rows[0].cells[_idx("task_type")] == "Assessment"
+
+    def test_task_type_general(self):
+        t = Task(
+            source=Source.COMPASS,
+            source_id="X2",
+            child="james",
+            subject="11BIO",
+            title="Advocacy task",
+            task_type=TaskType.GENERAL,
+            url="https://example/x",
+        )
+        rows = project_tasks_rows([t])
+        assert rows[0].cells[_idx("task_type")] == "General"
+
+    def test_description_populated(self):
+        t = Task(
+            source=Source.COMPASS,
+            source_id="D1",
+            child="james",
+            subject="9MATH",
+            title="Worksheet",
+            description="Complete questions 1-10.",
+            url="https://example/d",
+        )
+        rows = project_tasks_rows([t])
+        assert rows[0].cells[_idx("description")] == "Complete questions 1-10."
+
+    def test_checkpoint_sub_tasks_expanded(self):
+        t = Task(
+            source=Source.COMPASS,
+            source_id="CP1",
+            child="james",
+            subject="11MAM",
+            title="Chapter 1 Coursework",
+            checkpoints=[
+                {"id": 101, "name": "Equations"},
+                {"id": 102, "name": "Inequalities"},
+            ],
+            url="https://example/cp",
+        )
+        rows = project_tasks_rows([t])
+        # Parent + 2 sub-tasks
+        assert len(rows) == 3
+        assert rows[0].task_uid == "compass:CP1"
+        assert rows[1].task_uid == "compass:CP1:gi:101"
+        assert rows[2].task_uid == "compass:CP1:gi:102"
+        # Sub-task titles are prefixed with ↳
+        assert rows[1].cells[_idx("title")] == "↳ Equations"
+        assert rows[2].cells[_idx("title")] == "↳ Inequalities"
+        # Sub-tasks inherit parent subject and due
+        assert rows[1].cells[_idx("subject")] == "11MAM"
+        # Sub-tasks start undone
+        assert rows[1].cells[_idx("done")] is False
+
+    def test_checkpoint_with_no_id_skipped(self):
+        t = Task(
+            source=Source.COMPASS,
+            source_id="CP2",
+            child="james",
+            subject="11MAM",
+            title="Task",
+            checkpoints=[{"id": None, "name": "Should be skipped"}],
+            url="https://example/cp",
+        )
+        rows = project_tasks_rows([t])
+        assert len(rows) == 1  # only parent; bad checkpoint dropped
 
 
 # --------------------------------------------------------------------------- #
@@ -362,7 +448,6 @@ def _raw_row(task: Task, **overrides: str) -> list[str]:
     column keys.  Date objects are formatted ``dd/MM/yyyy``; booleans become
     ``"TRUE"``/``"FALSE"``; ``None`` becomes ``""``.
     """
-    from homework_hub.pipeline.publish import melbourne_local_date
 
     projected = project_tasks_rows([task])[0]
     cells = list(projected.cells)
@@ -473,7 +558,7 @@ class TestCaptureTasksTabEdits:
 
     def test_due_serial_number_parsed(self):
         # Sheets serial for 2026-05-01 = days since 1899-12-30
-        from datetime import date as _date, timedelta
+        from datetime import date as _date
         serial = (_date(2026, 5, 1) - _date(1899, 12, 30)).days
         t = _task(due_at=None)
         projected = project_tasks_rows([t])
@@ -679,6 +764,64 @@ class TestTaskUid:
         assert task_uid(_task(source=Source.CLASSROOM, source_id="abc")) == "classroom:abc"
 
 
+class TestCheckpointUid:
+    def test_format(self):
+        t = _task(source=Source.COMPASS, source_id="42")
+        assert checkpoint_uid(t, 101) == "compass:42:gi:101"
+
+    def test_different_gi_ids_are_distinct(self):
+        t = _task(source=Source.COMPASS, source_id="42")
+        assert checkpoint_uid(t, 101) != checkpoint_uid(t, 102)
+
+
+class TestParentUidFromCheckpoint:
+    def test_checkpoint_uid_extracts_parent(self):
+        assert parent_uid_from_checkpoint("compass:42:gi:101") == "compass:42"
+
+    def test_regular_uid_returns_none(self):
+        assert parent_uid_from_checkpoint("compass:42") is None
+
+    def test_classroom_checkpoint(self):
+        assert parent_uid_from_checkpoint("classroom:abc:gi:5") == "classroom:abc"
+
+
+class TestPropagateParentDone:
+    def _checkpoint_task(self) -> Task:
+        return Task(
+            source=Source.COMPASS,
+            source_id="CP1",
+            child="james",
+            subject="11MAM",
+            title="Chapter 1 Coursework",
+            checkpoints=[{"id": 101, "name": "Equations"}, {"id": 102, "name": "Inequalities"}],
+            url="https://example/cp",
+        )
+
+    def test_parent_done_propagates_to_sub_tasks(self):
+        rows = project_tasks_rows([self._checkpoint_task()])
+        # Manually tick parent done
+        done_idx = _idx("done")
+        parent_cells = list(rows[0].cells)
+        parent_cells[done_idx] = True
+        rows[0] = type(rows[0])(task_uid=rows[0].task_uid, cells=tuple(parent_cells))
+
+        result = propagate_parent_done(rows)
+        assert result[0].cells[done_idx] is True   # parent stays done
+        assert result[1].cells[done_idx] is True   # sub-task 1 propagated
+        assert result[2].cells[done_idx] is True   # sub-task 2 propagated
+
+    def test_parent_not_done_leaves_sub_tasks_undone(self):
+        rows = project_tasks_rows([self._checkpoint_task()])
+        result = propagate_parent_done(rows)
+        done_idx = _idx("done")
+        assert result[1].cells[done_idx] is False
+        assert result[2].cells[done_idx] is False
+
+    def test_no_checkpoints_returns_unchanged(self):
+        rows = project_tasks_rows([_task()])
+        assert propagate_parent_done(rows) == rows
+
+
 # --------------------------------------------------------------------------- #
 # publish_for_child — integration with a fake sink
 # --------------------------------------------------------------------------- #
@@ -829,7 +972,6 @@ class TestPublishForChild:
         """A priority override in the live Tasks tab is captured and round-tripped."""
         store = _store(tmp_path)
         t = _task()
-        projected = project_tasks_rows([t])
         raw_row = _raw_row(t, priority="Med")
         sink = FakeGoldSink(raw_tab_rows={"Tasks": [raw_row]})
         publish_for_child(
@@ -845,7 +987,6 @@ class TestPublishForChild:
         """Silver Graded locks status — even if the Tasks tab shows something else."""
         store = _store(tmp_path)
         t = _task(status=Status.GRADED)
-        projected = project_tasks_rows([t])
         raw_row = _raw_row(t, status="Not started")
         sink = FakeGoldSink(raw_tab_rows={"Tasks": [raw_row]})
         publish_for_child(

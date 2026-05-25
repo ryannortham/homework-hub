@@ -17,7 +17,7 @@ Pure stdlib ``sqlite3`` — no ORM. The DB lives at ``Settings.state_db``
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS silver_tasks (
     submitted_at TEXT,
     status_raw TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
+    task_type TEXT NOT NULL DEFAULT 'homework',
+    checkpoints_json TEXT NOT NULL DEFAULT '[]',
     url TEXT NOT NULL DEFAULT '',
     bronze_id INTEGER,
     last_synced TEXT NOT NULL,
@@ -169,6 +171,7 @@ class StateStore:
     def _init_schema(self) -> None:
         with closing(self._connect()) as conn, conn:
             conn.executescript(_SCHEMA)
+            _migrate(conn)
 
     # ------------------------------------------------------------------ #
     # auth_status
@@ -297,3 +300,16 @@ class StateStore:
 
 def _parse_opt_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply additive column migrations for databases created before a schema
+    change. Each ALTER TABLE is wrapped in a try/except so the function is
+    idempotent — re-running on an up-to-date DB is a safe no-op."""
+    migrations = [
+        "ALTER TABLE silver_tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'homework'",
+        "ALTER TABLE silver_tasks ADD COLUMN checkpoints_json TEXT NOT NULL DEFAULT '[]'",
+    ]
+    for sql in migrations:
+        with suppress(sqlite3.OperationalError):
+            conn.execute(sql)

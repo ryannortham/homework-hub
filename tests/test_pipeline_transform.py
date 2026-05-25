@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Status, Task
+from homework_hub.models import Status, Task, TaskType
 from homework_hub.pipeline.transform import (
     SilverWriter,
     bronze_to_silver_classroom,
@@ -303,6 +303,56 @@ class TestSilverWriterUpsert:
         writer.upsert_many([(_task(source_id="1", submitted_at=None), None)])
         ts = datetime(2026, 4, 21, 10, 0, 0, tzinfo=UTC)
         result = writer.upsert_many([(_task(source_id="1", submitted_at=ts), None)])
+        assert result.updated == 1
+
+    def test_task_type_persisted(self, writer: SilverWriter, store: StateStore):
+        t = Task(
+            source=SourceEnum.COMPASS,
+            source_id="1",
+            child="james",
+            subject="11BIO",
+            title="SAC 1",
+            task_type=TaskType.ASSESSMENT,
+        )
+        writer.upsert_many([(t, None)])
+        import sqlite3
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT task_type FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val == "assessment"
+
+    def test_checkpoints_json_persisted_and_round_trips(self, writer: SilverWriter):
+        checkpoints = [{"id": 101, "name": "Part A"}, {"id": 102, "name": "Part B"}]
+        t = Task(
+            source=SourceEnum.COMPASS,
+            source_id="1",
+            child="james",
+            subject="11MAM",
+            title="Chapter 1",
+            checkpoints=checkpoints,
+        )
+        writer.upsert_many([(t, None)])
+        tasks = writer.all_for_child("james")
+        assert len(tasks) == 1
+        assert tasks[0].checkpoints == checkpoints
+
+    def test_empty_checkpoints_round_trips(self, writer: SilverWriter):
+        writer.upsert_many([(_task(source_id="1"), None)])
+        tasks = writer.all_for_child("james")
+        assert tasks[0].checkpoints == []
+
+    def test_task_type_change_triggers_update(self, writer: SilverWriter):
+        t1 = Task(
+            source=SourceEnum.COMPASS,
+            source_id="1",
+            child="james",
+            subject="9MATH",
+            title="Task",
+            task_type=TaskType.HOMEWORK,
+        )
+        t2 = t1.model_copy(update={"task_type": TaskType.ASSESSMENT})
+        writer.upsert_many([(t1, None)])
+        result = writer.upsert_many([(t2, None)])
         assert result.updated == 1
 
 

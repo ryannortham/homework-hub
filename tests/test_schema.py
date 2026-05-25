@@ -51,7 +51,8 @@ class TestTabSpec:
 
     def test_column_index(self):
         assert TASKS_TAB.column_index("subject") == 0
-        assert TASKS_TAB.column_index("title") == 1
+        assert TASKS_TAB.column_index("task_type") == 1
+        assert TASKS_TAB.column_index("title") == 2
 
     def test_column_index_missing(self):
         with pytest.raises(KeyError):
@@ -80,11 +81,11 @@ class TestTasksTab:
         col = TASKS_TAB.columns[TASKS_TAB.column_index("days")]
         assert col.kind is ColumnKind.FORMULA
         assert "TODAY()" in col.formula_template
-        # Uses absolute column reference (C = Due column) with {row} substitution
-        # rather than a structured table reference ([@Due]) which the Sheets API
-        # rejects when written programmatically via updateCells.
+        # Uses absolute column reference (E = Due column, after Type+Description insertions)
+        # with {row} substitution rather than a structured table reference ([@Due]) which
+        # the Sheets API rejects when written programmatically via updateCells.
         assert "{row}" in col.formula_template
-        assert "C" in col.formula_template
+        assert "E" in col.formula_template
 
     def test_done_is_checkbox_and_editable(self):
         col = TASKS_TAB.columns[TASKS_TAB.column_index("done")]

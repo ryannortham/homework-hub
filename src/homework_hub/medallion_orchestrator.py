@@ -42,8 +42,8 @@ from homework_hub.pipeline.transform import (
     TransformResult,
     bronze_to_silver_classroom,
     bronze_to_silver_compass,
-    bronze_to_silver_eduperfect,
     bronze_to_silver_edrolo,
+    bronze_to_silver_eduperfect,
 )
 from homework_hub.sources.base import (
     AuthExpiredError,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -28,6 +28,19 @@ class Status(StrEnum):
     OVERDUE = "overdue"
 
 
+class TaskType(StrEnum):
+    """Task category as reported by the upstream LMS.
+
+    Compass exposes three teacher-assigned badge types. All other sources
+    default to ``homework`` — they are assignment/practice platforms with no
+    equivalent type taxonomy.
+    """
+
+    ASSESSMENT = "assessment"
+    HOMEWORK = "homework"
+    GENERAL = "general"
+
+
 class Task(BaseModel):
     """The canonical homework task. Every source maps to this shape."""
 
@@ -42,6 +55,11 @@ class Task(BaseModel):
     submitted_at: datetime | None = None
     status_raw: str = ""
     status: Status = Status.NOT_STARTED
+    task_type: TaskType = TaskType.HOMEWORK
+    # Ordered list of sub-task checkpoints derived from Compass gradingItems
+    # where measureUniqueId == "Checkpoints". Empty for all other sources and
+    # for Compass tasks that have no checkpoint breakdown.
+    checkpoints: list[dict[str, Any]] = Field(default_factory=list)
     url: str = ""
     last_synced: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

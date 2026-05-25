@@ -286,10 +286,11 @@ def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    MSG_ID = [0]
+    msg_id = [0]
 
     def _send(s: socket.socket, cmd: str, params: dict) -> None:
-        mid = MSG_ID[0]; MSG_ID[0] += 1
+        mid = msg_id[0]
+        msg_id[0] += 1
         msg = json.dumps([0, mid, cmd, params])
         s.sendall(f"{len(msg)}:{msg}".encode())
 

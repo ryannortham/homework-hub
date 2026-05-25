@@ -110,6 +110,8 @@ class TestSilverTasks:
             "submitted_at",
             "status_raw",
             "status",
+            "task_type",
+            "checkpoints_json",
             "url",
             "bronze_id",
             "last_synced",

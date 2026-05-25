@@ -150,7 +150,7 @@ class TestSeedRow:
                 continue
             for cell in uc["rows"][0]["values"]:
                 f = cell.get("userEnteredValue", {}).get("formulaValue", "")
-                if "TODAY()" in f and "C2" in f:
+                if "TODAY()" in f and "E2" in f:
                     return
         raise AssertionError("Days formula not seeded on Tasks row 2")
 
@@ -164,8 +164,8 @@ class TestDropdowns:
         reqs = bootstrap_requests()
         # No standalone setDataValidation — every dropdown column is in a Table.
         assert _by_kind(reqs, "setDataValidation") == []
-        # And the Tasks addTable carries 3 DROPDOWN column properties with
-        # ONE_OF_LIST validation rules (Status, Priority, Source).
+        # And the Tasks addTable carries 4 DROPDOWN column properties with
+        # ONE_OF_LIST validation rules (Type, Status, Priority, Source).
         tasks_table = next(
             r["addTable"]["table"] for r in _by_kind(reqs, "addTable")
             if r["addTable"]["table"]["name"] == "tbl_tasks"
@@ -174,7 +174,7 @@ class TestDropdowns:
             c for c in tasks_table["columnProperties"]
             if c.get("columnType") == "DROPDOWN"
         ]
-        assert len(dropdown_cols) == 3
+        assert len(dropdown_cols) == 4
         for c in dropdown_cols:
             cond = c["dataValidationRule"]["condition"]
             assert cond["type"] == "ONE_OF_LIST"

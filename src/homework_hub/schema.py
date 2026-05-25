@@ -139,6 +139,10 @@ STATUS_VALUES: tuple[str, ...] = (
     "Overdue",
 )
 
+# Task type mirrors homework_hub.models.TaskType display labels. Read-only —
+# derived from the upstream LMS badge; kids cannot change it.
+TYPE_VALUES: tuple[str, ...] = ("Assessment", "Homework", "General")
+
 PRIORITY_VALUES: tuple[str, ...] = ("", "Low", "Med", "High")
 
 CONFIRM_DISMISS_VALUES: tuple[str, ...] = ("", "Confirm", "Dismiss")  # unused; we use checkbox
@@ -155,13 +159,22 @@ TASKS_TAB = TabSpec(
     description="All current homework. Kids can edit Due, Status, Priority, Done and Notes.",
     columns=(
         ColumnSpec(key="subject", header="Subject", kind=ColumnKind.TEXT, width_px=120),
-        ColumnSpec(key="title", header="Title", kind=ColumnKind.TEXT, width_px=320),
+        ColumnSpec(
+            key="task_type",
+            header="Type",
+            kind=ColumnKind.DROPDOWN,
+            dropdown_values=TYPE_VALUES,
+            width_px=110,
+        ),
+        ColumnSpec(key="title", header="Title", kind=ColumnKind.TEXT, width_px=260),
+        ColumnSpec(key="description", header="Description", kind=ColumnKind.TEXT, width_px=380),
         ColumnSpec(key="due", header="Due", kind=ColumnKind.DATE, editable=True, width_px=110),
         ColumnSpec(
             key="days",
             header="Days",
             kind=ColumnKind.FORMULA,
-            formula_template="=C{row}-TODAY()",
+            # Due is now column E (index 4) after the Type and Description insertions.
+            formula_template="=E{row}-TODAY()",
             width_px=70,
         ),
         ColumnSpec(
