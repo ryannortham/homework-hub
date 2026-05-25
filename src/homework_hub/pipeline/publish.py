@@ -215,7 +215,7 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
                     subject=t.subject or "",
                     task_type=type_label,
                     title=t.title,
-                    description=t.description,
+                    description="",
                     due=due,
                     status=status_label,
                     done=upstream_done,

@@ -171,7 +171,9 @@ class TestProjectTasksRows:
         rows = project_tasks_rows([t])
         assert rows[0].cells[_idx("task_type")] == "General"
 
-    def test_description_populated(self):
+    def test_description_blank_for_regular_tasks(self):
+        # Description is suppressed for non-checkpoint tasks to avoid noisy
+        # upstream HTML content blowing out row height in the spreadsheet.
         t = Task(
             source=Source.COMPASS,
             source_id="D1",
@@ -182,7 +184,7 @@ class TestProjectTasksRows:
             url="https://example/d",
         )
         rows = project_tasks_rows([t])
-        assert rows[0].cells[_idx("description")] == "Complete questions 1-10."
+        assert rows[0].cells[_idx("description")] == ""
 
     def test_checkpoint_sub_tasks_expanded(self):
         t = Task(
