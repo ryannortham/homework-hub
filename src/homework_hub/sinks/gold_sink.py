@@ -392,17 +392,19 @@ class GspreadGoldSink:
             .get(
                 spreadsheetId=spreadsheet_id,
                 fields=(
+                    "properties(spreadsheetTheme(themeColors(colorType,color(rgbColor)))),"
                     "sheets(properties(sheetId,title),"
                     "tables(tableId),"
                     "bandedRanges(bandedRangeId),"
                     "conditionalFormats,"
-                    "protectedRanges(protectedRangeId,range)),"
-                    "spreadsheetTheme(themeColors(colorType,color(rgbColor)))"
+                    "protectedRanges(protectedRangeId,range))"
                 ),
             )
             .execute()
         )
-        theme_accent = _extract_accent1(resp.get("spreadsheetTheme"))
+        theme_accent = _extract_accent1(
+            (resp.get("properties") or {}).get("spreadsheetTheme")
+        )
         for sheet in resp.get("sheets", []):
             props = sheet.get("properties", {})
             if props.get("title") != DASHBOARD_TAB.name:

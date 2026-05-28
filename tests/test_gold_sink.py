@@ -587,7 +587,7 @@ def _dashboard_meta_response_with_theme(
 ) -> dict:
     out = _dashboard_meta_response(protected_ranges)
     if theme is not None:
-        out["spreadsheetTheme"] = theme
+        out["properties"] = {"spreadsheetTheme": theme}
     return out
 
 
@@ -695,7 +695,7 @@ def test_read_dashboard_meta_requests_spreadsheet_theme_field():
     sink = _make_discovery_sink(_dashboard_meta_response([]))
     sink.read_dashboard_meta("sheet-id")
     fields = sink._discovery.spreadsheets.return_value.get.call_args.kwargs["fields"]
-    assert "spreadsheetTheme(themeColors(colorType,color" in fields
+    assert "properties(spreadsheetTheme(themeColors(colorType,color" in fields
 
 
 def test_read_dashboard_meta_returns_none_when_theme_missing():
