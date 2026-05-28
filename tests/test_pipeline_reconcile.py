@@ -187,6 +187,40 @@ class TestReconcileStale:
         classroom_rows = store.active_silver_for(child="james", source="classroom")
         assert classroom_rows[0]["archived_at"] is None
 
+    def test_workplan_rows_excluded_from_classroom_reconcile(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """Workplan-fetcher rows (``source='classroom'``, ``source_id``
+        starting ``workplan:``) must not be archived by the classroom
+        reconciler — they aren't ingested via the classroom scrape and
+        would otherwise be missing from ``seen_ids`` on every sync."""
+        writer.upsert_many(
+            [
+                (_task(source=SourceEnum.CLASSROOM, source_id="real-card"), None),
+                (
+                    _task(
+                        source=SourceEnum.CLASSROOM,
+                        source_id="workplan:123:456:7a-translations",
+                    ),
+                    None,
+                ),
+            ],
+            now=NOW,
+        )
+        # Run two consecutive reconciles with no seen ids — would normally
+        # archive after grace_syncs=2.
+        reconcile_stale(
+            store, child="james", source="classroom", seen_ids=[], grace_syncs=2, now=NOW
+        )
+        reconcile_stale(
+            store, child="james", source="classroom", seen_ids=[], grace_syncs=2, now=NOW
+        )
+        # The real classroom row is archived; the workplan row is left
+        # alone (no streak bump, no archive flag).
+        rows = {r["source_id"]: r for r in store.active_silver_for(child="james", source="classroom")}
+        assert rows["real-card"]["archived_at"] is not None
+        assert rows["workplan:123:456:7a-translations"]["archived_at"] is None
+
 
 # --------------------------------------------------------------------------- #
 # apply_age_cap

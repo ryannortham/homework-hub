@@ -322,24 +322,34 @@ class StateStore:
         """Increment ``missing_streak`` for every silver row in
         ``(child, source)`` whose ``source_id`` is NOT in ``seen_ids``.
         Returns the list of affected rows with their new streak value so the
-        caller can decide which to archive."""
+        caller can decide which to archive.
+
+        Rows whose ``source_id`` starts with ``workplan:`` are excluded:
+        those rows are written by the workplan fetcher (a separate
+        post-ingest hook) and would otherwise be archived by the regular
+        classroom reconciler because they never appear in classroom's
+        ``seen_ids`` list."""
         with closing(self._connect()) as conn, conn:
             if seen_ids:
                 placeholders = ",".join("?" * len(seen_ids))
                 conn.execute(
                     f"UPDATE silver_tasks SET missing_streak = missing_streak + 1 "
-                    f"WHERE child = ? AND source = ? AND source_id NOT IN ({placeholders})",
+                    f"WHERE child = ? AND source = ? "
+                    f"AND source_id NOT IN ({placeholders}) "
+                    f"AND source_id NOT LIKE 'workplan:%'",
                     (child, source, *seen_ids),
                 )
             else:
                 conn.execute(
                     "UPDATE silver_tasks SET missing_streak = missing_streak + 1 "
-                    "WHERE child = ? AND source = ?",
+                    "WHERE child = ? AND source = ? "
+                    "AND source_id NOT LIKE 'workplan:%'",
                     (child, source),
                 )
             rows = conn.execute(
                 "SELECT source_id, missing_streak, status, archived_at "
-                "FROM silver_tasks WHERE child = ? AND source = ?",
+                "FROM silver_tasks WHERE child = ? AND source = ? "
+                "AND source_id NOT LIKE 'workplan:%'",
                 (child, source),
             ).fetchall()
         return [dict(r) for r in rows]

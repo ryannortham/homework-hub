@@ -420,6 +420,17 @@ class WorkplanFetcher:
             materials = self._scrape_materials(scraper, cfg)
             log.info("workplan[%s]: %d materials under '%s'", child, len(materials), cfg.topic)
 
+            # Empty material list almost always means a flaky scrape (the
+            # topic-toggle DOM is finicky), not that the teacher emptied the
+            # workplan. Refuse to full-replace in that case — bail out and
+            # leave the existing silver rows alone for the next sync to
+            # retry. A genuine empty workplan will need an explicit reset
+            # path (or just disable workplan in children.yaml).
+            if not materials:
+                raise TransientError(
+                    "workplan: scrape returned 0 materials; refusing to wipe persisted rows"
+                )
+
             tasks: list[Task] = []
             questions_total = 0
             ref = (now or datetime.now(UTC)).astimezone(MELBOURNE).date()
