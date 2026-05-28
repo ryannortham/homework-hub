@@ -352,11 +352,24 @@ def zen_cookie_login(
     port: int = DEFAULT_PORT,
     login_timeout: float = 300.0,
     poll_interval: float = 1.0,
+    warmup_urls: list[str] | None = None,
+    extra_cookie_hosts: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Open a new tab in Zen Browser, navigate to *url*, wait for login, return cookies.
 
     *is_logged_in* is called with the current URL on each poll tick; return
     ``True`` when the user has successfully authenticated.
+
+    *warmup_urls*, if provided, is a list of additional URLs the tab is
+    navigated to AFTER login is detected and BEFORE cookies are collected.
+    This forces the browser to complete SSO handshakes for other Google
+    properties (e.g. ``docs.google.com``) so their session cookies are
+    materialised in the cookie store. Each warmup URL is loaded and given a
+    short settle window; non-fatal on individual failure.
+
+    *extra_cookie_hosts*, if provided, expands the set of cookie domains
+    returned beyond the host of *url*. Used together with *warmup_urls* so we
+    can keep cookies for docs.google.com / forms.gle when warming those.
 
     Returns a list of cookie dicts in Playwright ``storage_state`` format::
 
@@ -420,6 +433,18 @@ def zen_cookie_login(
     # Brief settle so all cookies flush.
     time.sleep(2.0)
 
+    # Optional warmup: navigate to additional Google properties so SSO
+    # handshakes complete and their session cookies materialise. Workspace
+    # accounts often only complete SSO on first visit per origin — without
+    # this, ``.google.com`` parent cookies (SID/SAPISID) authenticate
+    # Classroom but Drive/Forms still bounce to accounts.google.com.
+    for warmup in warmup_urls or []:
+        _send(s, "WebDriver:Navigate", {"url": warmup})
+        _recv(s)
+        # Wait for redirects to settle. A warmup failure is non-fatal; we
+        # still want to collect whatever cookies were issued.
+        time.sleep(3.0)
+
     # Collect cookies via the chrome context so we get all cookies from the
     # full Firefox cookie store — including httpOnly and parent-domain cookies
     # (e.g. SID on .google.com) that WebDriver:GetCookies misses because it
@@ -460,15 +485,16 @@ def zen_cookie_login(
     except (IndexError, KeyError, TypeError, json.JSONDecodeError):
         raw_cookies = []
 
-    # Filter to domains relevant to the login URL so we don't return the
-    # entire browser cookie jar.
+    # Filter to domains relevant to the login URL (and any extra hosts the
+    # caller has warmed up) so we don't return the entire browser cookie jar.
     import urllib.parse
 
     login_host = urllib.parse.urlparse(url).hostname or ""
+    allowed_hosts = [login_host, *(extra_cookie_hosts or [])]
 
     def _matches(domain: str) -> bool:
         d = domain.lstrip(".")
-        return login_host == d or login_host.endswith("." + d)
+        return any(host == d or host.endswith("." + d) for host in allowed_hosts if host)
 
     # Normalise to Playwright storage_state cookie format.
     cookies: list[dict[str, Any]] = []

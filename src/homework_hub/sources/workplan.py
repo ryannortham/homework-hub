@@ -301,23 +301,6 @@ def course_id_to_b64(course_id: str) -> str:
     return b64encode(course_id.encode()).decode().rstrip("=")
 
 
-_FORMS_PATH_RE = re.compile(r"^(https?://docs\.google\.com)(/forms/)")
-
-
-def _force_account_zero(url: str) -> str:
-    """Insert ``/u/0`` into a ``docs.google.com/forms/...`` URL.
-
-    Workspace-managed Google accounts require an explicit account-selector
-    prefix on Docs/Forms URLs; without it, ``docs.google.com`` redirects to
-    the account picker even when valid SID/SAPISID cookies are present on
-    ``.google.com``. Returns the URL unchanged if it already contains a
-    ``/u/<n>`` prefix or isn't a ``docs.google.com/forms`` URL.
-    """
-    if "/u/" in url:
-        return url
-    return _FORMS_PATH_RE.sub(r"\1/u/0/forms/", url, count=1)
-
-
 # Extract every workplan topic's materials. Args: topic_text (str).
 # Returns a list of {stream_item_id, title} for materials under the matching
 # topic. Form URL resolution happens separately because it requires per-card
@@ -570,10 +553,6 @@ class WorkplanFetcher:
         # Normalise to the public viewform URL — teachers sometimes share
         # ``usp=publish-editor`` links which require edit auth.
         url = form_url.replace("usp=publish-editor", "usp=sharing")
-        # Workspace-managed sessions need an explicit ``/u/0/`` account
-        # selector or Google bounces ``docs.google.com`` to the account
-        # picker even with valid SID/SAPISID cookies on ``.google.com``.
-        url = _force_account_zero(url)
         page = scraper._context.new_page()
         try:
             try:

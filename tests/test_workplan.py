@@ -23,7 +23,6 @@ from homework_hub.sources.workplan import (
     WorkplanChildConfig,
     WorkplanFetcher,
     _build_task,
-    _force_account_zero,
     _slug,
     course_id_to_b64,
     filter_section_questions,
@@ -134,33 +133,6 @@ class TestSchoolCalendar:
 def test_course_id_to_b64_strips_padding():
     # Spike-verified: 829769119654 -> "ODI5NzY5MTE5NjU0"
     assert course_id_to_b64("829769119654") == "ODI5NzY5MTE5NjU0"
-
-
-# --------------------------------------------------------------------------- #
-# _force_account_zero
-# --------------------------------------------------------------------------- #
-
-
-class TestForceAccountZero:
-    def test_inserts_u0_into_forms_url(self):
-        assert _force_account_zero(
-            "https://docs.google.com/forms/d/e/abc/viewform"
-        ) == "https://docs.google.com/u/0/forms/d/e/abc/viewform"
-
-    def test_preserves_query_string(self):
-        assert _force_account_zero(
-            "https://docs.google.com/forms/d/e/abc/viewform?usp=sharing"
-        ) == "https://docs.google.com/u/0/forms/d/e/abc/viewform?usp=sharing"
-
-    def test_passthrough_when_u_prefix_present(self):
-        url = "https://docs.google.com/u/0/forms/d/e/abc/viewform"
-        assert _force_account_zero(url) == url
-        url2 = "https://docs.google.com/u/1/forms/d/e/abc/viewform"
-        assert _force_account_zero(url2) == url2
-
-    def test_passthrough_for_non_forms_url(self):
-        url = "https://example.com/forms/d/e/abc/viewform"
-        assert _force_account_zero(url) == url
 
 
 # --------------------------------------------------------------------------- #

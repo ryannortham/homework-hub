@@ -454,7 +454,14 @@ def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> Non
     ``auth classroom`` CLI command ensures Zen is launched with Marionette
     before calling this function.
 
-    After login, all cookies are extracted and saved as a Playwright-compatible
+    After classroom login is detected, the tab is briefly navigated to
+    ``docs.google.com`` so the SSO handshake completes for Drive/Forms.
+    Without this warmup, Workspace-managed student accounts can have valid
+    ``.google.com`` SID/SAPISID cookies that authenticate Classroom but
+    still bounce ``docs.google.com`` to ``accounts.google.com``.
+
+    All cookies (for classroom.google.com, .google.com, docs.google.com)
+    are extracted and saved as a Playwright-compatible
     ``storage_state.json`` so the headless scraper can replay the session.
     """
     from homework_hub.zen import zen_cookie_login
@@ -467,6 +474,8 @@ def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> Non
     cookies = zen_cookie_login(
         f"{base_url}/u/0/a/not-turned-in/all",
         _logged_in,
+        warmup_urls=["https://docs.google.com/u/0/"],
+        extra_cookie_hosts=["docs.google.com"],
     )
     ClassroomStorageState({"cookies": cookies, "origins": []}).save(out_path)
 
