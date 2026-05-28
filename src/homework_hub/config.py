@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import yaml
 from pydantic import BaseModel, Field
@@ -33,6 +33,10 @@ class ChildConfig(BaseModel):
     # Compass uses a single parent session covering all children. Per-child
     # numeric userId is captured during onboarding and recorded here.
     compass_user_id: int | None = None
+    # Optional Student Workplan Tracker block. Parsed by
+    # ``homework_hub.sources.workplan.parse_workplan_child_config`` so config
+    # stays decoupled from the workplan module.
+    workplan: dict[str, Any] | None = None
 
 
 class ChildrenConfig(BaseModel):
@@ -80,6 +84,10 @@ class Settings(BaseSettings):
     @property
     def children_yaml(self) -> Path:
         return self.config_dir / "children.yaml"
+
+    @property
+    def school_calendar_yaml(self) -> Path:
+        return self.config_dir / "school_calendar.yaml"
 
     def child_token_path(self, child: str, source: str) -> Path:
         return self.tokens_dir / f"{child}-{source}.json"

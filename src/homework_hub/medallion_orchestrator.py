@@ -28,6 +28,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from homework_hub.config import ChildrenConfig, Settings
 from homework_hub.models import Source as SourceEnum
@@ -52,6 +53,9 @@ from homework_hub.sources.base import (
     TransientError,
 )
 from homework_hub.state.store import StateStore
+
+if TYPE_CHECKING:
+    from homework_hub.sources.workplan import WorkplanFetcher
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +155,7 @@ class MedallionOrchestrator:
         stale_grace_syncs: int = 2,
         future_date_cap_days: int = 365,
         settings: Settings | None = None,
+        workplan_fetcher: WorkplanFetcher | None = None,
     ):
         self.children_config = children_config
         self.sources_for_child = sources_for_child
@@ -171,6 +176,10 @@ class MedallionOrchestrator:
         )
         self._bronze = BronzeWriter(state)
         self._silver = SilverWriter(state)
+        # Optional Student Workplan Tracker fetcher — runs after transform so
+        # its rows survive the bronze-replay reset; failures are isolated by
+        # the orchestrator hook below.
+        self._workplan_fetcher = workplan_fetcher
         # Per-run scratchpad mapping ``source.name -> list[silver_source_id]``
         # for the currently-running child. Populated by ``_ingest_one`` on
         # successful ingest; consumed by ``_run_for_child`` to drive
@@ -262,6 +271,14 @@ class MedallionOrchestrator:
             )
         except Exception:
             log.exception("apply_age_cap failed for %s", child)
+        # Workplan hook — fetches Student Workplan Tracker Forms and writes
+        # directly to silver. Wrapped so any failure stays isolated from the
+        # regular sync stages.
+        if self._workplan_fetcher is not None:
+            try:
+                self._workplan_fetcher.fetch_one_child(child)
+            except Exception:
+                log.exception("workplan fetch failed for %s", child)
         report.publish = self._stage_publish(child)
         return report
 

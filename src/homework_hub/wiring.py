@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homework_hub.config import ChildrenConfig, Settings
 from homework_hub.medallion_orchestrator import MedallionOrchestrator
@@ -28,6 +28,9 @@ from homework_hub.sinks.sheets_client import (
 )
 from homework_hub.sources.base import Source
 from homework_hub.state.store import StateStore
+
+if TYPE_CHECKING:
+    from homework_hub.sources.workplan import WorkplanFetcher
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ def build_medallion_orchestrator(
     state = StateStore(settings.state_db)
     if sink is None:
         sink = _try_build_gold_sink(bw)
+    workplan_fetcher = _try_build_workplan_fetcher(settings, children_config, state)
     return MedallionOrchestrator(
         children_config=children_config,
         sources_for_child=sources_for_child,
@@ -59,6 +63,54 @@ def build_medallion_orchestrator(
         sink=sink,
         history_cutoff_days=settings.history_cutoff_days,
         settings=settings,
+        workplan_fetcher=workplan_fetcher,
+    )
+
+
+def _try_build_workplan_fetcher(
+    settings: Settings,
+    cfg: ChildrenConfig,
+    state: StateStore,
+) -> WorkplanFetcher | None:
+    """Build a :class:`WorkplanFetcher` if any child enables ``workplan``.
+
+    Returns ``None`` (and logs) if no child has the block, the school
+    calendar YAML is missing, or any config parses fails. Designed so the
+    entire feature is opt-in and a configuration error never blocks the
+    regular sync.
+    """
+    from homework_hub.sources.workplan import (
+        SchoolCalendar,
+        WorkplanFetcher,
+        parse_workplan_child_config,
+    )
+
+    per_child: dict[str, tuple[Path, Any]] = {}
+    for child, child_cfg in cfg.children.items():
+        parsed = parse_workplan_child_config(child_cfg.workplan)
+        if parsed is None:
+            continue
+        token_path = settings.child_token_path(child, "classroom")
+        per_child[child] = (token_path, parsed)
+
+    if not per_child:
+        return None
+
+    try:
+        calendar = SchoolCalendar.load(settings.school_calendar_yaml)
+    except FileNotFoundError as exc:
+        log.warning("Workplan disabled: %s", exc)
+        return None
+
+    from homework_hub.pipeline.transform import SilverWriter
+
+    silver = SilverWriter(state)
+    log.info("Workplan fetcher enabled for: %s", ", ".join(sorted(per_child)))
+    return WorkplanFetcher(
+        store=state,
+        silver=silver,
+        calendar=calendar,
+        per_child=per_child,
     )
 
 

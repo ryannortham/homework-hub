@@ -1,0 +1,27 @@
+# Victorian government school term + semester dates.
+# Source: vic.gov.au/school-term-dates-and-holidays-victoria
+# Committed at build time so runtime sync is offline-stable.
+#
+# Workplan task ``due_at`` is set to the end of the semester containing
+# the sync date (Melbourne local end-of-day).
+
+years:
+  2026:
+    terms:
+      T1: {start: 2026-01-28, end: 2026-04-02}
+      T2: {start: 2026-04-20, end: 2026-06-26}
+      T3: {start: 2026-07-13, end: 2026-09-18}
+      T4: {start: 2026-10-05, end: 2026-12-18}
+    semesters:
+      S1: {start: 2026-01-28, end: 2026-06-26}
+      S2: {start: 2026-07-13, end: 2026-12-18}
+
+  2027:
+    terms:
+      T1: {start: 2027-01-28, end: 2027-03-25}
+      T2: {start: 2027-04-12, end: 2027-06-25}
+      T3: {start: 2027-07-12, end: 2027-09-17}
+      T4: {start: 2027-10-04, end: 2027-12-17}
+    semesters:
+      S1: {start: 2027-01-28, end: 2027-06-25}
+      S2: {start: 2027-07-12, end: 2027-12-17}
