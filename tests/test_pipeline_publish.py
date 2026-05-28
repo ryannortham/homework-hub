@@ -519,11 +519,26 @@ class TestFilterSupersededEdits:
         edits = [UserEdit("compass:T1", "status", "Not started", "now")]
         assert filter_superseded_edits(edits, [t]) == []
 
-    def test_status_edit_kept_when_submitted(self):
-        # Submitted does NOT lock — kid can revert.
+    def test_status_edit_dropped_when_submitted(self):
+        # Submitted is terminal — the source system is authoritative on
+        # completion, so a kid downgrade ("Not started" / "In progress")
+        # is dropped. Without this lock, the diff layer would re-emit
+        # the override forever (the edit's original_value matches the
+        # current Submitted state, so drift detection can't fire).
         t = _task(status=Status.SUBMITTED)
         edits = [UserEdit("compass:T1", "status", "Not started", "now")]
-        assert filter_superseded_edits(edits, [t]) == edits
+        assert filter_superseded_edits(edits, [t]) == []
+
+    def test_status_archive_edit_survives_terminal_lock(self):
+        # The terminal-status lock has one exception: a kid setting
+        # ``Archived`` is always allowed through, so apply_archive_edits
+        # downstream can shelve Submitted/Graded/Overdue work.
+        for terminal in (Status.SUBMITTED, Status.GRADED, Status.OVERDUE):
+            t = _task(status=terminal)
+            edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+            assert filter_superseded_edits(edits, [t]) == edits, (
+                f"Archive edit must survive when silver={terminal}"
+            )
 
     def test_status_edit_kept_when_not_started(self):
         t = _task(status=Status.NOT_STARTED)
@@ -989,9 +1004,12 @@ class TestApplyArchiveEdits:
         assert result == [t] or result[0].status == Status.ARCHIVED
 
     def test_terminal_status_not_archived_by_kid(self, tmp_path: Path):
-        """Graded / Overdue silver states cannot be archived via the sheet —
-        filter_superseded_edits drops the edit before apply_archive_edits
-        sees it, and apply_archive_edits also self-guards as defence in depth."""
+        """Graded / Overdue silver states cannot be archived via the sheet.
+        ``filter_superseded_edits`` now lets the ``Archived`` edit through
+        (so Submitted rows can be shelved), but ``apply_archive_edits``
+        self-guards against Graded / Overdue as defence in depth — those
+        are machine-derived terminal states the kid shouldn't be able to
+        bury."""
         from homework_hub.pipeline.transform import SilverWriter
 
         store = _store(tmp_path)

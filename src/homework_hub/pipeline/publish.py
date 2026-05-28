@@ -783,16 +783,21 @@ def filter_superseded_edits(
     """Drop kid overrides that silver's current state has superseded.
 
     Precedence rules:
-    - ``status`` — silver ``Graded`` or ``Overdue`` locks the status column;
-      kid cannot override these terminal states. Kids CAN set ``Archived``
-      via the sheet (handled by :func:`apply_archive_edits`) and can also
-      edit ``Archived`` → anything else to un-archive a task (handled by
-      :func:`apply_unarchive_edits`).
+    - ``status`` — silver ``Graded``, ``Overdue`` or ``Submitted`` locks
+      the status column against kid *downgrades*: the source system is
+      the authority on whether a task is done / past-due, and a kid
+      edit that pulls the row back to ``Not started`` / ``In progress``
+      would otherwise stick forever (the original_value on the edit
+      matches the source's current Submitted state, so the diff layer
+      can't detect drift). Kids CAN still set ``Archived`` from any
+      state — handled by :func:`apply_archive_edits` — and can also
+      edit ``Archived`` → anything else to un-archive a task (handled
+      by :func:`apply_unarchive_edits`).
     - ``due``    — kid always wins; they may set or override any due date.
     - ``notes`` — kid always wins; no silver equivalent.
     """
     task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
-    _terminal_status = {Status.GRADED, Status.OVERDUE}
+    _terminal_status = {Status.GRADED, Status.OVERDUE, Status.SUBMITTED}
 
     out: list[UserEdit] = []
     for edit in edits:
@@ -802,12 +807,18 @@ def filter_superseded_edits(
             out.append(edit)
             continue
 
-        # Status column has one terminal-state lock: silver Graded / Overdue
-        # supersede any kid edit. Kid-driven Archive IS allowed — handled by
-        # apply_archive_edits which writes the archive flags through to
-        # silver so the row stays archived across syncs and partitions to
-        # History.
-        if edit.column == "status" and task.status in _terminal_status:
+        # Status column has a terminal-state lock against downgrades:
+        # silver Graded / Overdue / Submitted supersede any kid edit
+        # EXCEPT a move to ``Archived`` (kids may always shelve work
+        # they consider done). Kid-driven Archive is handled by
+        # apply_archive_edits which writes the archive flags through
+        # to silver so the row stays archived across syncs and
+        # partitions to History.
+        if (
+            edit.column == "status"
+            and task.status in _terminal_status
+            and str(edit.value).strip().lower() != "archived"
+        ):
             continue
 
         out.append(edit)
