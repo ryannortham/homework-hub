@@ -396,11 +396,13 @@ class GspreadGoldSink:
                     "tables(tableId),"
                     "bandedRanges(bandedRangeId),"
                     "conditionalFormats,"
-                    "protectedRanges(protectedRangeId,range))"
+                    "protectedRanges(protectedRangeId,range)),"
+                    "spreadsheetTheme(themeColors(colorType,color(rgbColor)))"
                 ),
             )
             .execute()
         )
+        theme_accent = _extract_accent1(resp.get("spreadsheetTheme"))
         for sheet in resp.get("sheets", []):
             props = sheet.get("properties", {})
             if props.get("title") != DASHBOARD_TAB.name:
@@ -433,6 +435,7 @@ class GspreadGoldSink:
                 ],
                 conditional_format_rule_count=len(cf_rules),
                 protected_range_ids=whole_sheet_ids,
+                theme_accent=theme_accent,
             )
         raise GoldSinkError(f"Dashboard tab {DASHBOARD_TAB.name!r} not found in {spreadsheet_id}")
 
@@ -577,6 +580,32 @@ def _col_letter(n: int) -> str:
         n, rem = divmod(n - 1, 26)
         letters = chr(ord("A") + rem) + letters
     return letters
+
+
+def _extract_accent1(theme: dict[str, Any] | None) -> dict[str, float] | None:
+    """Return the spreadsheet theme's ACCENT1 colour as an
+    ``{"red","green","blue"}`` float dict, or ``None`` if unreadable.
+
+    Sheets omits channel keys whose value is ``0.0``; callers must
+    therefore default missing channels to zero. We do that here so
+    consumers get a fully-populated dict.
+    """
+    if not isinstance(theme, dict):
+        return None
+    for entry in theme.get("themeColors", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("colorType") != "ACCENT1":
+            continue
+        rgb = (entry.get("color") or {}).get("rgbColor") or {}
+        if not isinstance(rgb, dict):
+            return None
+        return {
+            "red": float(rgb.get("red", 0.0)),
+            "green": float(rgb.get("green", 0.0)),
+            "blue": float(rgb.get("blue", 0.0)),
+        }
+    return None
 
 
 __all__ = ["GoldSinkError", "GspreadGoldSink"]

@@ -82,14 +82,43 @@ _EXCLUDE_FROM_PENDING: frozenset[str] = frozenset({"Submitted", "Graded", "Archi
 # Done(7d) window — must mirror the tile formula in sheet_template.
 _DONE_WINDOW_DAYS = 7
 
-# Header colour for every Dashboard Table — a sage green that matches the
-# user's chosen palette. Applied via ``Table.rowsProperties.headerColorStyle``
-# in the same ``updateTable`` request that sets ``columnProperties``.
-_TABLE_HEADER_COLOR: dict[str, float] = {
+# Header colour for every Sheets-Table on the spreadsheet (Dashboard +
+# Tasks + History + UserEdits + Settings). Resolved at publish time from
+# the spreadsheet's theme ACCENT1 colour (see
+# :func:`_resolve_header_color`); this constant is the fallback used when
+# the theme isn't readable.
+_DEFAULT_HEADER_COLOR: dict[str, float] = {
     "red": 111 / 255,
     "green": 164 / 255,
     "blue": 140 / 255,
 }
+
+# White-mix fraction used to derive the Dashboard's banded ``secondBandColor``
+# from the resolved header colour. 0.92 → 92% white + 8% accent: a subtle
+# stripe that takes on the theme hue without overpowering content.
+_BANDING_WHITE_MIX = 0.92
+
+
+def _resolve_header_color(theme_accent: dict[str, float] | None) -> dict[str, float]:
+    """Return the resolved header colour for every Sheets-Table.
+
+    Falls back to :data:`_DEFAULT_HEADER_COLOR` when the spreadsheet
+    has no readable theme, so sheets without ``spreadsheetTheme``
+    render identically to the pre-theming code path.
+    """
+    return theme_accent if theme_accent else _DEFAULT_HEADER_COLOR
+
+
+def _tint(accent: dict[str, float], white_mix: float = _BANDING_WHITE_MIX) -> dict[str, float]:
+    """Mix ``accent`` with white. ``white_mix=0.92`` → 92% white + 8% accent.
+
+    Missing channels default to ``0.0`` (Sheets omits zero-valued channels
+    in API responses).
+    """
+    return {
+        c: white_mix + (1 - white_mix) * accent.get(c, 0.0)
+        for c in ("red", "green", "blue")
+    }
 
 # --------------------------------------------------------------------------- #
 # Layout constants (shared with sheet_template's frame)
@@ -323,6 +352,7 @@ def build_requests(
     existing_table_ids: list[str] | None = None,
     existing_banded_range_ids: list[int] | None = None,
     existing_conditional_format_rule_count: int = 0,
+    theme_accent: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the per-publish Dashboard lists region as a single batchUpdate body.
 
@@ -332,6 +362,14 @@ def build_requests(
     grid resize — Sheets validates ``addTable`` ranges against the
     pre-batch grid size and rejects with an opaque HTTP 500 if the grid
     was grown in the same call.
+
+    ``theme_accent`` is the spreadsheet's ACCENT1 colour resolved to an
+    ``{"red","green","blue"}`` float dict (0..1). When provided, every
+    Sheets-Table header chip on the spreadsheet — Dashboard's four
+    section Tables AND the non-Dashboard tabs (Tasks/History/UserEdits/
+    Settings) — is painted with this colour so the whole sheet tracks
+    the kid's chosen ``Format → Theme``. Falls back to a hard-coded
+    sage green when ``None``.
 
     Order of emitted requests:
 
@@ -343,6 +381,9 @@ def build_requests(
     6. Per section: header write, data write, ``addTable``, per-status CF rule,
        header cell formatting.
     7. Footer: formula write + merge + format.
+    8. ``updateTable`` per non-Dashboard Sheets-Table to repaint its
+       header chip (so theme changes propagate without re-bootstrapping
+       the template).
     """
     sections = _compute_section_layouts(tasks, today)
     last_data_row = sections[-1].data_end_row
@@ -366,8 +407,11 @@ def build_requests(
         )
     )
     for section, section_tasks in zip(sections, _sectioned_tasks(tasks, today), strict=True):
-        requests.extend(_section_requests(dash_sheet_id, section, section_tasks))
+        requests.extend(
+            _section_requests(dash_sheet_id, section, section_tasks, theme_accent=theme_accent)
+        )
     requests.extend(_footer_requests(dash_sheet_id, footer_row))
+    requests.extend(_repaint_non_dashboard_table_headers(theme_accent))
     return requests
 
 
@@ -571,6 +615,8 @@ def _section_requests(
     dash_sheet_id: int,
     section: SectionLayout,
     section_tasks: list[DashboardTask],
+    *,
+    theme_accent: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Emit per-section requests in an order Sheets won't 500 on.
 
@@ -592,7 +638,7 @@ def _section_requests(
     out.append(_write_header_row(dash_sheet_id, section))
     out.append(_write_data_rows(dash_sheet_id, section, section_tasks))
     out.append(_add_table_request(dash_sheet_id, section))
-    out.append(_update_table_columns_request(section))
+    out.append(_update_table_columns_request(section, theme_accent=theme_accent))
     out.extend(_header_format_request(dash_sheet_id, section))
     return out
 
@@ -672,12 +718,20 @@ def _add_table_request(dash_sheet_id: int, section: SectionLayout) -> dict[str, 
     }
 
 
-def _add_banding_request(dash_sheet_id: int, section: SectionLayout) -> dict[str, Any]:
+def _add_banding_request(
+    dash_sheet_id: int,
+    section: SectionLayout,
+    theme_accent: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Alternating-row banding for the section data rows.
 
-    Uses muted RGB tints — the ``BandingProperties`` colour fields don't
-    yet accept ``colorStyle`` so we cannot use theme colours here.
+    ``BandingProperties`` colour fields don't accept ``colorStyle``, so
+    we can't reference theme colours symbolically. Instead we resolve
+    ACCENT1 at publish time and derive ``secondBandColor`` as a
+    :func:`_tint` of it — the stripe takes on the kid's theme hue
+    while staying subtle.
     """
+    accent = _resolve_header_color(theme_accent)
     return {
         "addBanding": {
             "bandedRange": {
@@ -690,18 +744,17 @@ def _add_banding_request(dash_sheet_id: int, section: SectionLayout) -> dict[str
                 },
                 "rowProperties": {
                     "firstBandColor": {"red": 1, "green": 1, "blue": 1},
-                    "secondBandColor": {
-                        "red": 0.96,
-                        "green": 0.97,
-                        "blue": 0.98,
-                    },
+                    "secondBandColor": _tint(accent),
                 },
             }
         }
     }
 
 
-def _update_table_columns_request(section: SectionLayout) -> dict[str, Any]:
+def _update_table_columns_request(
+    section: SectionLayout,
+    theme_accent: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Set ``columnProperties`` + ``rowsProperties.headerColorStyle`` on the
     just-added Table via ``updateTable``.
 
@@ -712,9 +765,10 @@ def _update_table_columns_request(section: SectionLayout) -> dict[str, Any]:
     than the bare-text + tiny caret you get from a standalone
     ``setDataValidation`` rule.
 
-    Also paints the Table's header chip with :data:`_TABLE_HEADER_COLOR`
-    — the same sage green for every section so the lists region reads as
-    a cohesive group. Band colours are left at the Sheets defaults.
+    Also paints the Table's header chip with the resolved theme accent
+    (see :func:`_resolve_header_color`) so the lists region reads as a
+    cohesive group that tracks the kid's chosen ``Format → Theme``.
+    Band colours are left at the Sheets defaults.
 
     Why ``updateTable`` and not ``addTable`` with these fields inline?
     See :func:`_add_table_request` — inline columnProperties 500s when
@@ -755,7 +809,7 @@ def _update_table_columns_request(section: SectionLayout) -> dict[str, Any]:
                     },
                 ],
                 "rowsProperties": {
-                    "headerColorStyle": {"rgbColor": _TABLE_HEADER_COLOR},
+                    "headerColorStyle": {"rgbColor": _resolve_header_color(theme_accent)},
                 },
             },
             "fields": "columnProperties,rowsProperties.headerColorStyle",
@@ -934,6 +988,52 @@ __all__ = [
     "filter_week",
     "task_rows_to_dashboard_tasks",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Non-Dashboard table header repaint
+# --------------------------------------------------------------------------- #
+
+
+def _repaint_non_dashboard_table_headers(
+    theme_accent: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    """Emit one ``updateTable`` per non-Dashboard Sheets-Table to repaint
+    its header chip.
+
+    The Tasks/History/UserEdits/Settings Tables are created once at
+    template bootstrap without a custom ``headerColorStyle``, so they
+    default to Sheets' built-in Table chrome — which doesn't track the
+    spreadsheet's theme. To make the whole sheet follow the kid's
+    ``Format → Theme``, we repaint these headers on every publish.
+
+    Fields mask is ``rowsProperties.headerColorStyle`` only — does not
+    disturb ``columnProperties``, the Table ``range``, or implicit
+    banding.
+
+    Schema is imported lazily to avoid the
+    ``pipeline.publish → dashboard_layout → sheet_template`` circular
+    import otherwise triggered at module load.
+    """
+    from homework_hub.schema import DASHBOARD_TAB, SCHEMA
+
+    color = _resolve_header_color(theme_accent)
+    out: list[dict[str, Any]] = []
+    for tab in SCHEMA.tabs:
+        if not tab.table_id or tab.name == DASHBOARD_TAB.name:
+            continue
+        out.append(
+            {
+                "updateTable": {
+                    "table": {
+                        "tableId": tab.table_id,
+                        "rowsProperties": {"headerColorStyle": {"rgbColor": color}},
+                    },
+                    "fields": "rowsProperties.headerColorStyle",
+                }
+            }
+        )
+    return out
 
 
 # --------------------------------------------------------------------------- #

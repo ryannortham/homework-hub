@@ -1261,3 +1261,75 @@ class TestPublishDashboardProtection:
         )
         assert result.tasks_written == 1
         assert "Tasks" in sink.writes
+
+
+class TestPublishDashboardThemeAccent:
+    """v5.2: publish reads ``DashboardMeta.theme_accent`` and threads it
+    into the layout builder so every Sheets-Table header chip on the
+    spreadsheet — Dashboard + Tasks + History + UserEdits + Settings —
+    tracks the kid's chosen ``Format → Theme``."""
+
+    def test_theme_accent_threaded_into_section_table_headers(self, tmp_path: Path):
+        store = _store(tmp_path)
+        accent = {"red": 0.2, "green": 0.4, "blue": 0.8}
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+            theme_accent=accent,
+        )
+        sink = FakeGoldSink(dashboard_meta=meta)
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
+        reqs = sink.dashboard_requests[0]
+        section_updates = [
+            r
+            for r in reqs
+            if "updateTable" in r and "columnProperties" in r["updateTable"]["table"]
+        ]
+        assert section_updates  # at least one section
+        for r in section_updates:
+            rgb = r["updateTable"]["table"]["rowsProperties"]["headerColorStyle"]["rgbColor"]
+            assert rgb == accent
+
+    def test_repaint_requests_present_for_non_dashboard_tables(self, tmp_path: Path):
+        from homework_hub.schema import DASHBOARD_TAB, SCHEMA
+
+        store = _store(tmp_path)
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+            theme_accent={"red": 0.2, "green": 0.4, "blue": 0.8},
+        )
+        sink = FakeGoldSink(dashboard_meta=meta)
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
+        reqs = sink.dashboard_requests[0]
+        repaints = [
+            r
+            for r in reqs
+            if "updateTable" in r
+            and "columnProperties" not in r["updateTable"]["table"]
+        ]
+        expected = {
+            tab.table_id
+            for tab in SCHEMA.tabs
+            if tab.table_id and tab.name != DASHBOARD_TAB.name
+        }
+        seen = {r["updateTable"]["table"]["tableId"] for r in repaints}
+        assert seen == expected

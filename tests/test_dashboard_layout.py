@@ -297,7 +297,14 @@ class TestStatusColumn:
         floating charts — ``updateTable`` against an already-registered
         table sidesteps the poison."""
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
-        updates = _by_kind(reqs, "updateTable")
+        # Filter to the section ``updateTable`` requests (the ones that
+        # set columnProperties). The header-only repaint ``updateTable``s
+        # for the non-Dashboard tabs are tested separately.
+        updates = [
+            u
+            for u in _by_kind(reqs, "updateTable")
+            if "columnProperties" in u["updateTable"]["table"]
+        ]
         assert len(updates) == 4  # one per section
         for u in updates:
             cols = u["updateTable"]["table"]["columnProperties"]
@@ -333,29 +340,51 @@ class TestStatusColumn:
 
 
 class TestTableHeaderColour:
-    """All four Dashboard Tables share a sage-green header chip —
-    RGB(111, 164, 140) — applied via the same ``updateTable`` request
-    that sets ``columnProperties``. The colour rides on
-    ``Table.rowsProperties.headerColorStyle`` with a ``fields`` mask
-    extension; band colours are left at Sheets defaults."""
+    """Every Sheets-Table header chip — Dashboard's four sections AND
+    the non-Dashboard tabs (Tasks/History/UserEdits/Settings) — is
+    painted with the resolved theme accent so the whole sheet tracks
+    the kid's chosen ``Format → Theme``. When no theme is supplied
+    publish falls back to a sage default."""
 
-    def test_all_tables_use_target_header_color(self):
+    def test_all_section_tables_use_default_header_color_without_theme(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
-        updates = _by_kind(reqs, "updateTable")
-        assert len(updates) == 4
+        section_updates = [
+            u
+            for u in _by_kind(reqs, "updateTable")
+            if "columnProperties" in u["updateTable"]["table"]
+        ]
+        assert len(section_updates) == 4
         target = {"red": 111 / 255, "green": 164 / 255, "blue": 140 / 255}
-        for u in updates:
+        for u in section_updates:
             rows_props = u["updateTable"]["table"]["rowsProperties"]
             rgb = rows_props["headerColorStyle"]["rgbColor"]
             for chan, expected in target.items():
                 assert rgb[chan] == pytest.approx(expected, rel=1e-6)
 
+    def test_section_tables_use_theme_accent_when_supplied(self):
+        accent = {"red": 0.2, "green": 0.4, "blue": 0.8}
+        reqs = build_requests(
+            dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY, theme_accent=accent
+        )
+        section_updates = [
+            u
+            for u in _by_kind(reqs, "updateTable")
+            if "columnProperties" in u["updateTable"]["table"]
+        ]
+        assert len(section_updates) == 4
+        for u in section_updates:
+            rgb = u["updateTable"]["table"]["rowsProperties"]["headerColorStyle"]["rgbColor"]
+            assert rgb == accent
+
     def test_update_table_fields_mask_covers_columns_and_header_colour(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
         for u in _by_kind(reqs, "updateTable"):
             mask = u["updateTable"]["fields"]
-            assert "columnProperties" in mask
+            # Every updateTable touches headerColorStyle; the section
+            # ones additionally carry columnProperties.
             assert "rowsProperties.headerColorStyle" in mask
+            if "columnProperties" in u["updateTable"]["table"]:
+                assert "columnProperties" in mask
 
 
 # --------------------------------------------------------------------------- #
@@ -516,3 +545,91 @@ class TestProtectDashboardRequest:
         # The description surfaces in Sheets' lock toast. Lock it so
         # accidental wording drift gets caught.
         assert pr["description"] == "Auto-generated — edit on Tasks tab"
+
+
+# --------------------------------------------------------------------------- #
+# Theme-aware colour helpers + non-Dashboard table repaint
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveAndTint:
+    """``_resolve_header_color`` falls back when no theme is supplied;
+    ``_tint`` mixes ``white_mix`` fraction of pure white with the accent."""
+
+    def test_resolve_returns_default_when_no_theme(self):
+        from homework_hub.dashboard_layout import _DEFAULT_HEADER_COLOR, _resolve_header_color
+
+        assert _resolve_header_color(None) == _DEFAULT_HEADER_COLOR
+
+    def test_resolve_returns_input_when_theme_present(self):
+        from homework_hub.dashboard_layout import _resolve_header_color
+
+        accent = {"red": 0.1, "green": 0.5, "blue": 0.9}
+        assert _resolve_header_color(accent) == accent
+
+    def test_tint_known_red_accent(self):
+        from homework_hub.dashboard_layout import _tint
+
+        # Pure red, 92% white → red stays 1.0, green/blue rise to 0.92.
+        out = _tint({"red": 1.0, "green": 0.0, "blue": 0.0}, white_mix=0.92)
+        assert out["red"] == pytest.approx(1.0)
+        assert out["green"] == pytest.approx(0.92)
+        assert out["blue"] == pytest.approx(0.92)
+
+    def test_tint_missing_channels_default_to_zero(self):
+        from homework_hub.dashboard_layout import _tint
+
+        # All channels omitted → output is pure white_mix everywhere.
+        out = _tint({}, white_mix=0.92)
+        assert out == {"red": 0.92, "green": 0.92, "blue": 0.92}
+
+
+class TestRepaintNonDashboardTableHeaders:
+    """``build_requests`` appends one ``updateTable`` per non-Dashboard
+    Sheets-Table (Tasks/History/UserEdits/Settings) so theme changes
+    propagate to every tab on every publish."""
+
+    def _repaint_requests(self, reqs: list[dict]) -> list[dict]:
+        return [
+            u
+            for u in reqs
+            if "updateTable" in u
+            and "columnProperties" not in u["updateTable"]["table"]
+        ]
+
+    def test_emits_one_per_non_dashboard_table(self):
+        from homework_hub.schema import DASHBOARD_TAB, SCHEMA
+
+        reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
+        repaints = self._repaint_requests(reqs)
+        expected_table_ids = {
+            tab.table_id
+            for tab in SCHEMA.tabs
+            if tab.table_id and tab.name != DASHBOARD_TAB.name
+        }
+        seen = {u["updateTable"]["table"]["tableId"] for u in repaints}
+        assert seen == expected_table_ids
+
+    def test_fields_mask_only_header_colour(self):
+        reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
+        for u in self._repaint_requests(reqs):
+            assert u["updateTable"]["fields"] == "rowsProperties.headerColorStyle"
+
+    def test_uses_theme_accent_when_supplied(self):
+        accent = {"red": 0.2, "green": 0.4, "blue": 0.8}
+        reqs = build_requests(
+            dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY, theme_accent=accent
+        )
+        for u in self._repaint_requests(reqs):
+            rgb = u["updateTable"]["table"]["rowsProperties"]["headerColorStyle"]["rgbColor"]
+            assert rgb == accent
+
+    def test_falls_back_to_default_without_theme(self):
+        from homework_hub.dashboard_layout import _DEFAULT_HEADER_COLOR
+
+        reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
+        repaints = self._repaint_requests(reqs)
+        assert repaints, "expected at least one repaint request"
+        for u in repaints:
+            rgb = u["updateTable"]["table"]["rowsProperties"]["headerColorStyle"]["rgbColor"]
+            assert rgb == _DEFAULT_HEADER_COLOR

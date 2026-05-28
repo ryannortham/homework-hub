@@ -581,6 +581,16 @@ def _dashboard_meta_response(protected_ranges: list[dict]) -> dict:
     }
 
 
+def _dashboard_meta_response_with_theme(
+    protected_ranges: list[dict],
+    theme: dict | None,
+) -> dict:
+    out = _dashboard_meta_response(protected_ranges)
+    if theme is not None:
+        out["spreadsheetTheme"] = theme
+    return out
+
+
 def _make_discovery_sink(get_response: dict) -> GspreadGoldSink:
     sink = GspreadGoldSink(credentials=MagicMock())
     discovery = MagicMock()
@@ -674,3 +684,62 @@ def test_write_dashboard_protection_issues_single_batchupdate():
     assert pr["range"] == {"sheetId": 42}
     assert pr["warningOnly"] is False
     assert pr["editors"] == {"users": ["bot@svc.iam.gserviceaccount.com"]}
+
+
+# --------------------------------------------------------------------------- #
+# spreadsheetTheme → DashboardMeta.theme_accent
+# --------------------------------------------------------------------------- #
+
+
+def test_read_dashboard_meta_requests_spreadsheet_theme_field():
+    sink = _make_discovery_sink(_dashboard_meta_response([]))
+    sink.read_dashboard_meta("sheet-id")
+    fields = sink._discovery.spreadsheets.return_value.get.call_args.kwargs["fields"]
+    assert "spreadsheetTheme(themeColors(colorType,color" in fields
+
+
+def test_read_dashboard_meta_returns_none_when_theme_missing():
+    sink = _make_discovery_sink(_dashboard_meta_response_with_theme([], theme=None))
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert meta.theme_accent is None
+
+
+def test_read_dashboard_meta_parses_accent1_rgb():
+    theme = {
+        "themeColors": [
+            {"colorType": "TEXT", "color": {"rgbColor": {"red": 0.0}}},
+            {
+                "colorType": "ACCENT1",
+                "color": {"rgbColor": {"red": 0.25, "green": 0.5, "blue": 0.75}},
+            },
+            {"colorType": "ACCENT2", "color": {"rgbColor": {"red": 0.9}}},
+        ]
+    }
+    sink = _make_discovery_sink(_dashboard_meta_response_with_theme([], theme))
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert meta.theme_accent == {"red": 0.25, "green": 0.5, "blue": 0.75}
+
+
+def test_read_dashboard_meta_defaults_missing_channels_to_zero():
+    """Sheets omits zero-valued channels in API responses — caller must
+    default them so consumers always see a fully-populated dict."""
+    theme = {
+        "themeColors": [
+            {"colorType": "ACCENT1", "color": {"rgbColor": {"red": 0.5}}},
+        ]
+    }
+    sink = _make_discovery_sink(_dashboard_meta_response_with_theme([], theme))
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert meta.theme_accent == {"red": 0.5, "green": 0.0, "blue": 0.0}
+
+
+def test_read_dashboard_meta_returns_none_when_accent1_missing():
+    theme = {
+        "themeColors": [
+            {"colorType": "TEXT", "color": {"rgbColor": {"red": 0.0}}},
+            {"colorType": "ACCENT2", "color": {"rgbColor": {"red": 0.9}}},
+        ]
+    }
+    sink = _make_discovery_sink(_dashboard_meta_response_with_theme([], theme))
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert meta.theme_accent is None

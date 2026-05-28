@@ -836,6 +836,14 @@ class DashboardMeta:
     protected ranges already installed on the Dashboard. Used by publish
     to decide whether to emit a fresh ``addProtectedRange`` request
     (idempotent install on first sync after deploy).
+
+    ``theme_accent`` is the spreadsheet theme's ``ACCENT1`` colour
+    resolved to an ``{"red","green","blue"}`` float dict (0..1).
+    ``None`` when the spreadsheet has no readable theme — callers
+    fall back to a hard-coded default. Used to paint every Sheets-Table
+    header chip (Dashboard + Tasks + History + UserEdits + Settings)
+    and to tint the Dashboard's banded alt-rows so the whole sheet
+    tracks the kid's chosen ``Format → Theme``.
     """
 
     sheet_id: int
@@ -843,6 +851,7 @@ class DashboardMeta:
     banded_range_ids: list[int]
     conditional_format_rule_count: int
     protected_range_ids: list[int] = field(default_factory=list)
+    theme_accent: dict[str, float] | None = None
 
 
 class GoldSink(Protocol):
@@ -992,6 +1001,7 @@ def publish_for_child(
             existing_table_ids=meta.table_ids,
             existing_banded_range_ids=meta.banded_range_ids,
             existing_conditional_format_rule_count=meta.conditional_format_rule_count,
+            theme_accent=meta.theme_accent,
         )
         sink.write_dashboard_layout(spreadsheet_id, dash_requests)
         # One-shot install of the whole-sheet Dashboard protection. The
