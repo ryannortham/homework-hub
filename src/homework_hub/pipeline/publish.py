@@ -27,7 +27,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -831,12 +831,18 @@ class DashboardMeta:
     a previous publish was interrupted). ``banded_range_ids`` and
     ``conditional_format_rule_count`` are the counts/ids needed to drain
     those artefacts before re-emitting fresh ones.
+
+    ``protected_range_ids`` carries the ids of any *whole-sheet*
+    protected ranges already installed on the Dashboard. Used by publish
+    to decide whether to emit a fresh ``addProtectedRange`` request
+    (idempotent install on first sync after deploy).
     """
 
     sheet_id: int
     table_ids: list[str]
     banded_range_ids: list[int]
     conditional_format_rule_count: int
+    protected_range_ids: list[int] = field(default_factory=list)
 
 
 class GoldSink(Protocol):
@@ -859,6 +865,12 @@ class GoldSink(Protocol):
 
     def write_dashboard_layout(
         self, spreadsheet_id: str, requests: list[dict[str, Any]]
+    ) -> None: ...
+
+    def write_dashboard_protection(
+        self,
+        spreadsheet_id: str,
+        dashboard_sheet_id: int,
     ) -> None: ...
 
 
@@ -982,6 +994,17 @@ def publish_for_child(
             existing_conditional_format_rule_count=meta.conditional_format_rule_count,
         )
         sink.write_dashboard_layout(spreadsheet_id, dash_requests)
+        # One-shot install of the whole-sheet Dashboard protection. The
+        # ``addProtectedRange`` resource lives independently of the Tables
+        # we tear down each sync, so a single install survives indefinitely.
+        # Idempotent: only emitted when ``read_dashboard_meta`` reports no
+        # existing whole-sheet protected range.
+        if not meta.protected_range_ids:
+            try:
+                sink.write_dashboard_protection(spreadsheet_id, meta.sheet_id)
+                log.info("dashboard protection installed for child=%s", child)
+            except Exception:
+                log.exception("dashboard protection install failed for child=%s", child)
     except Exception:
         log.exception("dashboard layout refresh failed for child=%s", child)
 

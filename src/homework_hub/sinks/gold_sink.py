@@ -366,8 +366,9 @@ class GspreadGoldSink:
         """Return the Dashboard tab's live metadata for publish-time relayout.
 
         We ask the API for the Dashboard sheet's properties, tables,
-        banded ranges and conditional-format rule count in a single
-        ``spreadsheets.get`` call so the per-publish overhead is bounded.
+        banded ranges, conditional-format rule count and protected-range
+        ids in a single ``spreadsheets.get`` call so the per-publish
+        overhead is bounded.
 
         ``tables`` are filtered to those whose tableId matches a known
         Dashboard table id — leaves the user's own Tables (if any) alone.
@@ -375,6 +376,13 @@ class GspreadGoldSink:
         the v5.0 layout module owns 100% of the Dashboard sheet's
         banding + CF surface (no other code emits those artefacts on
         this tab).
+
+        ``protected_range_ids`` lists only *whole-sheet* protected
+        ranges (no inner ``range`` body) — those are the ones publish
+        installs and would otherwise re-install on every sync. Any
+        cell-scoped protections a kid or admin might add by hand are
+        ignored on read so they don't accidentally suppress the
+        whole-sheet install.
         """
         from homework_hub.schema import DASHBOARD_TABLE_IDS
 
@@ -387,7 +395,8 @@ class GspreadGoldSink:
                     "sheets(properties(sheetId,title),"
                     "tables(tableId),"
                     "bandedRanges(bandedRangeId),"
-                    "conditionalFormats)"
+                    "conditionalFormats,"
+                    "protectedRanges(protectedRangeId,range))"
                 ),
             )
             .execute()
@@ -399,6 +408,21 @@ class GspreadGoldSink:
             tables = sheet.get("tables", []) or []
             bandings = sheet.get("bandedRanges", []) or []
             cf_rules = sheet.get("conditionalFormats", []) or []
+            protected = sheet.get("protectedRanges", []) or []
+            # Whole-sheet protection has either no ``range`` at all or a
+            # ``range`` whose only field is ``sheetId`` — neither
+            # ``startRowIndex``/``endRowIndex`` nor the column equivalents
+            # are present. Anything else is a kid- or admin-installed
+            # cell-scoped protection we shouldn't touch.
+            whole_sheet_ids = [
+                int(pr["protectedRangeId"])
+                for pr in protected
+                if "protectedRangeId" in pr
+                and not any(
+                    k in (pr.get("range") or {})
+                    for k in ("startRowIndex", "endRowIndex", "startColumnIndex", "endColumnIndex")
+                )
+            ]
             return DashboardMeta(
                 sheet_id=int(props["sheetId"]),
                 table_ids=[
@@ -408,6 +432,7 @@ class GspreadGoldSink:
                     int(b["bandedRangeId"]) for b in bandings if "bandedRangeId" in b
                 ],
                 conditional_format_rule_count=len(cf_rules),
+                protected_range_ids=whole_sheet_ids,
             )
         raise GoldSinkError(f"Dashboard tab {DASHBOARD_TAB.name!r} not found in {spreadsheet_id}")
 
@@ -427,6 +452,43 @@ class GspreadGoldSink:
         self._disc().spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
+        ).execute()
+
+    def write_dashboard_protection(
+        self,
+        spreadsheet_id: str,
+        dashboard_sheet_id: int,
+    ) -> None:
+        """Install a whole-sheet hard-lock protected range on the Dashboard.
+
+        The only editor listed is this sink's own service account, so
+        the publisher continues to write through regardless of who owns
+        the spreadsheet. Idempotency is enforced by the caller — see
+        :func:`homework_hub.pipeline.publish.publish_for_child`, which
+        skips this call when ``DashboardMeta.protected_range_ids`` is
+        non-empty.
+
+        Raises ``GoldSinkError`` if the underlying credentials don't
+        expose a ``service_account_email`` (e.g. user-installed
+        application-default credentials), since omitting the editors
+        list would defer to the file owner and could lock the publisher
+        out on kid-owned sheets.
+        """
+        from homework_hub.dashboard_layout import build_protect_dashboard_request
+
+        email = getattr(self._credentials, "service_account_email", None)
+        if not email:
+            raise GoldSinkError(
+                "write_dashboard_protection requires service-account "
+                "credentials with a ``service_account_email`` attribute"
+            )
+        request = build_protect_dashboard_request(
+            dashboard_sheet_id=dashboard_sheet_id,
+            service_account_email=email,
+        )
+        self._disc().spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [request]},
         ).execute()
 
     # ------------------------------------------------------------------ #

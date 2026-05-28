@@ -9,6 +9,7 @@ import pytest
 
 from homework_hub.dashboard_layout import (
     DashboardTask,
+    build_protect_dashboard_request,
     build_requests,
     filter_done,
     filter_overdue,
@@ -475,3 +476,43 @@ class TestTaskRowProjection:
         assert out == [
             DashboardTask("Maths", "Algebra", date(2026, 5, 30), "Not started", "https://x")
         ]
+
+
+class TestProtectDashboardRequest:
+    """The whole-sheet hard-lock that prevents kids editing the Dashboard."""
+
+    def test_targets_dashboard_sheet_id_only(self):
+        req = build_protect_dashboard_request(
+            dashboard_sheet_id=42,
+            service_account_email="bot@svc.iam.gserviceaccount.com",
+        )
+        pr = req["addProtectedRange"]["protectedRange"]
+        # Range body carries ONLY ``sheetId`` — no row/column bounds —
+        # which the Sheets API interprets as "the whole sheet".
+        assert pr["range"] == {"sheetId": 42}
+
+    def test_hard_lock_not_warning_only(self):
+        req = build_protect_dashboard_request(
+            dashboard_sheet_id=42,
+            service_account_email="bot@svc.iam.gserviceaccount.com",
+        )
+        pr = req["addProtectedRange"]["protectedRange"]
+        assert pr["warningOnly"] is False
+
+    def test_service_account_sole_editor(self):
+        req = build_protect_dashboard_request(
+            dashboard_sheet_id=42,
+            service_account_email="bot@svc.iam.gserviceaccount.com",
+        )
+        pr = req["addProtectedRange"]["protectedRange"]
+        assert pr["editors"] == {"users": ["bot@svc.iam.gserviceaccount.com"]}
+
+    def test_description_is_concise_user_facing_string(self):
+        req = build_protect_dashboard_request(
+            dashboard_sheet_id=42,
+            service_account_email="bot@svc.iam.gserviceaccount.com",
+        )
+        pr = req["addProtectedRange"]["protectedRange"]
+        # The description surfaces in Sheets' lock toast. Lock it so
+        # accidental wording drift gets caught.
+        assert pr["description"] == "Auto-generated — edit on Tasks tab"

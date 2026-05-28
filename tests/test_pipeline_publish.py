@@ -641,6 +641,7 @@ class FakeGoldSink:
         self.writes: dict[str, list[tuple]] = {}
         self.hidden_state: dict[str, bool] = {}
         self.dashboard_requests: list[list[dict]] = []
+        self.protection_installs: list[tuple[str, int]] = []
         self._dashboard_meta = dashboard_meta or DashboardMeta(
             sheet_id=0,
             table_ids=[],
@@ -665,6 +666,11 @@ class FakeGoldSink:
 
     def write_dashboard_layout(self, spreadsheet_id: str, requests: list[dict]) -> None:
         self.dashboard_requests.append(list(requests))
+
+    def write_dashboard_protection(
+        self, spreadsheet_id: str, dashboard_sheet_id: int
+    ) -> None:
+        self.protection_installs.append((spreadsheet_id, dashboard_sheet_id))
 
 
 def _store(tmp_path: Path) -> StateStore:
@@ -1179,5 +1185,79 @@ class TestPublishDashboard:
             last_synced=None,
         )
         # Publish still returned a result; Tasks tab still written.
+        assert result.tasks_written == 1
+        assert "Tasks" in sink.writes
+
+
+class TestPublishDashboardProtection:
+    """v5.1: publish installs a whole-sheet protected range on the
+    Dashboard exactly once, then leaves it alone on subsequent runs."""
+
+    def test_installs_protection_when_meta_reports_none(self, tmp_path: Path):
+        store = _store(tmp_path)
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+            protected_range_ids=[],
+        )
+        sink = FakeGoldSink(dashboard_meta=meta)
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
+        assert sink.protection_installs == [("SS1", 42)]
+
+    def test_skips_protection_when_meta_already_has_one(self, tmp_path: Path):
+        store = _store(tmp_path)
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+            protected_range_ids=[999],
+        )
+        sink = FakeGoldSink(dashboard_meta=meta)
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
+        assert sink.protection_installs == []
+
+    def test_protection_failure_does_not_break_publish(self, tmp_path: Path):
+        """Protection install is best-effort. A failure here must not
+        prevent the rest of publish from completing — Tasks/History/etc.
+        are canonical state."""
+        store = _store(tmp_path)
+
+        class BrokenProtectionSink(FakeGoldSink):
+            def write_dashboard_protection(self, spreadsheet_id, dashboard_sheet_id):
+                raise RuntimeError("addProtectedRange 500")
+
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+            protected_range_ids=[],
+        )
+        sink = BrokenProtectionSink(dashboard_meta=meta)
+        result = publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
         assert result.tasks_written == 1
         assert "Tasks" in sink.writes

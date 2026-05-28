@@ -926,6 +926,7 @@ def _update_cells(
 __all__ = [
     "DashboardTask",
     "SectionLayout",
+    "build_protect_dashboard_request",
     "build_requests",
     "filter_done",
     "filter_overdue",
@@ -933,6 +934,48 @@ __all__ = [
     "filter_week",
     "task_rows_to_dashboard_tasks",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Whole-sheet protection
+# --------------------------------------------------------------------------- #
+
+
+# Description string surfaced by Sheets in the "you can't edit this" toast.
+# Kept short — Sheets truncates long strings, and the kid's takeaway is just
+# "go to the Tasks tab".
+_PROTECTION_DESCRIPTION = "Auto-generated — edit on Tasks tab"
+
+
+def build_protect_dashboard_request(
+    dashboard_sheet_id: int,
+    service_account_email: str,
+) -> dict[str, Any]:
+    """Return a single ``addProtectedRange`` request that hard-locks the
+    entire Dashboard sheet.
+
+    The protected range omits an inner ``range`` body, which the Sheets
+    API treats as "the whole sheet identified by ``sheetId``". Everything
+    inside the Dashboard tab — Tables, fallback rows, KPI scorecards,
+    donut charts, greeting cell — becomes read-only for anyone other
+    than the service account.
+
+    ``service_account_email`` is the only entry in ``editors.users`` so
+    the publisher always retains write access, regardless of who owns
+    the sheet at install time. Hard lock (``warningOnly=False``) is
+    deliberate: a dismissable warning dialog would just train kids to
+    click through it.
+    """
+    return {
+        "addProtectedRange": {
+            "protectedRange": {
+                "range": {"sheetId": dashboard_sheet_id},
+                "description": _PROTECTION_DESCRIPTION,
+                "warningOnly": False,
+                "editors": {"users": [service_account_email]},
+            }
+        }
+    }
 
 
 # Tiny convenience for callers that already have a ``datetime`` rather

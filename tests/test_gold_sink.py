@@ -559,3 +559,118 @@ def test_set_tab_hidden_raises_when_tab_missing():
     sink, _ = _make_sink({})
     with pytest.raises(GoldSinkError, match="Cannot hide"):
         sink.set_tab_hidden("sheet-id", USER_EDITS_TAB, hidden=True)
+
+
+# --------------------------------------------------------------------------- #
+# read_dashboard_meta — protected_range_ids
+# --------------------------------------------------------------------------- #
+
+
+def _dashboard_meta_response(protected_ranges: list[dict]) -> dict:
+    """Wrap a list of protectedRanges in the shape spreadsheets.get returns."""
+    return {
+        "sheets": [
+            {
+                "properties": {"sheetId": 42, "title": "Dashboard"},
+                "tables": [],
+                "bandedRanges": [],
+                "conditionalFormats": [],
+                "protectedRanges": protected_ranges,
+            }
+        ]
+    }
+
+
+def _make_discovery_sink(get_response: dict) -> GspreadGoldSink:
+    sink = GspreadGoldSink(credentials=MagicMock())
+    discovery = MagicMock()
+    discovery.spreadsheets.return_value.get.return_value.execute.return_value = (
+        get_response
+    )
+    sink._discovery = discovery  # type: ignore[assignment]
+    return sink
+
+
+def test_read_dashboard_meta_requests_protected_ranges_field():
+    sink = _make_discovery_sink(_dashboard_meta_response([]))
+    sink.read_dashboard_meta("sheet-id")
+    call = sink._discovery.spreadsheets.return_value.get.call_args
+    fields = call.kwargs["fields"]
+    assert "protectedRanges(protectedRangeId,range)" in fields
+
+
+def test_read_dashboard_meta_returns_whole_sheet_protection_ids():
+    sink = _make_discovery_sink(
+        _dashboard_meta_response(
+            [
+                {"protectedRangeId": 111, "range": {"sheetId": 42}},
+                # Bare ``range`` omitted entirely — also whole-sheet.
+                {"protectedRangeId": 222},
+            ]
+        )
+    )
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert sorted(meta.protected_range_ids) == [111, 222]
+
+
+def test_read_dashboard_meta_ignores_cell_scoped_protections():
+    """Cell-scoped protections (kid/admin installed) must not block
+    publish from installing its own whole-sheet lock."""
+    sink = _make_discovery_sink(
+        _dashboard_meta_response(
+            [
+                {
+                    "protectedRangeId": 333,
+                    "range": {
+                        "sheetId": 42,
+                        "startRowIndex": 0,
+                        "endRowIndex": 5,
+                    },
+                },
+                {
+                    "protectedRangeId": 444,
+                    "range": {
+                        "sheetId": 42,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 1,
+                    },
+                },
+            ]
+        )
+    )
+    meta = sink.read_dashboard_meta("sheet-id")
+    assert meta.protected_range_ids == []
+
+
+# --------------------------------------------------------------------------- #
+# write_dashboard_protection
+# --------------------------------------------------------------------------- #
+
+
+def test_write_dashboard_protection_raises_without_service_account_email():
+    """User-installed OAuth creds expose no service-account email — we
+    refuse to write because omitting editors would lock the publisher
+    out of kid-owned sheets."""
+    sink = GspreadGoldSink(credentials=MagicMock(spec=[]))
+    sink._discovery = MagicMock()  # type: ignore[assignment]
+    with pytest.raises(GoldSinkError, match="service_account_email"):
+        sink.write_dashboard_protection("sheet-id", dashboard_sheet_id=42)
+
+
+def test_write_dashboard_protection_issues_single_batchupdate():
+    creds = MagicMock()
+    creds.service_account_email = "bot@svc.iam.gserviceaccount.com"
+    sink = GspreadGoldSink(credentials=creds)
+    discovery = MagicMock()
+    sink._discovery = discovery  # type: ignore[assignment]
+
+    sink.write_dashboard_protection("sheet-id", dashboard_sheet_id=42)
+
+    call = discovery.spreadsheets.return_value.batchUpdate.call_args
+    assert call.kwargs["spreadsheetId"] == "sheet-id"
+    requests = call.kwargs["body"]["requests"]
+    assert len(requests) == 1
+    pr = requests[0]["addProtectedRange"]["protectedRange"]
+    assert pr["range"] == {"sheetId": 42}
+    assert pr["warningOnly"] is False
+    assert pr["editors"] == {"users": ["bot@svc.iam.gserviceaccount.com"]}
