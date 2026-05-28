@@ -12,7 +12,6 @@ from click.testing import CliRunner
 
 from homework_hub.__main__ import cli
 from homework_hub.medallion_orchestrator import (
-    DetectStageResult,
     IngestStageResult,
     MedallionChildReport,
     MedallionSyncReport,
@@ -67,7 +66,6 @@ def _fake_report(*, ok: bool = True) -> MedallionSyncReport:
         updated=1,
         unchanged=0,
     )
-    detect = DetectStageResult(child="james", ok=True)
     publish = PublishStageResult(
         child="james",
         ok=True,
@@ -77,7 +75,6 @@ def _fake_report(*, ok: bool = True) -> MedallionSyncReport:
         child="james",
         ingest=[ingest],
         transform=transform,
-        detect=detect,
         publish=publish,
     )
     return MedallionSyncReport(started_at=now, finished_at=now, children=[child])
@@ -242,7 +239,11 @@ def test_auth_compass_rejects_empty_cookie(tmp_path: Path):
 def test_auth_edrolo_invokes_headed_login(tmp_path: Path):
     out_token = tmp_path / "james-edrolo.json"
     runner = CliRunner()
-    with patch("homework_hub.sources.edrolo.run_headed_login") as mock_login:
+    with (
+        patch("homework_hub.sources.edrolo.run_headed_login") as mock_login,
+        patch("homework_hub.__main__._push_token") as mock_push,
+        patch("homework_hub.__main__._ensure_zen_marionette"),
+    ):
         result = runner.invoke(
             cli,
             [
@@ -256,6 +257,7 @@ def test_auth_edrolo_invokes_headed_login(tmp_path: Path):
         )
     assert result.exit_code == 0, result.output
     mock_login.assert_called_once()
+    mock_push.assert_called_once()
     # First positional arg is the output path
     call_args = mock_login.call_args
     assert call_args.args[0] == out_token
@@ -266,7 +268,11 @@ def test_auth_classroom_runs_headed_login(tmp_path: Path):
     out_token = tmp_path / "out.json"
 
     runner = CliRunner()
-    with patch("homework_hub.sources.classroom.run_headed_login") as mock_login:
+    with (
+        patch("homework_hub.sources.classroom.run_headed_login") as mock_login,
+        patch("homework_hub.__main__._push_token") as mock_push,
+        patch("homework_hub.__main__._ensure_zen_marionette"),
+    ):
         result = runner.invoke(
             cli,
             [
@@ -280,6 +286,7 @@ def test_auth_classroom_runs_headed_login(tmp_path: Path):
         )
     assert result.exit_code == 0, result.output
     mock_login.assert_called_once()
+    mock_push.assert_called_once()
     call_args = mock_login.call_args
     assert call_args.args[0] == out_token
     assert "saved" in result.output.lower()
@@ -516,70 +523,6 @@ def test_subjects_add_invalid_regex(tmp_path: Path):
     assert res.exit_code != 0
 
 
-# --------------------------------------------------------------------------- #
-# links subcommands
-# --------------------------------------------------------------------------- #
-
-
-def _seed_link_pair(state_db: Path) -> None:
-    """Insert a Compass↔Classroom pair for james that the detector will flag."""
-    import sqlite3
-    from contextlib import closing
-    from datetime import UTC, datetime
-
-    from homework_hub.state.store import StateStore
-
-    StateStore(state_db)  # ensure schema
-    due = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
-    now = datetime.now(UTC).isoformat()
-    with closing(sqlite3.connect(state_db)) as conn, conn:
-        for source, source_id, title in [
-            ("compass", "C1", "WW1 Benchmark"),
-            ("classroom", "K1", "WW1"),
-        ]:
-            conn.execute(
-                "INSERT INTO silver_tasks "
-                "(child, source, source_id, subject_raw, subject_canonical, "
-                "subject_short, title, status, last_synced, due_at) "
-                "VALUES ('james', ?, ?, '', 'Year 9 Humanities', 'Hum', "
-                "?, 'not_started', ?, ?)",
-                (source, source_id, title, now, due),
-            )
-
-
-def test_links_list_empty(tmp_path: Path):
-    env = _write_min_config(tmp_path)
-    runner = CliRunner()
-    res = runner.invoke(cli, ["links", "list"], env=env)
-    assert res.exit_code == 0, res.output
-    assert "No links" in res.output
-
-
-def test_links_detect_then_list(tmp_path: Path):
-    env = _write_min_config(tmp_path)
-    _seed_link_pair(Path(env["HOMEWORK_HUB_STATE_DB"]))
-    runner = CliRunner()
-
-    detect = runner.invoke(cli, ["links", "detect"], env=env)
-    assert detect.exit_code == 0, detect.output
-    assert "inserted=1" in detect.output
-
-    listing = runner.invoke(cli, ["links", "list"], env=env)
-    assert listing.exit_code == 0, listing.output
-    assert "auto_high" in listing.output
-    assert "compass:C1" in listing.output
-    assert "classroom:K1" in listing.output
-
-
-def test_links_detect_specific_child(tmp_path: Path):
-    env = _write_min_config(tmp_path)
-    _seed_link_pair(Path(env["HOMEWORK_HUB_STATE_DB"]))
-    runner = CliRunner()
-    res = runner.invoke(cli, ["links", "detect", "--child", "james"], env=env)
-    assert res.exit_code == 0, res.output
-    assert "james: inserted=1" in res.output
-
-
 # ----- refresh-ep ---------------------------------------------------------
 
 
@@ -605,6 +548,7 @@ def test_refresh_ep_uses_hardcoded_defaults(tmp_path: Path):
     runner = CliRunner()
     with (
         patch("homework_hub.zen.marionette_reachable", return_value=True) as mock_reach,
+        patch("homework_hub.zen.is_zen_running_with_profile", return_value=True),
         patch(
             "homework_hub.sources.eduperfect.run_headed_login",
             side_effect=fake_run_headed_login,
@@ -691,6 +635,7 @@ def test_refresh_ep_logged_out_message(tmp_path: Path):
     runner = CliRunner()
     with (
         patch("homework_hub.zen.marionette_reachable", return_value=True),
+        patch("homework_hub.zen.is_zen_running_with_profile", return_value=True),
         patch(
             "homework_hub.sources.eduperfect.run_headed_login",
             side_effect=RuntimeError(
@@ -719,3 +664,59 @@ def test_refresh_ep_marionette_launch_timeout(tmp_path: Path):
 
     assert result.exit_code != 0
     assert "did not become available" in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# reapply-template → auto-publish wiring (v5.0)
+# --------------------------------------------------------------------------- #
+
+
+def _patch_reapply_imports(tmp_path: Path):
+    """Context-manager bundle: stub Sheets API + service-account creds so
+    ``reapply-template`` runs end-to-end against a fake spreadsheet."""
+
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    # Bitwarden notes / credentials
+    stack.enter_context(patch("homework_hub.secrets.from_env"))
+    stack.enter_context(patch("homework_hub.sinks.sheets_client.load_service_account_credentials"))
+    # Fake the discovery client.
+    fake_service = stack.enter_context(patch("googleapiclient.discovery.build"))
+    spreadsheets = fake_service.return_value.spreadsheets.return_value
+    spreadsheets.get.return_value.execute.return_value = {
+        "sheets": [
+            {
+                "properties": {"title": "Dashboard", "sheetId": 0, "index": 0},
+                "charts": [],
+                "bandedRanges": [],
+                "merges": [],
+                "conditionalFormats": [],
+                "tables": [{"tableId": "tbl_dash_overdue"}],
+            }
+        ]
+    }
+    spreadsheets.batchUpdate.return_value.execute.return_value = {}
+    return stack, fake_service
+
+
+def test_reapply_template_invokes_publish_only_per_child(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    stack, _svc = _patch_reapply_imports(tmp_path)
+    with stack, patch("homework_hub.wiring.build_medallion_orchestrator") as mock_build:
+        mock_build.return_value.publish_only.return_value = _fake_report(ok=True)
+        result = runner.invoke(cli, ["reapply-template"], env=env)
+    assert result.exit_code == 0, result.output
+    mock_build.return_value.publish_only.assert_called_once_with(only_child="james")
+
+
+def test_reapply_template_exits_2_when_publish_fails(tmp_path: Path):
+    env = _write_min_config(tmp_path, sheet_id="sheet-abc")
+    runner = CliRunner()
+    stack, _svc = _patch_reapply_imports(tmp_path)
+    with stack, patch("homework_hub.wiring.build_medallion_orchestrator") as mock_build:
+        mock_build.return_value.publish_only.side_effect = RuntimeError("kaboom")
+        result = runner.invoke(cli, ["reapply-template"], env=env)
+    assert result.exit_code == 2, result.output
+    assert "publish failed" in result.output

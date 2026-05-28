@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 
 from homework_hub.models import Task
 from homework_hub.pipeline.ingest import RawRecord
@@ -53,3 +54,12 @@ class Source(ABC):
         pipeline is the only path, this becomes ``@abstractmethod``.
         """
         raise NotImplementedError(f"{type(self).__name__}.fetch_raw not implemented")
+
+    def token_refreshed_at(self, child: str) -> datetime | None:
+        """Return the UTC timestamp of the most recent token refresh for ``child``.
+
+        Used by the orchestrator to bypass ``silence_repeated_auth_expired``
+        once a fresh token has landed on disk after the last recorded failure.
+        Default implementation returns ``None`` (no token-refresh signal).
+        """
+        return None

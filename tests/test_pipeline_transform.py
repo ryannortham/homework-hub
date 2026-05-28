@@ -277,9 +277,7 @@ class TestSilverWriterUpsert:
         conn.close()
         assert row == ("9MATH", "9MATH", "9MATH")
 
-    def test_submitted_at_persisted_and_round_trips(
-        self, writer: SilverWriter, store: StateStore
-    ):
+    def test_submitted_at_persisted_and_round_trips(self, writer: SilverWriter, store: StateStore):
         ts = datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
         writer.upsert_many([(_task(source_id="1", submitted_at=ts), None)])
         import sqlite3
@@ -316,6 +314,7 @@ class TestSilverWriterUpsert:
         )
         writer.upsert_many([(t, None)])
         import sqlite3
+
         conn = sqlite3.connect(store.db_path)
         val = conn.execute("SELECT task_type FROM silver_tasks").fetchone()[0]
         conn.close()
@@ -378,3 +377,73 @@ class TestSilverWriterAllForChild:
         tasks = writer.all_for_child("james")
         assert len(tasks) == 1
         assert tasks[0].submitted_at == ts
+
+
+# --------------------------------------------------------------------------- #
+# SilverWriter — archival / first_seen_at / recovery
+# --------------------------------------------------------------------------- #
+
+
+class TestSilverWriterArchival:
+    def test_first_seen_at_set_on_insert(self, writer: SilverWriter, store: StateStore):
+        ts = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        writer.upsert_many([(_task(source_id="A"), None)], now=ts)
+        tasks = writer.all_for_child("james")
+        assert tasks[0].first_seen_at == ts
+        assert tasks[0].last_seen_at == ts
+
+    def test_first_seen_at_stable_across_resyncs(self, writer: SilverWriter, store: StateStore):
+        ts1 = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+        ts2 = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        writer.upsert_many([(_task(source_id="A"), None)], now=ts1)
+        writer.upsert_many([(_task(source_id="A"), None)], now=ts2)
+        tasks = writer.all_for_child("james")
+        assert tasks[0].first_seen_at == ts1
+        assert tasks[0].last_seen_at == ts2
+
+    def test_resync_clears_upstream_removed_archive(self, writer: SilverWriter, store: StateStore):
+        """An archived-for-upstream_removed row that reappears in the next
+        sync should have its archive flags cleared (recovery path)."""
+        writer.upsert_many([(_task(source_id="A"), None)])
+        store.mark_archived(
+            child="james",
+            source="compass",
+            source_id="A",
+            reason="upstream_removed",
+        )
+        assert len(store.list_archived(child="james")) == 1
+        # Re-sync the same task with a content change so the update path runs.
+        writer.upsert_many([(_task(source_id="A", subject="9SCI"), None)])
+        assert store.list_archived(child="james") == []
+
+    def test_age_cap_archive_survives_resync(self, writer: SilverWriter, store: StateStore):
+        """``age_cap`` (and ``manual``) archives must NOT be cleared by a
+        resync — only ``upstream_removed`` is recoverable that way."""
+        writer.upsert_many([(_task(source_id="A"), None)])
+        store.mark_archived(child="james", source="compass", source_id="A", reason="age_cap")
+        # Resync with a content change — silver writer must short-circuit
+        # and refuse to overwrite the archived row's content.
+        writer.upsert_many([(_task(source_id="A", subject="9SCI"), None)])
+        rows = store.list_archived(child="james")
+        assert len(rows) == 1
+        assert rows[0]["archived_reason"] == "age_cap"
+
+    def test_missing_streak_not_reset_by_writer(self, writer: SilverWriter, store: StateStore):
+        """The silver writer must NOT reset ``missing_streak`` on rewrite.
+
+        Why: the transform stage replays the bronze back-catalogue every
+        sync, so resetting the streak from re-derivation would mask
+        upstream disappearance. The streak is owned by
+        ``reconcile_stale`` (which sees the actual freshly-fetched ids
+        from this sync) and ``bump_last_seen`` (called by reconcile)."""
+        writer.upsert_many([(_task(source_id="A"), None)])
+        store.increment_missing_streak(child="james", source="compass", seen_ids=[])
+        # Rewrite with a content change — streak must persist.
+        writer.upsert_many([(_task(source_id="A", subject="9SCI"), None)])
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            (streak,) = conn.execute(
+                "SELECT missing_streak FROM silver_tasks WHERE source_id = 'A'"
+            ).fetchone()
+        assert streak == 1

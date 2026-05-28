@@ -171,6 +171,33 @@ def test_health_includes_next_run_time_when_scheduler_attached(tmp_path: Path):
         scheduler.shutdown(wait=False)
 
 
+def test_health_filters_disabled_sources(tmp_path: Path):
+    state = _state(tmp_path)
+    state.record_success("james", "classroom")
+    state.record_failure("james", "edrolo", kind="auth_expired", message="expired")
+
+    config_yaml = tmp_path / "children.yaml"
+    config_yaml.write_text("""
+children:
+  james:
+    display_name: James
+    sources:
+      classroom:
+        enabled: true
+      edrolo:
+        enabled: false
+""")
+
+    app = build_health_app(state=state, children_config_path=config_yaml)
+    body = client_get_health(app)
+
+    assert body["status"] == "ok"
+    sources = body["sources"]
+    assert len(sources) == 1
+    assert sources[0]["source"] == "classroom"
+    assert sources[0]["failing"] is False
+
+
 def client_get_health(app) -> dict:
     """Helper for the tests above — single TestClient lifecycle per call."""
     with TestClient(app) as client:

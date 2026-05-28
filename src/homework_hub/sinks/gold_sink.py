@@ -4,8 +4,7 @@ The publish layer's :class:`~homework_hub.pipeline.publish.GoldSink`
 Protocol describes four operations:
 
 * :meth:`read_user_edits` — pull the hidden ``UserEdits`` Table.
-* :meth:`read_duplicate_checkboxes` — read Confirm/Dismiss state from
-  the ``Possible Duplicates`` Table.
+* :meth:`read_tab_raw` — return raw rows from any named tab.
 * :meth:`write_tab` — replace a tab's data area with the supplied rows
   (header is preserved).
 * :meth:`set_tab_hidden` — toggle a tab's ``hidden`` property.
@@ -30,8 +29,8 @@ import gspread
 from google.auth.credentials import Credentials
 from googleapiclient.discovery import build
 
-from homework_hub.pipeline.publish import DuplicateCheckboxState, UserEdit
-from homework_hub.schema import TabSpec
+from homework_hub.pipeline.publish import DashboardMeta, UserEdit
+from homework_hub.schema import DASHBOARD_TAB, ColumnKind, TabSpec
 
 log = logging.getLogger(__name__)
 
@@ -79,42 +78,36 @@ class GspreadGoldSink:
             return []
         out: list[UserEdit] = []
         for row in rows:
-            # Tab schema: task_uid, column, value, updated_at
+            # Tab schema: task_uid, column, original_value, value, updated_at.
+            # Tolerate legacy 4-column rows (task_uid, column, value, updated_at)
+            # produced before original_value was introduced — they get
+            # original_value="" until the next publish refreshes them.
             if len(row) < 4:
                 continue
-            task_uid, column, value, updated_at = row[0], row[1], row[2], row[3]
+            task_uid = row[0]
+            column = row[1]
+            if len(row) >= 5:
+                original_value, value, updated_at = row[2], row[3], row[4]
+            else:
+                original_value = ""
+                value, updated_at = row[2], row[3]
             if not task_uid or not column:
                 continue
             coerced: object = value
             if value in ("TRUE", "FALSE"):
                 coerced = value == "TRUE"
+            coerced_orig: object = original_value
+            if original_value in ("TRUE", "FALSE"):
+                coerced_orig = original_value == "TRUE"
             out.append(
                 UserEdit(
                     task_uid=task_uid,
                     column=column,
                     value=coerced,
                     updated_at=updated_at,
+                    original_value=coerced_orig,
                 )
             )
-        return out
-
-    def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[DuplicateCheckboxState]:
-        """Read Confirm/Dismiss state from the Possible Duplicates tab."""
-        rows = self._read_tab_rows(spreadsheet_id, "Possible Duplicates")
-        if not rows:
-            return []
-        out: list[DuplicateCheckboxState] = []
-        for row in rows:
-            # Tab schema columns 0=link_id, 7=confirm, 8=dismiss
-            if len(row) < 9:
-                continue
-            try:
-                link_id = int(row[0])
-            except (TypeError, ValueError):
-                continue
-            confirm = row[7] == "TRUE" if len(row) > 7 else False
-            dismiss = row[8] == "TRUE" if len(row) > 8 else False
-            out.append(DuplicateCheckboxState(link_id=link_id, confirm=confirm, dismiss=dismiss))
         return out
 
     def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
@@ -165,17 +158,44 @@ class GspreadGoldSink:
         if tab.table_id:
             self._write_table_tab(spreadsheet_id, ws, tab, encoded)
         else:
-            self._write_plain_tab(ws, len(tab.columns), encoded)
+            self._write_plain_tab(ws, tab, encoded)
 
     def _write_plain_tab(
         self,
         ws: gspread.Worksheet,
-        num_cols: int,
+        tab: TabSpec,
         encoded: list[list[object]],
     ) -> None:
-        """Clear + range-write for non-Table tabs."""
+        """Clear + range-write for non-Table tabs.
+
+        For data-bearing plain tabs (e.g. Settings), the header row is
+        rewritten from the tab schema so on-sheet headers stay in sync
+        with code-side schema changes. Formula-only tabs (e.g. Today —
+        a single ``=QUERY(...)`` in A1) are not header-managed: we clear
+        from A2 down so the formula cell is preserved.
+        """
+        num_cols = len(tab.columns)
         last_col = _col_letter(num_cols)
-        ws.batch_clear([f"A2:{last_col}"])
+        is_formula_only = all(c.kind is ColumnKind.FORMULA for c in tab.columns)
+        if is_formula_only:
+            ws.batch_clear([f"A2:{last_col}"])
+            if not encoded:
+                return
+            end_row = 1 + len(encoded)
+            ws.update(
+                range_name=f"A2:{last_col}{end_row}",
+                values=encoded,
+                value_input_option="USER_ENTERED",
+            )
+            return
+
+        headers = [[c.header for c in tab.columns]]
+        ws.batch_clear([f"A1:{last_col}"])
+        ws.update(
+            range_name=f"A1:{last_col}1",
+            values=headers,
+            value_input_option="USER_ENTERED",
+        )
         if not encoded:
             return
         end_row = 1 + len(encoded)
@@ -217,16 +237,18 @@ class GspreadGoldSink:
         all_values = ws.get_all_values()
         populated_rows = len(all_values)  # includes header
         if populated_rows > 1:
-            requests.append({
-                "deleteDimension": {
-                    "range": {
-                        "sheetId": ws.id,
-                        "dimension": "ROWS",
-                        "startIndex": 1,
-                        "endIndex": populated_rows,
+            requests.append(
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "dimension": "ROWS",
+                            "startIndex": 1,
+                            "endIndex": populated_rows,
+                        }
                     }
                 }
-            })
+            )
 
         # 1b. If we have more data rows than the grid can hold after the delete,
         #     append the extra rows. After deleteDimension, the grid has 1 row
@@ -239,34 +261,38 @@ class GspreadGoldSink:
             rows_needed = len(encoded)  # data rows after header
             # After deletion we have at most ws.row_count - (populated_rows - 1) rows.
             # To be safe, just always insert the required number of rows.
-            requests.append({
-                "appendDimension": {
-                    "sheetId": ws.id,
-                    "dimension": "ROWS",
-                    "length": rows_needed,
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "length": rows_needed,
+                    }
                 }
-            })
+            )
 
         # 2. Resize the Table *before* writing data so that structured column
         #    references in formula cells (e.g. ``=[@Due]-TODAY()``) resolve
         #    correctly — they only work when the cell is inside a named Table
         #    column.  endRowIndex = 1 header + len(encoded) data rows.
-        requests.append({
-            "updateTable": {
-                "table": {
-                    "tableId": tab.table_id,
-                    "name": tab.table_id,
-                    "range": {
-                        "sheetId": ws.id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1 + len(encoded),
-                        "startColumnIndex": 0,
-                        "endColumnIndex": len(tab.columns),
+        requests.append(
+            {
+                "updateTable": {
+                    "table": {
+                        "tableId": tab.table_id,
+                        "name": tab.table_id,
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1 + len(encoded),
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(tab.columns),
+                        },
                     },
-                },
-                "fields": "range",
+                    "fields": "range",
+                }
             }
-        })
+        )
 
         # 3. Write fresh data rows via updateCells with explicit cell value
         #    dicts so formulas, booleans, numbers and strings each use the
@@ -278,25 +304,31 @@ class GspreadGoldSink:
         #    survive deleteDimension. Writing format via SA credentials would
         #    normalise dd/MM/yyyy to M/d/yyyy (SA account is en_US).
         if encoded:
-            requests.append({
-                "updateCells": {
-                    "rows": [
-                        {"values": [
-                            _to_cell_value(
-                                v.format(row=2 + i) if isinstance(v, str) and "{row}" in v else v
-                            )
-                            for v in row
-                        ]}
-                        for i, row in enumerate(encoded)
-                    ],
-                    "fields": "userEnteredValue",
-                    "start": {
-                        "sheetId": ws.id,
-                        "rowIndex": 1,       # 0-based → row 2
-                        "columnIndex": 0,
-                    },
+            requests.append(
+                {
+                    "updateCells": {
+                        "rows": [
+                            {
+                                "values": [
+                                    _to_cell_value(
+                                        v.format(row=2 + i)
+                                        if isinstance(v, str) and "{row}" in v
+                                        else v
+                                    )
+                                    for v in row
+                                ]
+                            }
+                            for i, row in enumerate(encoded)
+                        ],
+                        "fields": "userEnteredValue",
+                        "start": {
+                            "sheetId": ws.id,
+                            "rowIndex": 1,  # 0-based → row 2
+                            "columnIndex": 0,
+                        },
+                    }
                 }
-            })
+            )
 
         disc.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
@@ -324,6 +356,77 @@ class GspreadGoldSink:
                     }
                 ]
             },
+        ).execute()
+
+    # ------------------------------------------------------------------ #
+    # GoldSink: Dashboard layout (v5.0)
+    # ------------------------------------------------------------------ #
+
+    def read_dashboard_meta(self, spreadsheet_id: str) -> DashboardMeta:
+        """Return the Dashboard tab's live metadata for publish-time relayout.
+
+        We ask the API for the Dashboard sheet's properties, tables,
+        banded ranges and conditional-format rule count in a single
+        ``spreadsheets.get`` call so the per-publish overhead is bounded.
+
+        ``tables`` are filtered to those whose tableId matches a known
+        Dashboard table id — leaves the user's own Tables (if any) alone.
+        Banded ranges and CF rule counts are returned wholesale because
+        the v5.0 layout module owns 100% of the Dashboard sheet's
+        banding + CF surface (no other code emits those artefacts on
+        this tab).
+        """
+        from homework_hub.schema import DASHBOARD_TABLE_IDS
+
+        disc = self._disc()
+        resp = (
+            disc.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields=(
+                    "sheets(properties(sheetId,title),"
+                    "tables(tableId),"
+                    "bandedRanges(bandedRangeId),"
+                    "conditionalFormats)"
+                ),
+            )
+            .execute()
+        )
+        for sheet in resp.get("sheets", []):
+            props = sheet.get("properties", {})
+            if props.get("title") != DASHBOARD_TAB.name:
+                continue
+            tables = sheet.get("tables", []) or []
+            bandings = sheet.get("bandedRanges", []) or []
+            cf_rules = sheet.get("conditionalFormats", []) or []
+            return DashboardMeta(
+                sheet_id=int(props["sheetId"]),
+                table_ids=[
+                    str(t["tableId"]) for t in tables if t.get("tableId") in DASHBOARD_TABLE_IDS
+                ],
+                banded_range_ids=[
+                    int(b["bandedRangeId"]) for b in bandings if "bandedRangeId" in b
+                ],
+                conditional_format_rule_count=len(cf_rules),
+            )
+        raise GoldSinkError(f"Dashboard tab {DASHBOARD_TAB.name!r} not found in {spreadsheet_id}")
+
+    def write_dashboard_layout(self, spreadsheet_id: str, requests: list[dict[str, Any]]) -> None:
+        """Execute the pre-built Dashboard layout batchUpdate.
+
+        ``requests`` comes from
+        :func:`homework_hub.dashboard_layout.build_requests`. The
+        Dashboard grid is pre-sized at template bootstrap so all
+        ``addTable`` ranges fit within the existing grid bounds, letting
+        the whole layout ship as a single batchUpdate call.
+
+        A no-op when ``requests`` is empty.
+        """
+        if not requests:
+            return
+        self._disc().spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
         ).execute()
 
     # ------------------------------------------------------------------ #

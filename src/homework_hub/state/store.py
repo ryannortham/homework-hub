@@ -2,10 +2,9 @@
 
 Tables:
 
-* **bronze_records / silver_tasks / dim_subjects / silver_task_links /
-  sync_runs** — the medallion data plane. Append-only bronze, latest-wins
-  silver, subject canonicalisation rules, cross-source duplicate links,
-  operational sync ledger.
+* **bronze_records / silver_tasks / dim_subjects / sync_runs** — the
+  medallion data plane. Append-only bronze, latest-wins silver, subject
+  canonicalisation rules, operational sync ledger.
 * **auth_status** — most-recent sync outcome per (child, source) so the
   ``status`` CLI command and Discord alerting can show "Compass last
   succeeded 2 hours ago, Edrolo failed 6 hours ago: auth_expired".
@@ -76,6 +75,11 @@ CREATE TABLE IF NOT EXISTS silver_tasks (
     url TEXT NOT NULL DEFAULT '',
     bronze_id INTEGER,
     last_synced TEXT NOT NULL,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    missing_streak INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT,
+    archived_reason TEXT,
     PRIMARY KEY (child, source, source_id),
     FOREIGN KEY (bronze_id) REFERENCES bronze_records(id) ON DELETE SET NULL
 );
@@ -98,29 +102,6 @@ CREATE TABLE IF NOT EXISTS dim_subjects (
 );
 CREATE INDEX IF NOT EXISTS ix_dim_subjects_priority
     ON dim_subjects (priority DESC, match_type);
-
--- silver_task_links: cross-source duplicate links (Compass↔Classroom only).
--- primary_source is always 'compass' for auto-detected pairs; manual links
--- may use any combination. state transitions: pending -> confirmed/dismissed.
-CREATE TABLE IF NOT EXISTS silver_task_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    child TEXT NOT NULL,
-    primary_source TEXT NOT NULL,
-    primary_source_id TEXT NOT NULL,
-    secondary_source TEXT NOT NULL,
-    secondary_source_id TEXT NOT NULL,
-    confidence TEXT NOT NULL CHECK (confidence IN ('auto_high', 'auto_medium', 'manual')),
-    state TEXT NOT NULL DEFAULT 'pending'
-        CHECK (state IN ('pending', 'confirmed', 'dismissed')),
-    score_subject REAL,
-    score_title REAL,
-    score_due INTEGER,
-    detected_at TEXT NOT NULL,
-    UNIQUE (child, primary_source, primary_source_id,
-            secondary_source, secondary_source_id)
-);
-CREATE INDEX IF NOT EXISTS ix_links_child_state
-    ON silver_task_links (child, state);
 
 -- sync_runs: operational ledger. One row per orchestrator tick per
 -- (child, source); powers Settings tab + /health.
@@ -297,6 +278,148 @@ class StateStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------ #
+    # silver_tasks — archival / reconciliation helpers
+    # ------------------------------------------------------------------ #
+
+    def bump_last_seen(
+        self,
+        *,
+        child: str,
+        source: str,
+        source_ids: list[str],
+        now: datetime | None = None,
+    ) -> int:
+        """Set ``last_seen_at = now`` and ``missing_streak = 0`` for each
+        ``(child, source, source_id)`` that came back in the current sync.
+        Also clears ``archived_at`` / ``archived_reason`` when the row had
+        previously been archived for ``upstream_removed`` — this is the
+        recovery path when a teacher re-adds a task. Returns the number of
+        rows touched."""
+        if not source_ids:
+            return 0
+        ts = (now or datetime.now(UTC)).isoformat()
+        placeholders = ",".join("?" * len(source_ids))
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                f"UPDATE silver_tasks SET last_seen_at = ?, missing_streak = 0, "
+                f"archived_at = CASE WHEN archived_reason = 'upstream_removed' "
+                f"  THEN NULL ELSE archived_at END, "
+                f"archived_reason = CASE WHEN archived_reason = 'upstream_removed' "
+                f"  THEN NULL ELSE archived_reason END "
+                f"WHERE child = ? AND source = ? AND source_id IN ({placeholders})",
+                (ts, child, source, *source_ids),
+            )
+            return cur.rowcount
+
+    def increment_missing_streak(
+        self,
+        *,
+        child: str,
+        source: str,
+        seen_ids: list[str],
+    ) -> list[dict]:
+        """Increment ``missing_streak`` for every silver row in
+        ``(child, source)`` whose ``source_id`` is NOT in ``seen_ids``.
+        Returns the list of affected rows with their new streak value so the
+        caller can decide which to archive."""
+        with closing(self._connect()) as conn, conn:
+            if seen_ids:
+                placeholders = ",".join("?" * len(seen_ids))
+                conn.execute(
+                    f"UPDATE silver_tasks SET missing_streak = missing_streak + 1 "
+                    f"WHERE child = ? AND source = ? AND source_id NOT IN ({placeholders})",
+                    (child, source, *seen_ids),
+                )
+            else:
+                conn.execute(
+                    "UPDATE silver_tasks SET missing_streak = missing_streak + 1 "
+                    "WHERE child = ? AND source = ?",
+                    (child, source),
+                )
+            rows = conn.execute(
+                "SELECT source_id, missing_streak, status, archived_at "
+                "FROM silver_tasks WHERE child = ? AND source = ?",
+                (child, source),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_archived(
+        self,
+        *,
+        child: str,
+        source: str,
+        source_id: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Mark a silver row archived. Sets ``status = 'archived'``,
+        ``archived_at = now``, ``archived_reason = reason``. Returns True if
+        a row was updated."""
+        ts = (now or datetime.now(UTC)).isoformat()
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                "UPDATE silver_tasks SET status = 'archived', "
+                "archived_at = ?, archived_reason = ? "
+                "WHERE child = ? AND source = ? AND source_id = ?",
+                (ts, reason, child, source, source_id),
+            )
+            return cur.rowcount > 0
+
+    def clear_archive(self, *, child: str, source: str, source_id: str) -> bool:
+        """Clear archive flags on a silver row. Status is reset to
+        ``not_started`` so the silver mapper / overdue derivation can take
+        over again on the next sync. Returns True if a row was updated."""
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                "UPDATE silver_tasks SET archived_at = NULL, "
+                "archived_reason = NULL, "
+                "status = CASE WHEN status = 'archived' THEN 'not_started' ELSE status END "
+                "WHERE child = ? AND source = ? AND source_id = ?",
+                (child, source, source_id),
+            )
+            return cur.rowcount > 0
+
+    def list_archived(self, *, child: str, reason: str | None = None) -> list[dict]:
+        """Return all archived silver rows for a child, optionally filtered by reason."""
+        sql = (
+            "SELECT child, source, source_id, title, subject_raw, due_at, "
+            "archived_at, archived_reason "
+            "FROM silver_tasks WHERE child = ? AND archived_at IS NOT NULL"
+        )
+        params: list = [child]
+        if reason is not None:
+            sql += " AND archived_reason = ?"
+            params.append(reason)
+        sql += " ORDER BY archived_at DESC"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_silver_for(self, *, child: str, source: str) -> list[dict]:
+        """Return minimal columns of all silver rows for ``(child, source)``
+        needed by reconciliation: source_id, status, due_at, first_seen_at,
+        archived_at, archived_reason."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT source_id, status, due_at, first_seen_at, "
+                "archived_at, archived_reason "
+                "FROM silver_tasks WHERE child = ? AND source = ?",
+                (child, source),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def silver_for_child(self, *, child: str) -> list[dict]:
+        """Return minimal silver columns across all sources for a child —
+        used by the age-cap sweep."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT child, source, source_id, status, due_at, first_seen_at, "
+                "archived_at FROM silver_tasks WHERE child = ?",
+                (child,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 def _parse_opt_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
@@ -309,7 +432,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
     migrations = [
         "ALTER TABLE silver_tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'homework'",
         "ALTER TABLE silver_tasks ADD COLUMN checkpoints_json TEXT NOT NULL DEFAULT '[]'",
+        # Cleansing/archival fields (added with the stale-task sweep feature).
+        # All nullable / defaulted so existing rows survive the migration.
+        "ALTER TABLE silver_tasks ADD COLUMN first_seen_at TEXT",
+        "ALTER TABLE silver_tasks ADD COLUMN last_seen_at TEXT",
+        "ALTER TABLE silver_tasks ADD COLUMN missing_streak INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE silver_tasks ADD COLUMN archived_at TEXT",
+        "ALTER TABLE silver_tasks ADD COLUMN archived_reason TEXT",
     ]
     for sql in migrations:
         with suppress(sqlite3.OperationalError):
             conn.execute(sql)
+
+    # One-shot backfill: any silver row missing first_seen_at / last_seen_at
+    # inherits the existing last_synced timestamp. Safe to run on every start
+    # because it only updates NULL columns.
+    with suppress(sqlite3.OperationalError):
+        conn.execute(
+            "UPDATE silver_tasks SET first_seen_at = last_synced WHERE first_seen_at IS NULL"
+        )
+        conn.execute(
+            "UPDATE silver_tasks SET last_seen_at = last_synced WHERE last_seen_at IS NULL"
+        )

@@ -12,19 +12,22 @@ and the module is safe to import from anywhere.
 Tab layout
 ----------
 
-* **Today** — read-only ``QUERY()`` view of ``tbl_tasks`` filtered to
-  due-today/overdue rows. Owned by formula; no kid edits.
-* **Tasks** — the kid-facing Table. Some columns mirror silver
-  (read-only after publish), others are kid-editable and persisted via
-  ``UserEdits`` merge. Native Sheets Table ``tbl_tasks``.
-* **Possible Duplicates** — Compass↔Classroom auto-link rows. Two
-  ``Confirm`` / ``Dismiss`` checkboxes per row drive ``state`` writeback
-  on the next sync. Auto-hidden when empty. Native Sheets Table
-  ``tbl_duplicates``.
+* **Dashboard** — read-only formula-driven landing page. Greeting + last-sync
+  pulled from Settings via ``VLOOKUP``, KPI counters via ``COUNTIFS`` against
+  ``tbl_tasks``, three 10-row task lists (Overdue / Due this week / Upcoming)
+  built from per-row ``IFERROR(INDEX(SORT(FILTER(...))))`` slabs, and a "By
+  subject" block (spilled ``UNIQUE`` + ``COUNTIFS`` + ``SPARKLINE``). No kid
+  edits, no publish writes — purely formula-owned.
+* **Tasks** — the kid-facing Table for active homework. Some columns mirror
+  silver (read-only after publish), others are kid-editable and persisted
+  via ``UserEdits`` merge. Native Sheets Table ``tbl_tasks``.
+* **History** — submitted/graded tasks older than ``history_cutoff_days``.
+  Only Status and Notes are editable here. Native Sheets Table
+  ``tbl_history``.
 * **Settings** — key/value display tab; kids never edit it.
 * **UserEdits** — hidden tab, script-managed. Merge target for kid
-  edits to the editable columns on the Tasks tab. Native Sheets Table
-  ``tbl_user_edits``.
+  edits to the editable columns on the Tasks and History tabs. Native
+  Sheets Table ``tbl_user_edits``.
 """
 
 from __future__ import annotations
@@ -74,7 +77,7 @@ class ColumnSpec:
     formula_template:
         For ``FORMULA`` columns, the per-row template. ``{row}`` is
         substituted with the 1-based row number at write time, e.g.
-        ``"=C{row}-TODAY()"`` where C is the absolute column letter for Due.
+        ``"=D{row}-TODAY()"`` where D is the absolute column letter for Due.
     width_px:
         Optional column-width hint applied at bootstrap time. ``None``
         leaves Sheets' default (100px).
@@ -127,37 +130,70 @@ class TabSpec:
 # Fixed dropdown vocabularies
 # --------------------------------------------------------------------------- #
 
+# Native Sheets Table ids for the three Dashboard lists. The Tables are
+# emitted at publish time (sized to actual data) rather than at template
+# time, but the ids are declared here so callers can refer to them by
+# stable name when tearing down / re-creating.
+DASHBOARD_OVERDUE_TABLE_ID = "tbl_dash_overdue"
+DASHBOARD_WEEK_TABLE_ID = "tbl_dash_week"
+DASHBOARD_UPCOMING_TABLE_ID = "tbl_dash_upcoming"
+DASHBOARD_DONE_TABLE_ID = "tbl_dash_done"
+
+# Human-visible section names — used as the Table's ``name`` so the
+# section identity is conveyed via the Table label itself.
+DASHBOARD_OVERDUE_TABLE_NAME = "Overdue"
+DASHBOARD_WEEK_TABLE_NAME = "DueThisWeek"
+DASHBOARD_UPCOMING_TABLE_NAME = "Upcoming"
+DASHBOARD_DONE_TABLE_NAME = "DoneThisWeek"
+
+DASHBOARD_TABLE_IDS: tuple[str, ...] = (
+    DASHBOARD_OVERDUE_TABLE_ID,
+    DASHBOARD_WEEK_TABLE_ID,
+    DASHBOARD_UPCOMING_TABLE_ID,
+    DASHBOARD_DONE_TABLE_ID,
+)
+
+
 SOURCE_VALUES: tuple[str, ...] = ("Compass", "Classroom", "EP", "Edrolo")
 
-# Status mirrors homework_hub.models.Status display labels. Read-only on
-# the Tasks tab — the dropdown is informational + visual only.
+# Status mirrors homework_hub.models.Status display labels. Editable on
+# both Tasks and History tabs so kids can manually update completion state.
 STATUS_VALUES: tuple[str, ...] = (
     "Not started",
     "In progress",
     "Submitted",
     "Graded",
     "Overdue",
+    "Archived",
 )
 
 # Task type mirrors homework_hub.models.TaskType display labels. Read-only —
 # derived from the upstream LMS badge; kids cannot change it.
 TYPE_VALUES: tuple[str, ...] = ("Assessment", "Homework", "General")
 
-PRIORITY_VALUES: tuple[str, ...] = ("", "Low", "Med", "High")
-
-CONFIRM_DISMISS_VALUES: tuple[str, ...] = ("", "Confirm", "Dismiss")  # unused; we use checkbox
-
 
 # --------------------------------------------------------------------------- #
-# Tab definitions
+# Shared column tuple for Tasks and History (identical structure)
 # --------------------------------------------------------------------------- #
+#
+# Both tabs share the same 10-column layout:
+#   Subject(A), Type(B), Title(C), Due(D), Days(E), Status(F),
+#   Notes(G), Source(H), Link(I), task_uid(J)
+#
+# The Days formula references Due=D (col 4) and Status=F (col 6).
 
-# Tasks — the kid-facing Table.
-TASKS_TAB = TabSpec(
-    name="Tasks",
-    table_id="tbl_tasks",
-    description="All current homework. Kids can edit Due, Status, Priority, Done and Notes.",
-    columns=(
+_DAYS_FORMULA = (
+    '=IF(OR(D{row}="",F{row}="Submitted",F{row}="Graded",F{row}="Archived"),' '"",D{row}-TODAY())'
+)
+
+
+def _task_columns(*, due_editable: bool) -> tuple[ColumnSpec, ...]:
+    """Build the 10-column task column tuple.
+
+    ``due_editable`` controls whether the Due column accepts kid overrides.
+    Tasks tab: True. History tab: False (date is locked once in History).
+    """
+    return (
         ColumnSpec(key="subject", header="Subject", kind=ColumnKind.TEXT, width_px=120),
         ColumnSpec(
             key="task_type",
@@ -166,15 +202,22 @@ TASKS_TAB = TabSpec(
             dropdown_values=TYPE_VALUES,
             width_px=110,
         ),
-        ColumnSpec(key="title", header="Title", kind=ColumnKind.TEXT, width_px=260),
-        ColumnSpec(key="description", header="Description", kind=ColumnKind.TEXT, width_px=380),
-        ColumnSpec(key="due", header="Due", kind=ColumnKind.DATE, editable=True, width_px=110),
+        ColumnSpec(key="title", header="Title", kind=ColumnKind.TEXT, width_px=300),
+        ColumnSpec(
+            key="due",
+            header="Due",
+            kind=ColumnKind.DATE,
+            editable=due_editable,
+            width_px=110,
+        ),
         ColumnSpec(
             key="days",
             header="Days",
             kind=ColumnKind.FORMULA,
-            # Due is now column E (index 4) after the Type and Description insertions.
-            formula_template="=E{row}-TODAY()",
+            # Blank when no due date or already submitted/graded — only
+            # relevant for unsubmitted work with a due date.
+            # Due=D(col 4), Status=F(col 6).
+            formula_template=_DAYS_FORMULA,
             width_px=70,
         ),
         ColumnSpec(
@@ -184,21 +227,6 @@ TASKS_TAB = TabSpec(
             dropdown_values=STATUS_VALUES,
             editable=True,
             width_px=120,
-        ),
-        ColumnSpec(
-            key="priority",
-            header="Priority",
-            kind=ColumnKind.DROPDOWN,
-            dropdown_values=PRIORITY_VALUES,
-            editable=True,
-            width_px=90,
-        ),
-        ColumnSpec(
-            key="done",
-            header="Done",
-            kind=ColumnKind.CHECKBOX,
-            editable=True,
-            width_px=60,
         ),
         ColumnSpec(
             key="notes",
@@ -215,105 +243,79 @@ TASKS_TAB = TabSpec(
             width_px=110,
         ),
         ColumnSpec(key="link", header="Link", kind=ColumnKind.TEXT, width_px=80),
-        # Stable identity for UserEdits merge — hidden in the UI but
-        # required so we can join silver writes against kid overrides.
         ColumnSpec(key="task_uid", header="task_uid", kind=ColumnKind.TEXT, width_px=0),
-    ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Tab definitions
+# --------------------------------------------------------------------------- #
+
+# Tasks — active homework kid-facing Table.
+TASKS_TAB = TabSpec(
+    name="Tasks",
+    table_id="tbl_tasks",
+    description="Active homework. Kids can edit Due, Status and Notes.",
+    columns=_task_columns(due_editable=True),
 )
 
 
-# Today — pure formula tab. The single QUERY() formula in A1 builds the
-# whole view from tbl_tasks; no per-column data writes ever land here.
-TODAY_TAB = TabSpec(
-    name="Today",
-    description="Auto-built view: due today + overdue. Read-only.",
+# History — submitted/graded tasks beyond the cutoff window.
+HISTORY_TAB = TabSpec(
+    name="History",
+    table_id="tbl_history",
+    description="Submitted/graded tasks older than the history cutoff. Status and Notes editable.",
+    columns=_task_columns(due_editable=False),
+)
+
+
+# Dashboard — kid-facing landing page. Pure formula tab: every cell is
+# written by ``sheet_template._write_dashboard_layout`` via ``updateCells``
+# (greeting, KPI counters, list slabs, by-subject block). No headers at
+# the schema level — the layout owns row 1 too.
+#
+# v4.3 bordered-canvas layout: 6 columns A..F. Columns A and F are 8px
+# border columns (left + right gutter). Columns B-E host the content:
+#
+#   A=8 border │ B=256 Subject │ C=512 Title │ D=128 Due │ E=128 Status │ F=8 border
+#
+# Border columns also frame the greeting / section headers / footer by
+# being skipped over via ``startColumnIndex=1, endColumnIndex=5`` in the
+# layout writer.
+DASHBOARD_TAB = TabSpec(
+    name="Dashboard",
+    description="Auto-built landing page: greeting, KPIs, task lists. Read-only.",
     columns=(
-        ColumnSpec(
-            key="query",
-            header="",
-            kind=ColumnKind.FORMULA,
-            # Filter Tasks Table by Days <= 0 (today + overdue), excluding
-            # rows already marked Done. Sort by Days ascending so most-
-            # overdue items float to the top.
-            formula_template=(
-                '=QUERY(tbl_tasks, "select Subject, Title, Due, Days, Status, '
-                'Priority, Source where Days <= 0 and Done = false order by Days asc", 1)'
-            ),
-        ),
+        ColumnSpec(key="col_a", header="", kind=ColumnKind.TEXT, width_px=8),
+        ColumnSpec(key="col_b", header="", kind=ColumnKind.TEXT, width_px=256),
+        ColumnSpec(key="col_c", header="", kind=ColumnKind.TEXT, width_px=512),
+        ColumnSpec(key="col_d", header="", kind=ColumnKind.TEXT, width_px=128),
+        ColumnSpec(key="col_e", header="", kind=ColumnKind.TEXT, width_px=128),
+        ColumnSpec(key="col_f", header="", kind=ColumnKind.TEXT, width_px=8),
     ),
     frozen_rows=0,
 )
 
 
-# Possible Duplicates — Compass↔Classroom auto-links.
-DUPLICATES_TAB = TabSpec(
-    name="Possible Duplicates",
-    table_id="tbl_duplicates",
-    description="Confirm/Dismiss to merge or keep apart. Auto-hidden when empty.",
-    columns=(
-        ColumnSpec(key="link_id", header="link_id", kind=ColumnKind.TEXT, width_px=0),
-        ColumnSpec(
-            key="confidence",
-            header="Confidence",
-            kind=ColumnKind.TEXT,
-            width_px=110,
-        ),
-        ColumnSpec(key="subject", header="Subject", kind=ColumnKind.TEXT, width_px=130),
-        ColumnSpec(
-            key="compass_title",
-            header="Compass Title",
-            kind=ColumnKind.TEXT,
-            width_px=260,
-        ),
-        ColumnSpec(
-            key="compass_due",
-            header="Compass Due",
-            kind=ColumnKind.DATE,
-            width_px=110,
-        ),
-        ColumnSpec(
-            key="classroom_title",
-            header="Classroom Title",
-            kind=ColumnKind.TEXT,
-            width_px=260,
-        ),
-        ColumnSpec(
-            key="classroom_due",
-            header="Classroom Due",
-            kind=ColumnKind.DATE,
-            width_px=110,
-        ),
-        ColumnSpec(
-            key="confirm",
-            header="Confirm",
-            kind=ColumnKind.CHECKBOX,
-            editable=True,
-            width_px=80,
-        ),
-        ColumnSpec(
-            key="dismiss",
-            header="Dismiss",
-            kind=ColumnKind.CHECKBOX,
-            editable=True,
-            width_px=80,
-        ),
-    ),
-)
-
-
-# Settings — simple key/value display.
+# Settings — per-source auth/sync status table.
+#
+# Header row + N source rows + trailer rows (Child, Last full sync, Tabs
+# managed). Plain (non-Table) tab so we can mix the header row with the
+# child-info trailer without forcing every row to share the same schema.
 SETTINGS_TAB = TabSpec(
     name="Settings",
-    description="Sync metadata. Read-only.",
+    description="Per-source auth + sync status. Read-only.",
     columns=(
-        ColumnSpec(key="key", header="Key", kind=ColumnKind.TEXT, width_px=180),
-        ColumnSpec(key="value", header="Value", kind=ColumnKind.TEXT, width_px=420),
+        ColumnSpec(key="source", header="Source", kind=ColumnKind.TEXT, width_px=140),
+        ColumnSpec(key="last_synced", header="Last Synced", kind=ColumnKind.TEXT, width_px=180),
+        ColumnSpec(key="token_expires", header="Token Expires", kind=ColumnKind.TEXT, width_px=180),
+        ColumnSpec(key="status", header="Status", kind=ColumnKind.TEXT, width_px=120),
     ),
 )
 
 
 # UserEdits — hidden, script-managed. One row per (task_uid, column) edit.
-# Publish reads this tab before writing Tasks so kid edits survive a resync.
+# Publish reads this tab before writing Tasks/History so kid edits survive a resync.
 USER_EDITS_TAB = TabSpec(
     name="UserEdits",
     table_id="tbl_user_edits",
@@ -322,9 +324,27 @@ USER_EDITS_TAB = TabSpec(
     columns=(
         ColumnSpec(key="task_uid", header="task_uid", kind=ColumnKind.TEXT),
         ColumnSpec(key="column", header="column", kind=ColumnKind.TEXT),
+        ColumnSpec(key="original_value", header="original_value", kind=ColumnKind.TEXT),
         ColumnSpec(key="value", header="value", kind=ColumnKind.TEXT),
         ColumnSpec(key="updated_at", header="updated_at", kind=ColumnKind.TEXT),
     ),
+)
+
+
+# DashboardData — hidden helper tab. Holds the 4 KPI label+value pairs
+# (label in col A, COUNTIF formula in col B) consumed by the Dashboard's
+# floating scorecard and donut charts. Charts require their data to live
+# in actual cells; this tab keeps that plumbing out of the visible
+# Dashboard grid and away from any user-managed tab.
+DASHBOARD_DATA_TAB = TabSpec(
+    name="DashboardData",
+    description="Hidden helper cells sourcing Dashboard charts.",
+    hidden=True,
+    columns=(
+        ColumnSpec(key="label", header="", kind=ColumnKind.TEXT, width_px=160),
+        ColumnSpec(key="value", header="", kind=ColumnKind.TEXT, width_px=80),
+    ),
+    frozen_rows=0,
 )
 
 
@@ -338,7 +358,14 @@ class SheetSchema:
     """The full set of tabs in a kid spreadsheet, in display order."""
 
     tabs: tuple[TabSpec, ...] = field(
-        default=(TODAY_TAB, TASKS_TAB, DUPLICATES_TAB, SETTINGS_TAB, USER_EDITS_TAB)
+        default=(
+            DASHBOARD_TAB,
+            TASKS_TAB,
+            HISTORY_TAB,
+            SETTINGS_TAB,
+            USER_EDITS_TAB,
+            DASHBOARD_DATA_TAB,
+        )
     )
 
     def by_name(self, name: str) -> TabSpec:

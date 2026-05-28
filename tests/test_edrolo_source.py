@@ -211,6 +211,28 @@ class TestEdroloStorageState:
         assert "sessionid=fake-session-abc123" in header
         assert "csrftoken=fake-csrf-xyz789" in header
 
+    def test_token_expires_at_session_cookie_returns_none(self, storage_raw):
+        state = EdroloStorageState(storage_raw)
+        assert state.token_expires_at() is None
+
+    def test_token_expires_at_reads_persistent_cookie(self):
+        from datetime import UTC, datetime
+
+        ts = 1900000000  # well in the future
+        raw = {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "x",
+                    "domain": "app.edrolo.com",
+                    "expires": ts,
+                }
+            ],
+            "origins": [],
+        }
+        state = EdroloStorageState(raw)
+        assert state.token_expires_at() == datetime.fromtimestamp(ts, tz=UTC)
+
 
 # --------------------------------------------------------------------------- #
 # EdroloClient — full HTTP code path via httpx.MockTransport

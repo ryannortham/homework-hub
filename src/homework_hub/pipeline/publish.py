@@ -2,16 +2,16 @@
 
 The publish flow:
 
-1. Read silver rows + auto-detected links for the child.
-2. Read existing ``UserEdits`` rows + ``Possible Duplicates`` checkbox
-   state from the spreadsheet via the :class:`GoldSink` protocol.
-3. Apply checkbox state back to ``silver_task_links`` (kid confirmations
-   from the previous sync are persisted before the next publish).
-4. Project silver into per-tab row data using
-   :func:`project_tasks_rows` / :func:`project_duplicates_rows` /
-   :func:`project_settings_rows`.
-5. Merge ``UserEdits`` over the editable columns on the Tasks tab.
-6. Write Tasks, Possible Duplicates, Settings tabs through the sink.
+1. Read silver rows for the child.
+2. Read existing ``UserEdits`` rows from the spreadsheet via the
+   :class:`GoldSink` protocol.
+3. Capture live kid overrides from the Tasks and History tabs *before*
+   they are overwritten.
+4. Project silver into task rows using :func:`project_tasks_rows`.
+5. Merge ``UserEdits`` over the editable columns.
+6. Partition rows into Active (→ Tasks tab) and History (→ History tab)
+   using a configurable ``cutoff_days`` window.
+7. Write Tasks, History, Settings and UserEdits tabs through the sink.
 
 This module owns ``Source``-display labels (``Compass``/``Classroom``/
 ``Edrolo``) and ``Status``-display labels (``Not started``/...). Date
@@ -24,23 +24,33 @@ needs from the sheet client; a fake implementation is used in tests.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import sqlite3
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from homework_hub.dashboard_layout import (
+    build_requests as build_dashboard_requests,
+)
+from homework_hub.dashboard_layout import (
+    task_rows_to_dashboard_tasks,
+)
 from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Status, Task, TaskType
+from homework_hub.pipeline.auth_status import SourceAuthRow
 from homework_hub.schema import (
-    DUPLICATES_TAB,
+    HISTORY_TAB,
     SCHEMA,
     SETTINGS_TAB,
     TASKS_TAB,
     TabSpec,
 )
 from homework_hub.state.store import StateStore
+
+log = logging.getLogger(__name__)
 
 MELBOURNE = ZoneInfo("Australia/Melbourne")
 
@@ -58,6 +68,7 @@ _STATUS_DISPLAY: dict[str, str] = {
     Status.SUBMITTED.value: "Submitted",
     Status.GRADED.value: "Graded",
     Status.OVERDUE.value: "Overdue",
+    Status.ARCHIVED.value: "Archived",
 }
 
 _TASK_TYPE_DISPLAY: dict[str, str] = {
@@ -82,6 +93,27 @@ def melbourne_local_date(dt: datetime | None) -> date | None:
         return None
     aware = dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     return aware.astimezone(MELBOURNE).date()
+
+
+def format_melbourne_dmy(dt: datetime | None) -> str:
+    """Format a UTC datetime as Melbourne-local ``dd/mm/yyyy HH:MM``.
+
+    Used for the Settings tab where Sheets number-format coercion doesn't
+    apply (the tab is a plain text grid, not a Table with a DATE column).
+    Returns an em-dash for ``None``.
+    """
+    if dt is None:
+        return "—"
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    return aware.astimezone(MELBOURNE).strftime("%d/%m/%Y %H:%M")
+
+
+def format_melbourne_dmy_date(dt: datetime | None) -> str:
+    """Format a UTC datetime as Melbourne-local ``dd/mm/yyyy`` (date only)."""
+    if dt is None:
+        return "—"
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    return aware.astimezone(MELBOURNE).strftime("%d/%m/%Y")
 
 
 def task_uid(task: Task) -> str:
@@ -112,17 +144,9 @@ def parent_uid_from_checkpoint(uid: str) -> str | None:
 
 @dataclass(frozen=True)
 class TaskRow:
-    """One projected row for the Tasks tab. Cells are tab-column-ordered."""
+    """One projected row for the Tasks or History tab. Cells are tab-column-ordered."""
 
     task_uid: str
-    cells: tuple[object, ...]
-
-
-@dataclass(frozen=True)
-class DuplicateRow:
-    """One projected row for the Possible Duplicates tab."""
-
-    link_id: int
     cells: tuple[object, ...]
 
 
@@ -132,25 +156,20 @@ def _task_row(
     subject: str,
     task_type: str,
     title: str,
-    description: str,
     due: date | None,
     status: str,
-    done: bool,
     source: str,
     link: str,
 ) -> TaskRow:
-    """Build one TaskRow with the full TASKS_TAB column order."""
+    """Build one TaskRow with the 10-column TASKS_TAB column order."""
     days_formula = TASKS_TAB.columns[TASKS_TAB.column_index("days")].formula_template
     cell_by_key = {
         "subject": subject,
         "task_type": task_type,
         "title": title,
-        "description": description,
         "due": due,
         "days": days_formula,
         "status": status,
-        "priority": "",
-        "done": done,
         "notes": "",
         "source": source,
         "link": link,
@@ -161,21 +180,14 @@ def _task_row(
 
 
 def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
-    """Project silver tasks into Tasks-tab row data.
+    """Project silver tasks into task row data.
 
-    Tasks with Compass ``Checkpoints`` gradingItems are expanded into a
-    parent row followed by one sub-task row per checkpoint.  Sub-task rows
-    share the parent's subject, type, due date, source and link; their title
-    is prefixed with ``↳`` for visual indentation.
+    Tasks with Compass ``Checkpoints`` gradingItems are expanded into one
+    sub-task row per checkpoint. Sub-task titles are merged as
+    ``"<parent title>: <checkpoint name>"`` so the kid sees both at a glance.
 
-    Editable columns ``priority`` and ``notes`` default to blank.
-    ``done`` is derived from the task's status: ``True`` when the upstream
-    LMS reports the task as Submitted or Graded, ``False`` otherwise.
-    Kids can override it via the sheet; :func:`merge_user_edits` overlays
-    those overrides afterwards.
-
-    The ``Days`` column is written as a row-relative formula so Sheets
-    evaluates it as a number on every open.
+    Editable column ``notes`` defaults to blank. The ``Days`` column is
+    written as a row-relative formula so Sheets evaluates it on every open.
     """
     rows: list[TaskRow] = []
     for t in tasks:
@@ -184,7 +196,6 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
         type_label = _TASK_TYPE_DISPLAY.get(t.task_type.value, "Homework")
         status_label = _STATUS_DISPLAY.get(t.status.value, t.status.value)
         due = melbourne_local_date(t.due_at)
-        upstream_done = t.status in (Status.SUBMITTED, Status.GRADED)
 
         # Tasks with checkpoints are expanded into one row per checkpoint;
         # the parent row is suppressed (the checkpoints carry all the detail).
@@ -199,11 +210,9 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
                         uid=checkpoint_uid(t, gi_id),
                         subject=t.subject or "",
                         task_type=type_label,
-                        title=t.title,
-                        description=gi_name,
+                        title=f"{t.title}: {gi_name}",
                         due=due,
                         status=status_label,
-                        done=upstream_done,
                         source=src_label,
                         link=t.url,
                     )
@@ -215,10 +224,8 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
                     subject=t.subject or "",
                     task_type=type_label,
                     title=t.title,
-                    description="",
                     due=due,
                     status=status_label,
-                    done=upstream_done,
                     source=src_label,
                     link=t.url,
                 )
@@ -227,96 +234,214 @@ def project_tasks_rows(tasks: list[Task]) -> list[TaskRow]:
     return rows
 
 
-def propagate_parent_done(rows: list[TaskRow]) -> list[TaskRow]:
-    """Cascade a parent row's ``Done=True`` to all of its checkpoint sub-rows.
-
-    When a kid ticks the parent task's Done checkbox, the next sync should
-    tick all sub-task rows automatically.  The relationship is identified by
-    ``task_uid`` format: a sub-task uid is ``<parent_uid>:gi:<gi_id>``.
-
-    This runs after ``merge_user_edits`` so the parent's live Done value
-    (potentially a kid override) is already merged in.
-    """
-    done_idx = TASKS_TAB.column_index("done")
-    # Build set of parent uids that are marked done.
-    done_parents: set[str] = {
-        r.task_uid
-        for r in rows
-        if parent_uid_from_checkpoint(r.task_uid) is None and r.cells[done_idx] is True
-    }
-    if not done_parents:
-        return rows
-
-    out: list[TaskRow] = []
+def cap_future_dates(
+    rows: list[TaskRow],
+    *,
+    cap_days: int = 365,
+    today: date | None = None,
+) -> list[TaskRow]:
+    """Blank the Due cell on any row whose due date is implausibly far in the
+    future. Belt-and-braces against source-side date-parser drift (e.g. the
+    pre-fix Classroom bare-date roll-forward that emitted 2027 dates from
+    last-year's missed cards). Emits a WARN log line per affected row."""
+    today_local = today or datetime.now(MELBOURNE).date()
+    cap = today_local + timedelta(days=cap_days)
+    due_idx = TASKS_TAB.column_index("due")
+    capped: list[TaskRow] = []
     for row in rows:
-        parent = parent_uid_from_checkpoint(row.task_uid)
-        if parent in done_parents:
+        cell = row.cells[due_idx]
+        if isinstance(cell, date) and cell > cap:
+            log.warning(
+                "cap_future_dates: blanking due=%s on uid=%s (cap=%s)",
+                cell.isoformat(),
+                row.task_uid,
+                cap.isoformat(),
+            )
             new_cells = list(row.cells)
-            new_cells[done_idx] = True
-            out.append(TaskRow(task_uid=row.task_uid, cells=tuple(new_cells)))
+            new_cells[due_idx] = ""
+            capped.append(TaskRow(task_uid=row.task_uid, cells=tuple(new_cells)))
         else:
-            out.append(row)
-    return out
+            capped.append(row)
+    return capped
 
 
-@dataclass(frozen=True)
-class LinkProjectionInput:
-    """Bundle of silver data needed to project one duplicate row."""
+def project_settings_rows(
+    *,
+    child: str,
+    last_synced: datetime | None,
+    source_auth_rows: list[SourceAuthRow] | None = None,
+) -> list[tuple[str, str, str, str]]:
+    """Project the Settings tab as a 4-column table.
 
-    link_id: int
-    confidence: str  # auto_high | auto_medium | manual
-    state: str  # pending | confirmed | dismissed
-    subject: str
-    compass_title: str
-    compass_due: datetime | None
-    classroom_title: str
-    classroom_due: datetime | None
+    Layout (rows include blank trailing cells so every row has exactly
+    four columns; Sheets renders them as a uniform grid):
 
+    1. One row per enabled source: ``Source | Last Synced | Token Expires | Status``.
+       Dates are formatted as Melbourne-local ``dd/mm/yyyy HH:MM``.
+    2. A spacer row.
+    3. A trailer block with the child name, the full-sync timestamp, and
+       the list of managed tabs.
 
-def project_duplicates_rows(links: list[LinkProjectionInput]) -> list[DuplicateRow]:
-    """Project duplicate-link rows for the Possible Duplicates tab.
-
-    Only ``state == 'pending'`` rows are surfaced; kids' confirm/dismiss
-    decisions are persisted on silver_task_links so the row simply drops
-    off the next publish.
+    ``source_auth_rows`` is optional for backwards compatibility with the
+    older two-column tests; when omitted the per-source block is empty.
     """
-    rows: list[DuplicateRow] = []
-    for link in links:
-        if link.state != "pending":
-            continue
-        confidence_label = (
-            "High"
-            if link.confidence == "auto_high"
-            else "Medium" if link.confidence == "auto_medium" else "Manual"
+    rows: list[tuple[str, str, str, str]] = []
+
+    for row in source_auth_rows or []:
+        rows.append(
+            (
+                row.display_name,
+                format_melbourne_dmy(row.last_success_at),
+                _format_token_expires(row),
+                _STATUS_LABEL.get(row.status, row.status),
+            )
         )
-        cell_by_key = {
-            "link_id": str(link.link_id),
-            "confidence": confidence_label,
-            "subject": link.subject,
-            "compass_title": link.compass_title,
-            "compass_due": melbourne_local_date(link.compass_due),
-            "classroom_title": link.classroom_title,
-            "classroom_due": melbourne_local_date(link.classroom_due),
-            "confirm": False,
-            "dismiss": False,
-        }
-        cells = tuple(cell_by_key[c.key] for c in DUPLICATES_TAB.columns)
-        rows.append(DuplicateRow(link_id=link.link_id, cells=cells))
+
+    rows.append(("", "", "", ""))
+
+    rows.append(("Child", child, "", ""))
+    rows.append(("Last full sync", format_melbourne_dmy(last_synced), "", ""))
+    rows.append(
+        (
+            "Tabs managed",
+            ", ".join(t.name for t in SCHEMA.tabs if not t.hidden),
+            "",
+            "",
+        )
+    )
     return rows
 
 
-def project_settings_rows(*, child: str, last_synced: datetime | None) -> list[tuple[str, str]]:
-    """Project the Settings tab key/value pairs."""
-    last = melbourne_local_date(last_synced).isoformat() if last_synced is not None else "—"
-    return [
-        ("Child", child),
-        ("Last synced (Melbourne date)", last),
-        (
-            "Last synced (UTC)",
-            last_synced.isoformat() if last_synced is not None else "—",
-        ),
-        ("Tabs managed", ", ".join(t.name for t in SCHEMA.tabs if not t.hidden)),
-    ]
+_STATUS_LABEL: dict[str, str] = {
+    "ok": "OK",
+    "expiring": "Expiring soon",
+    "expired": "Expired",
+    "missing": "No token",
+    "never_synced": "Never synced",
+    "failing": "Failing",
+    "unknown": "Unknown",
+}
+
+
+def _format_token_expires(row: SourceAuthRow) -> str:
+    """Render the Token Expires cell for one source row.
+
+    * EduPerfect / Classroom expose an absolute expiry — show it.
+    * Edrolo's ``sessionid`` is a browser-session cookie (no expiry) —
+      show ``Session``.
+    * Compass has no published expiry; we fall back to the captured-at
+      timestamp returned by the reader so the kid can see roughly how
+      stale the cookie is.
+    """
+    if not row.token_present:
+        return "No token"
+    if row.token_expires_at is None:
+        if row.source == "edrolo":
+            return "Session"
+        if row.source == "compass":
+            return "Unknown"
+        return "Session"
+    if row.source == "compass":
+        return f"Captured {format_melbourne_dmy(row.token_expires_at)}"
+    return format_melbourne_dmy(row.token_expires_at)
+
+
+# --------------------------------------------------------------------------- #
+# Task partitioning
+# --------------------------------------------------------------------------- #
+
+
+def partition_tasks(
+    rows: list[TaskRow],
+    tasks: list[Task],
+    user_edits: list[UserEdit],
+    *,
+    cutoff_days: int = 30,
+    now: datetime | None = None,
+) -> tuple[list[TaskRow], list[TaskRow]]:
+    """Partition task rows into (active, history).
+
+    A row moves to History when:
+
+    * Its effective status is ``Archived`` (immediate — no cutoff wait), OR
+    * Its effective status is ``Submitted`` or ``Graded`` AND its effective
+      completion date is older than ``cutoff_days`` ago.
+
+    Effective completion date priority:
+    1. ``updated_at`` from the kid's status UserEdit (manual override timestamp).
+    2. ``submitted_at`` from the silver Task.
+    3. ``due_at`` from the silver Task.
+    4. ``first_seen_at`` from the silver Task (stable anchor; ``last_synced``
+       was deliberately removed here because it refreshes every sync and
+       therefore prevented terminal rows lacking an upstream completion
+       timestamp from ever ageing into History).
+
+    Rows whose completion date cannot be determined are routed straight to
+    History (a terminal status with no temporal anchor is clearly stale and
+    should not clutter the Tasks tab).
+    """
+    ref = now or datetime.now(UTC)
+    cutoff = ref - timedelta(days=cutoff_days)
+
+    task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
+
+    # Index the latest status UserEdit per uid for completion-date lookup.
+    status_edit_by_uid: dict[str, UserEdit] = {}
+    for e in user_edits:
+        if e.column == "status":
+            status_edit_by_uid[e.task_uid] = e
+
+    status_idx = TASKS_TAB.column_index("status")
+    _terminal = {"Submitted", "Graded"}
+
+    active: list[TaskRow] = []
+    history: list[TaskRow] = []
+
+    for row in rows:
+        effective_status = row.cells[status_idx]
+
+        # Archived rows go straight to History regardless of cutoff.
+        if effective_status == "Archived":
+            history.append(row)
+            continue
+
+        if effective_status not in _terminal:
+            active.append(row)
+            continue
+
+        # Resolve the silver Task (handles checkpoint rows via parent uid).
+        uid = row.task_uid
+        task = task_by_uid.get(uid)
+        if task is None:
+            parent_uid = parent_uid_from_checkpoint(uid)
+            if parent_uid:
+                task = task_by_uid.get(parent_uid)
+
+        # Determine the effective completion datetime.
+        completion: datetime | None = None
+        status_edit = status_edit_by_uid.get(uid)
+        if status_edit is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                completion = datetime.fromisoformat(status_edit.updated_at)
+        if completion is None and task is not None:
+            completion = task.submitted_at or task.due_at or task.first_seen_at
+
+        if completion is None:
+            # Terminal status with no temporal anchor — treat as stale and
+            # route to History rather than letting it linger on Tasks.
+            history.append(row)
+            continue
+
+        # Ensure tz-aware for comparison.
+        if completion.tzinfo is None:
+            completion = completion.replace(tzinfo=UTC)
+
+        if completion < cutoff:
+            history.append(row)
+        else:
+            active.append(row)
+
+    return active, history
 
 
 # --------------------------------------------------------------------------- #
@@ -326,19 +451,28 @@ def project_settings_rows(*, child: str, last_synced: datetime | None) -> list[t
 
 @dataclass(frozen=True)
 class UserEdit:
-    """One persisted kid override for a (task_uid, column) pair."""
+    """One persisted kid override for a (task_uid, column) pair.
+
+    ``original_value`` captures the system-derived (projected silver) value
+    at the moment the override is written. Refreshed every publish cycle so
+    it always reflects what the system *would* show now if the override
+    were cleared. When the system catches up (silver value equals the kid's
+    overridden value), the override is automatically dropped by
+    :func:`diff_user_edits` because there's no longer a meaningful diff.
+    """
 
     task_uid: str
     column: str
     value: object  # already coerced to bool for checkboxes
     updated_at: str
+    original_value: object = ""
 
 
 def merge_user_edits(
     rows: list[TaskRow],
     edits: list[UserEdit],
 ) -> list[TaskRow]:
-    """Overlay kid overrides on the editable columns of Tasks rows.
+    """Overlay kid overrides on the editable columns of task rows.
 
     Edits referencing a ``task_uid`` no longer present in silver are
     silently dropped — silver is the source of truth for which tasks
@@ -370,7 +504,7 @@ def diff_user_edits(
     existing: list[UserEdit],
     projected: list[TaskRow] | None = None,
 ) -> list[UserEdit]:
-    """Compute the canonical UserEdits row-set for the Tasks tab.
+    """Compute the canonical UserEdits row-set for the task tabs.
 
     For each editable cell that differs from its *projected* (system-derived)
     value we emit a ``UserEdit`` — this represents a deliberate kid override.
@@ -378,18 +512,15 @@ def diff_user_edits(
     stays small.
 
     ``projected`` is the pre-merge output of :func:`project_tasks_rows`.
-    When omitted (backwards-compat) a static default of ``""`` / ``False``
-    is used, which was the original behaviour before ``done`` became
-    status-derived.  Callers should always supply it.
+    When omitted (backwards-compat) a static default of ``""`` is used.
+    Callers should always supply it.
 
     Existing ``updated_at`` timestamps are preserved when the value did not
     change (avoids spurious churn on every publish).
     """
     editable_cols = TASKS_TAB.editable_columns()
-    projected_by_uid: dict[str, TaskRow] = (
-        {r.task_uid: r for r in projected} if projected else {}
-    )
-    _static_defaults: dict[str, object] = {"priority": "", "done": False, "notes": ""}
+    projected_by_uid: dict[str, TaskRow] = {r.task_uid: r for r in projected} if projected else {}
+    _static_defaults: dict[str, object] = {"notes": ""}
     existing_by_key = {(e.task_uid, e.column): e for e in existing}
 
     out: list[UserEdit] = []
@@ -399,18 +530,30 @@ def diff_user_edits(
         for col in editable_cols:
             idx = TASKS_TAB.column_index(col.key)
             value = row.cells[idx]
-            # Use the projected (system-derived) value as the baseline so a
-            # done=True on a Submitted task is not treated as a kid override.
+            # Use the projected (system-derived) value as the baseline.
             if proj_row is not None:
                 default = proj_row.cells[idx]
             else:
                 default = _static_defaults.get(col.key, "")
             if value == default:
+                # System has caught up to the kid's value (or there never
+                # was an override). Skip — this naturally drops the
+                # override from UserEdits on the next writeback cycle.
                 continue
             prior = existing_by_key.get((row.task_uid, col.key))
             if prior is not None and prior.value == value:
-                # Unchanged — preserve original updated_at.
-                out.append(prior)
+                # Unchanged value — preserve original updated_at but
+                # refresh ``original_value`` to the current projected
+                # silver value (Option B semantics).
+                out.append(
+                    UserEdit(
+                        task_uid=prior.task_uid,
+                        column=prior.column,
+                        value=prior.value,
+                        updated_at=prior.updated_at,
+                        original_value=default,
+                    )
+                )
             else:
                 out.append(
                     UserEdit(
@@ -418,6 +561,7 @@ def diff_user_edits(
                         column=col.key,
                         value=value,
                         updated_at=now,
+                        original_value=default,
                     )
                 )
     return out
@@ -428,7 +572,7 @@ _SHEETS_EPOCH = date(1899, 12, 30)
 
 
 def _parse_tasks_tab_date(raw: str) -> date | None:
-    """Parse a date cell from the Tasks tab as returned by ``get_all_values()``.
+    """Parse a date cell from the Tasks/History tab as returned by ``get_all_values()``.
 
     Sheets returns the cell's *display* string, so we expect ``dd/MM/yyyy``
     (the format applied at bootstrap).  As a fallback we also handle the raw
@@ -448,17 +592,23 @@ def _parse_tasks_tab_date(raw: str) -> date | None:
     return None
 
 
-def capture_tasks_tab_edits(
+def capture_tab_edits(
     raw_rows: list[list[str]],
     projected: list[TaskRow],
+    *,
+    tab: TabSpec = TASKS_TAB,
 ) -> list[UserEdit]:
-    """Detect kid overrides by comparing the live Tasks tab against projected defaults.
+    """Detect kid overrides by comparing a live tab against projected defaults.
 
     Called with the raw string rows from ``get_all_values()[1:]`` (header
     stripped) before the tab is overwritten.  Joins each raw row to its
     projected counterpart by ``task_uid`` (last column), then for every
     editable column emits a :class:`UserEdit` when the cell value differs
     from the system default.
+
+    ``tab`` selects which tab's editable columns to inspect. Defaults to
+    ``TASKS_TAB``; pass ``HISTORY_TAB`` when reading the History tab (editable
+    columns are Status and Notes only — Due is locked in History).
 
     Coercion per column kind:
     - ``CHECKBOX``  — ``"TRUE"`` → ``True``, ``"FALSE"`` → ``False``.
@@ -467,8 +617,8 @@ def capture_tasks_tab_edits(
     """
     from homework_hub.schema import ColumnKind
 
-    editable_cols = TASKS_TAB.editable_columns()
-    uid_idx = TASKS_TAB.column_index("task_uid")
+    editable_cols = tab.editable_columns()
+    uid_idx = TASKS_TAB.column_index("task_uid")  # same index in both tabs
     projected_by_uid = {r.task_uid: r for r in projected}
     now = datetime.now(UTC).isoformat()
 
@@ -482,7 +632,7 @@ def capture_tasks_tab_edits(
             continue
 
         for col in editable_cols:
-            col_idx = TASKS_TAB.column_index(col.key)
+            col_idx = TASKS_TAB.column_index(col.key)  # same index in both tabs
             if col_idx >= len(raw_row):
                 continue
             raw_val = raw_row[col_idx]
@@ -506,7 +656,15 @@ def capture_tasks_tab_edits(
             if value == default:
                 continue
 
-            out.append(UserEdit(task_uid=uid, column=col.key, value=value, updated_at=now))
+            out.append(
+                UserEdit(
+                    task_uid=uid,
+                    column=col.key,
+                    value=value,
+                    updated_at=now,
+                    original_value=default,
+                )
+            )
 
     return out
 
@@ -515,17 +673,107 @@ def _merge_edit_sources(
     live: list[UserEdit],
     persisted: list[UserEdit],
 ) -> list[UserEdit]:
-    """Combine live (Tasks tab) and persisted (UserEdits tab) edit lists.
+    """Combine live (Tasks/History tabs) and persisted (UserEdits tab) edit lists.
 
     Live edits represent the kid's current state in the sheet and always
     take precedence over what was persisted from a previous sync.
     """
-    merged: dict[tuple[str, str], UserEdit] = {
-        (e.task_uid, e.column): e for e in persisted
-    }
+    merged: dict[tuple[str, str], UserEdit] = {(e.task_uid, e.column): e for e in persisted}
     for e in live:
         merged[(e.task_uid, e.column)] = e
     return list(merged.values())
+
+
+def apply_unarchive_edits(
+    edits: list[UserEdit],
+    tasks: list[Task],
+    store: StateStore,
+) -> list[Task]:
+    """Honour kid-driven un-archive: any ``status`` edit on an archived task
+    that sets a non-Archived value clears the archive flags in silver and
+    returns the updated task list so downstream projection sees the change
+    within the same publish cycle. Returns ``tasks`` unmodified when no
+    un-archive edits are present."""
+    task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
+    updates: dict[str, Task] = {}
+
+    for edit in edits:
+        if edit.column != "status":
+            continue
+        task = task_by_uid.get(edit.task_uid)
+        if task is None or task.status != Status.ARCHIVED:
+            continue
+        new_label = str(edit.value).strip().lower()
+        if new_label == "archived":
+            continue
+        # Reverse the display label back to enum; default to NOT_STARTED if
+        # the kid's value doesn't match a known status.
+        reverse = {v.lower(): k for k, v in _STATUS_DISPLAY.items()}
+        new_status = Status(reverse.get(new_label, Status.NOT_STARTED.value))
+        store.clear_archive(child=task.child, source=task.source.value, source_id=task.source_id)
+        log.info(
+            "apply_unarchive_edits: kid un-archived uid=%s → %s",
+            edit.task_uid,
+            new_status.value,
+        )
+        updates[edit.task_uid] = task.model_copy(
+            update={
+                "status": new_status,
+                "archived_at": None,
+                "archived_reason": None,
+            }
+        )
+
+    if not updates:
+        return tasks
+    return [updates.get(f"{t.source.value}:{t.source_id}", t) for t in tasks]
+
+
+def apply_archive_edits(
+    edits: list[UserEdit],
+    tasks: list[Task],
+    store: StateStore,
+) -> list[Task]:
+    """Honour kid-driven archive: any ``status`` edit setting ``Archived`` on
+    a non-archived task writes the archive flags through to silver so the row
+    persists as archived across syncs. Returns the updated task list so
+    downstream projection sees the change within the same publish cycle.
+
+    The mirror of :func:`apply_unarchive_edits`. Silver ``Graded`` /
+    ``Overdue`` tasks are skipped (terminal statuses can't be re-archived
+    via the sheet; ``filter_superseded_edits`` already drops those edits).
+    """
+    task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
+    updates: dict[str, Task] = {}
+    _terminal_status = {Status.GRADED, Status.OVERDUE}
+
+    for edit in edits:
+        if edit.column != "status":
+            continue
+        if str(edit.value).strip().lower() != "archived":
+            continue
+        task = task_by_uid.get(edit.task_uid)
+        if task is None or task.status == Status.ARCHIVED:
+            continue
+        if task.status in _terminal_status:
+            continue
+        store.mark_archived(
+            child=task.child,
+            source=task.source.value,
+            source_id=task.source_id,
+            reason="kid_edit",
+        )
+        log.info("apply_archive_edits: kid archived uid=%s", edit.task_uid)
+        updates[edit.task_uid] = task.model_copy(
+            update={
+                "status": Status.ARCHIVED,
+                "archived_reason": "kid_edit",
+            }
+        )
+
+    if not updates:
+        return tasks
+    return [updates.get(f"{t.source.value}:{t.source_id}", t) for t in tasks]
 
 
 def filter_superseded_edits(
@@ -536,10 +784,12 @@ def filter_superseded_edits(
 
     Precedence rules:
     - ``status`` — silver ``Graded`` or ``Overdue`` locks the status column;
-      kid cannot override these terminal states.
-    - ``done``   — silver ``Graded`` locks ``done=True``; kid cannot un-tick.
+      kid cannot override these terminal states. Kids CAN set ``Archived``
+      via the sheet (handled by :func:`apply_archive_edits`) and can also
+      edit ``Archived`` → anything else to un-archive a task (handled by
+      :func:`apply_unarchive_edits`).
     - ``due``    — kid always wins; they may set or override any due date.
-    - ``priority`` / ``notes`` — kid always wins; no silver equivalent.
+    - ``notes`` — kid always wins; no silver equivalent.
     """
     task_by_uid = {f"{t.source.value}:{t.source_id}": t for t in tasks}
     _terminal_status = {Status.GRADED, Status.OVERDUE}
@@ -552,11 +802,13 @@ def filter_superseded_edits(
             out.append(edit)
             continue
 
+        # Status column has one terminal-state lock: silver Graded / Overdue
+        # supersede any kid edit. Kid-driven Archive IS allowed — handled by
+        # apply_archive_edits which writes the archive flags through to
+        # silver so the row stays archived across syncs and partitions to
+        # History.
         if edit.column == "status" and task.status in _terminal_status:
-            continue  # Graded / Overdue lock the status column.
-
-        if edit.column == "done" and task.status is Status.GRADED:
-            continue  # Graded locks done=True; kid cannot un-tick.
+            continue
 
         out.append(edit)
 
@@ -564,117 +816,33 @@ def filter_superseded_edits(
 
 
 # --------------------------------------------------------------------------- #
-# Possible-Duplicates checkbox readback
+# Sink protocol + publish entry point
 # --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
-class DuplicateCheckboxState:
-    """Checkbox state read from a Possible Duplicates row."""
+class DashboardMeta:
+    """Live metadata about the Dashboard tab needed for an idempotent
+    publish-time relayout.
 
-    link_id: int
-    confirm: bool
-    dismiss: bool
-
-
-def reconcile_link_state(state: DuplicateCheckboxState) -> str | None:
-    """Map (confirm, dismiss) checkboxes to a silver_task_links state.
-
-    Returns:
-        ``'confirmed'`` if Confirm is ticked,
-        ``'dismissed'`` if only Dismiss is ticked,
-        ``None`` if neither ticked (no change).
-
-    Both ticked → Confirm wins (kid clearly meant to merge).
+    ``sheet_id`` is the Dashboard tab's sheetId. ``table_ids`` is the
+    list of any pre-existing Dashboard Tables (typically the three
+    ``tbl_dash_*`` ids, but tolerant of zero on first publish or one if
+    a previous publish was interrupted). ``banded_range_ids`` and
+    ``conditional_format_rule_count`` are the counts/ids needed to drain
+    those artefacts before re-emitting fresh ones.
     """
-    if state.confirm:
-        return "confirmed"
-    if state.dismiss:
-        return "dismissed"
-    return None
 
-
-# --------------------------------------------------------------------------- #
-# State-store readers
-# --------------------------------------------------------------------------- #
-
-
-def load_links_for_publish(store: StateStore, child: str) -> list[LinkProjectionInput]:
-    """Read silver_task_links + matching silver_tasks for projection.
-
-    Joins each link to both silver rows so the publish layer has the
-    titles and due dates needed without a second query.
-    """
-    with closing(_connect(store)) as conn:
-        rows = conn.execute(
-            "SELECT l.id, l.confidence, l.state, "
-            "  ps.subject_canonical AS subject, "
-            "  ps.title AS compass_title, ps.due_at AS compass_due, "
-            "  ks.title AS classroom_title, ks.due_at AS classroom_due "
-            "FROM silver_task_links l "
-            "JOIN silver_tasks ps "
-            "  ON ps.child = l.child AND ps.source = l.primary_source "
-            " AND ps.source_id = l.primary_source_id "
-            "JOIN silver_tasks ks "
-            "  ON ks.child = l.child AND ks.source = l.secondary_source "
-            " AND ks.source_id = l.secondary_source_id "
-            "WHERE l.child = ? "
-            "ORDER BY l.confidence DESC, l.id ASC",
-            (child,),
-        ).fetchall()
-
-    return [
-        LinkProjectionInput(
-            link_id=int(r["id"]),
-            confidence=r["confidence"],
-            state=r["state"],
-            subject=r["subject"] or "",
-            compass_title=r["compass_title"] or "",
-            compass_due=(datetime.fromisoformat(r["compass_due"]) if r["compass_due"] else None),
-            classroom_title=r["classroom_title"] or "",
-            classroom_due=(
-                datetime.fromisoformat(r["classroom_due"]) if r["classroom_due"] else None
-            ),
-        )
-        for r in rows
-    ]
-
-
-def apply_link_state_writebacks(
-    store: StateStore,
-    states: list[DuplicateCheckboxState],
-) -> int:
-    """Persist checkbox-driven state changes to silver_task_links.
-
-    Returns the count of rows updated.
-    """
-    if not states:
-        return 0
-    updated = 0
-    with closing(_connect(store)) as conn, conn:
-        for s in states:
-            new_state = reconcile_link_state(s)
-            if new_state is None:
-                continue
-            cur = conn.execute(
-                "UPDATE silver_task_links SET state = ? WHERE id = ?",
-                (new_state, s.link_id),
-            )
-            updated += cur.rowcount
-    return updated
-
-
-# --------------------------------------------------------------------------- #
-# Sink protocol + publish entry point
-# --------------------------------------------------------------------------- #
+    sheet_id: int
+    table_ids: list[str]
+    banded_range_ids: list[int]
+    conditional_format_rule_count: int
 
 
 class GoldSink(Protocol):
     """Surface the publish step needs from the spreadsheet backend."""
 
     def read_user_edits(self, spreadsheet_id: str) -> list[UserEdit]: ...
-
-    def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[DuplicateCheckboxState]: ...
 
     def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]: ...
 
@@ -687,13 +855,18 @@ class GoldSink(Protocol):
 
     def set_tab_hidden(self, spreadsheet_id: str, tab: TabSpec, hidden: bool) -> None: ...
 
+    def read_dashboard_meta(self, spreadsheet_id: str) -> DashboardMeta: ...
+
+    def write_dashboard_layout(
+        self, spreadsheet_id: str, requests: list[dict[str, Any]]
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class PublishResult:
     child: str
     tasks_written: int
-    duplicates_written: int
-    duplicates_state_updates: int
+    history_written: int
     user_edits_written: int
 
 
@@ -705,39 +878,71 @@ def publish_for_child(
     spreadsheet_id: str,
     tasks: list[Task],
     last_synced: datetime | None,
+    cutoff_days: int = 30,
+    future_date_cap_days: int = 365,
+    source_auth_rows: list[SourceAuthRow] | None = None,
 ) -> PublishResult:
     """End-to-end publish for one child.
 
     Idempotent: re-running with the same silver state and the same
     sheet contents produces zero net changes.
     """
-    # 1. Persist last sync's checkbox decisions BEFORE re-reading links,
-    #    so confirmed/dismissed pairs drop out of this publish.
-    checkbox_states = sink.read_duplicate_checkboxes(spreadsheet_id)
-    state_updates = apply_link_state_writebacks(store, checkbox_states)
-
-    # 2. Read silver-derived link projections for the kid.
-    link_inputs = load_links_for_publish(store, child)
-
-    # 3. Project rows and capture kid overrides from the live Tasks tab
-    #    *before* it is overwritten.
+    # 1. Project silver into task rows, then blank out implausibly-future
+    #    due dates (defence against source-side parser drift).
     task_rows = project_tasks_rows(tasks)
+    task_rows = cap_future_dates(task_rows, cap_days=future_date_cap_days)
+
+    # 2. Capture live kid overrides from both tabs *before* overwriting.
+    #
+    # Each capture call is scoped to the projection rows that BELONG in the
+    # tab being read. If we passed the full ``task_rows`` to both calls, a
+    # row that moved from Tasks→History this cycle (e.g. a newly-archived
+    # row) would have its stale Tasks-tab cell compared against its new
+    # History-tab projection, generating a phantom kid-edit that then
+    # triggers ``apply_unarchive_edits`` and clears the archive flags every
+    # sync. Pre-partition with an empty edit list to derive the silver-only
+    # destination per row, then scope each capture accordingly.
     persisted_edits = sink.read_user_edits(spreadsheet_id)
     raw_tasks_rows = sink.read_tab_raw(spreadsheet_id, TASKS_TAB.name)
-    live_edits = capture_tasks_tab_edits(raw_tasks_rows, task_rows)
-    user_edits = _merge_edit_sources(live_edits, persisted_edits)
+    raw_history_rows = sink.read_tab_raw(spreadsheet_id, HISTORY_TAB.name)
+    silver_active_rows, silver_history_rows = partition_tasks(
+        task_rows, tasks, [], cutoff_days=cutoff_days
+    )
+    live_task_edits = capture_tab_edits(raw_tasks_rows, silver_active_rows, tab=TASKS_TAB)
+    live_history_edits = capture_tab_edits(raw_history_rows, silver_history_rows, tab=HISTORY_TAB)
+
+    # 3. Merge all edit sources and apply superseded filter.
+    user_edits = _merge_edit_sources([*live_task_edits, *live_history_edits], persisted_edits)
     user_edits = filter_superseded_edits(user_edits, tasks)
+
+    # 3a. Honour kid-driven un-archive: a status edit moving a row from
+    #     "Archived" to anything else clears the archive flags in silver and
+    #     reprojects the row so it lands on the Tasks tab this cycle.
+    tasks = apply_unarchive_edits(user_edits, tasks, store)
+    # 3b. Honour kid-driven archive: a status edit setting "Archived" on
+    #     a non-archived task writes the archive flags into silver so the
+    #     row persists as archived across syncs and partitions to History.
+    tasks = apply_archive_edits(user_edits, tasks, store)
+    task_rows = project_tasks_rows(tasks)
+    task_rows = cap_future_dates(task_rows, cap_days=future_date_cap_days)
+
+    # 4. Apply edits to rows, then partition into active / history.
     merged_rows = merge_user_edits(task_rows, user_edits)
-    merged_rows = propagate_parent_done(merged_rows)
-    duplicate_rows = project_duplicates_rows(link_inputs)
-    settings_rows = project_settings_rows(child=child, last_synced=last_synced)
+    active_rows, history_rows = partition_tasks(
+        merged_rows, tasks, user_edits, cutoff_days=cutoff_days
+    )
 
-    # 4. Compute UserEdits writeback (canonical row-set).
+    # 5. Compute UserEdits writeback (canonical row-set against all rows).
     edits_writeback = diff_user_edits(merged_rows, user_edits, projected=task_rows)
+    settings_rows = project_settings_rows(
+        child=child,
+        last_synced=last_synced,
+        source_auth_rows=source_auth_rows,
+    )
 
-    # 5. Write tabs.
-    sink.write_tab(spreadsheet_id, TASKS_TAB, [r.cells for r in merged_rows])
-    sink.write_tab(spreadsheet_id, DUPLICATES_TAB, [r.cells for r in duplicate_rows])
+    # 6. Write tabs.
+    sink.write_tab(spreadsheet_id, TASKS_TAB, [r.cells for r in active_rows])
+    sink.write_tab(spreadsheet_id, HISTORY_TAB, [r.cells for r in history_rows])
     sink.write_tab(spreadsheet_id, SETTINGS_TAB, [tuple(p) for p in settings_rows])
 
     user_edits_tab = SCHEMA.by_name("UserEdits")
@@ -745,19 +950,45 @@ def publish_for_child(
         spreadsheet_id,
         user_edits_tab,
         [
-            (e.task_uid, e.column, _coerce_user_edit_value(e.value), e.updated_at)
+            (
+                e.task_uid,
+                e.column,
+                _coerce_user_edit_value(e.original_value),
+                _coerce_user_edit_value(e.value),
+                e.updated_at,
+            )
             for e in edits_writeback
         ],
     )
 
-    # 6. Auto-hide the Possible Duplicates tab when there's nothing to confirm.
-    sink.set_tab_hidden(spreadsheet_id, DUPLICATES_TAB, hidden=not duplicate_rows)
+    # 7. Refresh the Dashboard's three task-list Tables. The Dashboard
+    # frame (greeting / floating KPI scorecards / donut) is template-owned
+    # and stays put; this step re-emits the lists region sized to the
+    # current active row count. Failures here are logged but don't fail
+    # publish — the Tasks/History/Settings/UserEdits writes above are the
+    # canonical state of the world, and the Dashboard lists will be
+    # picked up on the next publish.
+    try:
+        meta = sink.read_dashboard_meta(spreadsheet_id)
+        today = melbourne_local_date(datetime.now(UTC))
+        assert today is not None  # datetime.now(UTC) is never None
+        dash_tasks = task_rows_to_dashboard_tasks(active_rows)
+        dash_requests = build_dashboard_requests(
+            dash_sheet_id=meta.sheet_id,
+            tasks=dash_tasks,
+            today=today,
+            existing_table_ids=meta.table_ids,
+            existing_banded_range_ids=meta.banded_range_ids,
+            existing_conditional_format_rule_count=meta.conditional_format_rule_count,
+        )
+        sink.write_dashboard_layout(spreadsheet_id, dash_requests)
+    except Exception:
+        log.exception("dashboard layout refresh failed for child=%s", child)
 
     return PublishResult(
         child=child,
-        tasks_written=len(merged_rows),
-        duplicates_written=len(duplicate_rows),
-        duplicates_state_updates=state_updates,
+        tasks_written=len(active_rows),
+        history_written=len(history_rows),
         user_edits_written=len(edits_writeback),
     )
 
@@ -786,27 +1017,25 @@ def _connect(store: StateStore) -> sqlite3.Connection:
 # Re-export internal types intentionally kept private at module level.
 __all__ = [
     "MELBOURNE",
-    "DuplicateCheckboxState",
-    "DuplicateRow",
+    "DashboardMeta",
     "GoldSink",
-    "LinkProjectionInput",
     "PublishResult",
     "TaskRow",
     "UserEdit",
-    "apply_link_state_writebacks",
-    "capture_tasks_tab_edits",
+    "apply_archive_edits",
+    "apply_unarchive_edits",
+    "capture_tab_edits",
     "checkpoint_uid",
     "diff_user_edits",
     "filter_superseded_edits",
-    "load_links_for_publish",
+    "format_melbourne_dmy",
+    "format_melbourne_dmy_date",
     "melbourne_local_date",
     "merge_user_edits",
     "parent_uid_from_checkpoint",
-    "project_duplicates_rows",
+    "partition_tasks",
     "project_settings_rows",
     "project_tasks_rows",
-    "propagate_parent_done",
     "publish_for_child",
-    "reconcile_link_state",
     "task_uid",
 ]

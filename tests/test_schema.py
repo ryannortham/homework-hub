@@ -5,14 +5,12 @@ from __future__ import annotations
 import pytest
 
 from homework_hub.schema import (
-    DUPLICATES_TAB,
-    PRIORITY_VALUES,
+    DASHBOARD_TAB,
     SCHEMA,
     SETTINGS_TAB,
     SOURCE_VALUES,
     STATUS_VALUES,
     TASKS_TAB,
-    TODAY_TAB,
     USER_EDITS_TAB,
     ColumnKind,
     ColumnSpec,
@@ -60,15 +58,14 @@ class TestTabSpec:
 
     def test_editable_columns(self):
         keys = {c.key for c in TASKS_TAB.editable_columns()}
-        assert keys == {"due", "status", "priority", "done", "notes"}
+        assert keys == {"due", "status", "notes"}
 
 
 class TestTasksTab:
-    def test_priority_dropdown_includes_blank(self):
-        col = TASKS_TAB.columns[TASKS_TAB.column_index("priority")]
+    def test_type_dropdown(self):
+        col = TASKS_TAB.columns[TASKS_TAB.column_index("task_type")]
         assert col.kind is ColumnKind.DROPDOWN
-        assert "" in col.dropdown_values
-        assert {"Low", "Med", "High"}.issubset(set(col.dropdown_values))
+        assert {"Assessment", "Homework", "General"}.issubset(set(col.dropdown_values))
 
     def test_subject_is_text_not_dropdown(self):
         # Subject column intentionally has NO dropdown — there are too many
@@ -81,16 +78,21 @@ class TestTasksTab:
         col = TASKS_TAB.columns[TASKS_TAB.column_index("days")]
         assert col.kind is ColumnKind.FORMULA
         assert "TODAY()" in col.formula_template
-        # Uses absolute column reference (E = Due column, after Type+Description insertions)
-        # with {row} substitution rather than a structured table reference ([@Due]) which
-        # the Sheets API rejects when written programmatically via updateCells.
         assert "{row}" in col.formula_template
-        assert "E" in col.formula_template
+        # Blank when no due date or already submitted/graded.
+        assert "Submitted" in col.formula_template
+        assert "Graded" in col.formula_template
 
-    def test_done_is_checkbox_and_editable(self):
-        col = TASKS_TAB.columns[TASKS_TAB.column_index("done")]
-        assert col.kind is ColumnKind.CHECKBOX
-        assert col.editable is True
+    def test_days_formula_blanks_archived_rows(self):
+        """The Days formula must blank archived rows so they don't render a
+        negative number when they appear on the History tab."""
+        col = TASKS_TAB.columns[TASKS_TAB.column_index("days")]
+        assert "Archived" in col.formula_template
+
+    def test_status_dropdown_includes_archived(self):
+        """The Status dropdown must include 'Archived' so the cell renders
+        correctly when the silver writer / age-cap sweep sets it."""
+        assert "Archived" in STATUS_VALUES
 
     def test_due_is_date(self):
         col = TASKS_TAB.columns[TASKS_TAB.column_index("due")]
@@ -116,40 +118,39 @@ class TestTasksTab:
         assert TASKS_TAB.table_id == "tbl_tasks"
 
 
-class TestTodayTab:
-    def test_query_formula(self):
-        col = TODAY_TAB.columns[0]
-        assert col.kind is ColumnKind.FORMULA
-        assert "QUERY(tbl_tasks" in col.formula_template
-        assert "Days <= 0" in col.formula_template
-        assert "Done = false" in col.formula_template
-
+class TestDashboardTab:
     def test_no_table_id(self):
-        # Today is a pure formula view, NOT a Sheets Table.
-        assert TODAY_TAB.table_id == ""
+        # Dashboard is pure formula-driven, NOT a Sheets Table.
+        assert DASHBOARD_TAB.table_id == ""
 
+    def test_six_columns(self):
+        # v4.3 bordered-canvas Dashboard layout uses 6 columns A..F.
+        # Columns A and F are 8px border columns framing content in B..E.
+        assert len(DASHBOARD_TAB.columns) == 6
 
-class TestDuplicatesTab:
-    def test_confirm_dismiss_checkboxes(self):
-        confirm = DUPLICATES_TAB.columns[DUPLICATES_TAB.column_index("confirm")]
-        dismiss = DUPLICATES_TAB.columns[DUPLICATES_TAB.column_index("dismiss")]
-        assert confirm.kind is ColumnKind.CHECKBOX
-        assert confirm.editable is True
-        assert dismiss.kind is ColumnKind.CHECKBOX
-        assert dismiss.editable is True
+    def test_no_headers(self):
+        # The layout owns row 1 — no schema-level header strings.
+        assert all(c.header == "" for c in DASHBOARD_TAB.columns)
 
-    def test_compass_and_classroom_titles_present(self):
-        assert "compass_title" in {c.key for c in DUPLICATES_TAB.columns}
-        assert "classroom_title" in {c.key for c in DUPLICATES_TAB.columns}
+    def test_no_frozen_rows(self):
+        # Dashboard has no header row to freeze.
+        assert DASHBOARD_TAB.frozen_rows == 0
 
-    def test_link_id_hidden_first(self):
-        # link_id is required for state writeback; placed first as a stable key.
-        assert DUPLICATES_TAB.columns[0].key == "link_id"
+    def test_column_widths(self):
+        widths = [c.width_px for c in DASHBOARD_TAB.columns]
+        # 8px borders on A/F; B(Subject)=256, C(Title)=512, D(Due)=128,
+        # E(Status)=128. Inner canvas = 1024px; total = 1040px.
+        assert widths == [8, 256, 512, 128, 128, 8]
 
 
 class TestSettingsTab:
-    def test_key_value_layout(self):
-        assert tuple(c.key for c in SETTINGS_TAB.columns) == ("key", "value")
+    def test_per_source_layout(self):
+        assert tuple(c.key for c in SETTINGS_TAB.columns) == (
+            "source",
+            "last_synced",
+            "token_expires",
+            "status",
+        )
         assert SETTINGS_TAB.table_id == ""
 
 
@@ -161,6 +162,7 @@ class TestUserEditsTab:
         assert tuple(c.key for c in USER_EDITS_TAB.columns) == (
             "task_uid",
             "column",
+            "original_value",
             "value",
             "updated_at",
         )
@@ -172,7 +174,14 @@ class TestUserEditsTab:
 class TestSheetSchema:
     def test_default_tab_order(self):
         names = tuple(t.name for t in SCHEMA.tabs)
-        assert names == ("Today", "Tasks", "Possible Duplicates", "Settings", "UserEdits")
+        assert names == (
+            "Dashboard",
+            "Tasks",
+            "History",
+            "Settings",
+            "UserEdits",
+            "DashboardData",
+        )
 
     def test_by_name(self):
         assert SCHEMA.by_name("Tasks") is TASKS_TAB
@@ -182,6 +191,39 @@ class TestSheetSchema:
             SCHEMA.by_name("Nope")
 
 
-class TestPriorityVocabulary:
-    def test_priority_values(self):
-        assert PRIORITY_VALUES == ("", "Low", "Med", "High")
+class TestDashboardTableIds:
+    """v5.0: Dashboard lists are real Sheets Tables; each section's
+    Table is identified by a stable opaque id + human-readable name."""
+
+    def test_table_ids_and_names_are_distinct_and_stable(self):
+        from homework_hub.schema import (
+            DASHBOARD_DONE_TABLE_ID,
+            DASHBOARD_DONE_TABLE_NAME,
+            DASHBOARD_OVERDUE_TABLE_ID,
+            DASHBOARD_OVERDUE_TABLE_NAME,
+            DASHBOARD_TABLE_IDS,
+            DASHBOARD_UPCOMING_TABLE_ID,
+            DASHBOARD_UPCOMING_TABLE_NAME,
+            DASHBOARD_WEEK_TABLE_ID,
+            DASHBOARD_WEEK_TABLE_NAME,
+        )
+
+        # IDs are non-empty strings (Sheets accepts caller-supplied ids).
+        ids = (
+            DASHBOARD_OVERDUE_TABLE_ID,
+            DASHBOARD_WEEK_TABLE_ID,
+            DASHBOARD_UPCOMING_TABLE_ID,
+            DASHBOARD_DONE_TABLE_ID,
+        )
+        for tid in ids:
+            assert isinstance(tid, str)
+            assert tid
+        # Distinct.
+        assert len(set(ids)) == 4
+        # Aggregated tuple matches.
+        assert ids == DASHBOARD_TABLE_IDS
+        # Names are the user-visible section labels.
+        assert DASHBOARD_OVERDUE_TABLE_NAME == "Overdue"
+        assert DASHBOARD_WEEK_TABLE_NAME == "DueThisWeek"
+        assert DASHBOARD_UPCOMING_TABLE_NAME == "Upcoming"
+        assert DASHBOARD_DONE_TABLE_NAME == "DoneThisWeek"

@@ -26,6 +26,7 @@ class Status(StrEnum):
     SUBMITTED = "submitted"
     GRADED = "graded"
     OVERDUE = "overdue"
+    ARCHIVED = "archived"
 
 
 class TaskType(StrEnum):
@@ -62,8 +63,22 @@ class Task(BaseModel):
     checkpoints: list[dict[str, Any]] = Field(default_factory=list)
     url: str = ""
     last_synced: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Operational/archival metadata populated by the silver layer. Not set by
+    # source mappers; surfaced in publish for partitioning + diagnostics.
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    archived_at: datetime | None = None
+    archived_reason: str | None = None
 
-    @field_validator("assigned_at", "due_at", "submitted_at", "last_synced")
+    @field_validator(
+        "assigned_at",
+        "due_at",
+        "submitted_at",
+        "last_synced",
+        "first_seen_at",
+        "last_seen_at",
+        "archived_at",
+    )
     @classmethod
     def ensure_tz_aware(cls, value: datetime | None) -> datetime | None:
         """All datetimes stored in UTC. Naive values are assumed UTC."""
@@ -80,7 +95,7 @@ class Task(BaseModel):
 
     def with_overdue_check(self, now: datetime | None = None) -> Self:
         """Return a copy with status flipped to OVERDUE if past due and not submitted."""
-        if self.due_at is None or self.status in (Status.SUBMITTED, Status.GRADED):
+        if self.due_at is None or self.status in (Status.SUBMITTED, Status.GRADED, Status.ARCHIVED):
             return self
         ref = now or datetime.now(UTC)
         if self.due_at < ref:

@@ -26,6 +26,7 @@ from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Status
 from homework_hub.sources.base import AuthExpiredError, SchemaBreakError
 from homework_hub.sources.classroom import (
+    _EXTRACT_CARDS_JS,
     DEFAULT_TZ,
     ClassroomSource,
     ClassroomStorageState,
@@ -153,11 +154,15 @@ class TestParseDueText:
         assert result is not None
         assert result.date() == date(2026, 5, 6)
 
-    def test_date_no_year_rolls_to_next_year_when_past(self):
-        # Today 2026-04-29; "1 Mar" would have been March 2026 → past, so 2027.
+    def test_date_no_year_returns_past_date_unchanged(self):
+        # Today 2026-04-29; "1 Mar" parses to March 2026 (in the past).
+        # The parser no longer rolls forward to next year — a past date is
+        # a past date, and silver layer can treat it as overdue. This guards
+        # against the old behaviour that silently produced phantom future
+        # dates (e.g. 2027) from last-year's missed cards.
         result = parse_due_text("Sunday 1 Mar", today=TODAY)
         assert result is not None
-        assert result.date() == date(2027, 3, 1)
+        assert result.date() == date(2026, 3, 1)
 
     def test_short_month_names(self):
         result = parse_due_text("Tuesday, 2 Dec 2025", today=TODAY)
@@ -362,6 +367,35 @@ class TestStorageState:
         reloaded = ClassroomStorageState.load(path)
         assert reloaded.raw == raw
 
+    def test_token_expires_at_reads_sid_cookie(self, tmp_path: Path):
+        ts = 1814331241  # 2027-07-30 UTC
+        raw = {
+            "cookies": [
+                {"name": "SID", "value": "x", "domain": ".google.com", "expires": ts},
+                {"name": "SAPISID", "value": "y", "domain": ".google.com", "expires": -1},
+            ],
+            "origins": [],
+        }
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps(raw))
+        state = ClassroomStorageState.load(path)
+        from datetime import UTC, datetime
+
+        assert state.token_expires_at() == datetime.fromtimestamp(ts, tz=UTC)
+
+    def test_token_expires_at_returns_none_for_session_cookie(self, tmp_path: Path):
+        raw = {
+            "cookies": [
+                {"name": "SID", "value": "x", "domain": ".google.com", "expires": -1},
+                {"name": "SAPISID", "value": "y", "domain": ".google.com", "expires": -1},
+            ],
+            "origins": [],
+        }
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps(raw))
+        state = ClassroomStorageState.load(path)
+        assert state.token_expires_at() is None
+
 
 # --------------------------------------------------------------------------- #
 # ClassroomSource.fetch (integration with fake scraper)
@@ -502,12 +536,33 @@ class TestClassroomFetchRaw:
         with pytest.raises(SchemaBreakError):
             src.fetch_raw("tahlia")
 
-    def test_missing_id_fields_raise_schema_break(self, storage_path: Path):
-        broken = {**CARD_FULL_DATE, "course_id": ""}
-        canned = {"assigned": [broken], "missing": [], "done": []}
+    def test_missing_id_fields_skipped_with_warning(
+        self, storage_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        broken = {**CARD_FULL_DATE, "course_id": "", "title": "Broken Card"}
+        canned = {"assigned": [broken, CARD_NO_YEAR], "missing": [], "done": []}
         src = ClassroomSource(
             {"james": storage_path},
             scraper_factory=lambda _s: FakeScraper(canned),
         )
-        with pytest.raises(SchemaBreakError):
-            src.fetch_raw("james")
+        with caplog.at_level("WARNING", logger="homework_hub.sources.classroom"):
+            records = src.fetch_raw("james")
+        # Good card still flows through; broken one is dropped.
+        assert len(records) == 1
+        assert (
+            records[0].source_id == f"{CARD_NO_YEAR['course_id']}:{CARD_NO_YEAR['stream_item_id']}"
+        )
+        assert any("Broken Card" in r.message for r in caplog.records)
+
+
+class TestExtractCardsJs:
+    """The card-extractor JS is hard to test directly without a browser, but
+    we can at least assert that the href regex covers both assignment (``/a/``)
+    and short-answer question (``/sa/``) URL shapes — Google emits the latter
+    for ``icon=live_help`` cards (regression seen 2026-05)."""
+
+    def test_href_regex_accepts_sa_segment(self):
+        # The JS source uses an escaped-for-Python-string regex literal.
+        # The relevant fragment is the literal ``\/c\/([^/]+)\/s?a\/([^/]+)\/``
+        # which permits an optional ``s`` before ``a``.
+        assert "/c\\/([^/]+)\\/s?a\\/([^/]+)\\/" in _EXTRACT_CARDS_JS

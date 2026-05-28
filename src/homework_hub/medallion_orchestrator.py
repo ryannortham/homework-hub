@@ -1,4 +1,4 @@
-"""Medallion orchestrator — wires bronze → silver → links → gold.
+"""Medallion orchestrator — wires bronze → silver → gold.
 
 The legacy ``Orchestrator`` (in ``orchestrator.py``) writes through the
 old ``apply_diff`` Raw-tab path; this module replaces it with the
@@ -8,11 +8,9 @@ medallion flow:
                     write to ``bronze_records``.
 2. **Transform**  — read latest bronze rows for the child, project to
                     canonical ``Task`` rows, upsert to ``silver_tasks``.
-3. **Detect**     — re-run :class:`LinkDetector` against the now-fresh
-                    silver layer.
-4. **Publish**    — project silver into per-tab gold rows and write
+3. **Publish**    — project silver into per-tab gold rows and write
                     through a :class:`GoldSink`. Skipped (with a clear
-                    ``sync_runs`` row) when no sink is configured \u2014
+                    ``sync_runs`` row) when no sink is configured —
                     M5c provides the real implementation.
 
 Each step records one row per ``(child, source)`` to ``sync_runs`` so
@@ -20,7 +18,7 @@ the Settings tab and ``/health`` can surface operational status.
 
 Failures isolate per source: an Edrolo auth-expired error must not
 prevent the Compass + Classroom layers from publishing. Stage-level
-failures (transform, detect, publish) record a single row with
+failures (transform, publish) record a single row with
 ``source='*'`` and an error string.
 """
 
@@ -31,12 +29,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from homework_hub.config import ChildrenConfig
+from homework_hub.config import ChildrenConfig, Settings
 from homework_hub.models import Source as SourceEnum
 from homework_hub.models import Task
+from homework_hub.pipeline.auth_status import build_source_auth_rows
 from homework_hub.pipeline.ingest import BronzeWriter, IngestResult
-from homework_hub.pipeline.link_detector import DetectionResult, LinkDetector
 from homework_hub.pipeline.publish import GoldSink, PublishResult, publish_for_child
+from homework_hub.pipeline.reconcile import apply_age_cap, reconcile_stale
 from homework_hub.pipeline.transform import (
     SilverWriter,
     TransformResult,
@@ -93,23 +92,12 @@ class TransformStageResult:
 
 
 @dataclass(frozen=True)
-class DetectStageResult:
-    child: str
-    ok: bool
-    inserted: int = 0
-    updated: int = 0
-    unchanged: int = 0
-    error: str | None = None
-
-
-@dataclass(frozen=True)
 class PublishStageResult:
     child: str
     ok: bool
     skipped_reason: str | None = None
     tasks_written: int = 0
-    duplicates_written: int = 0
-    duplicates_state_updates: int = 0
+    history_written: int = 0
     user_edits_written: int = 0
     error: str | None = None
 
@@ -119,19 +107,16 @@ class MedallionChildReport:
     child: str
     ingest: list[IngestStageResult] = field(default_factory=list)
     transform: TransformStageResult | None = None
-    detect: DetectStageResult | None = None
     publish: PublishStageResult | None = None
 
     @property
     def ok(self) -> bool:
         if self.transform and not self.transform.ok:
             return False
-        if self.detect and not self.detect.ok:
-            return False
         if self.publish and not self.publish.ok:
             return False
-        # An ingest source failing isn't fatal for the run \u2014 the others
-        # still publish \u2014 but it does mark the report as having failures.
+        # An ingest source failing isn't fatal for the run — the others
+        # still publish — but it does mark the report as having failures.
         return all(r.ok for r in self.ingest)
 
 
@@ -161,14 +146,38 @@ class MedallionOrchestrator:
         sources_for_child: dict[str, list[Source]],
         state: StateStore,
         sink: GoldSink | None = None,
+        history_cutoff_days: int = 30,
+        active_cutoff_days: int = 60,
+        stale_grace_syncs: int = 2,
+        future_date_cap_days: int = 365,
+        settings: Settings | None = None,
     ):
         self.children_config = children_config
         self.sources_for_child = sources_for_child
         self.state = state
         self.sink = sink
+        self.history_cutoff_days = history_cutoff_days
+        self.settings = settings
+        # Cleansing knobs. When ``settings`` is supplied, prefer its values
+        # so the wiring layer is the single source of truth.
+        self._active_cutoff_days = (
+            settings.active_cutoff_days if settings is not None else active_cutoff_days
+        )
+        self._stale_grace_syncs = (
+            settings.stale_grace_syncs if settings is not None else stale_grace_syncs
+        )
+        self._future_date_cap_days = (
+            settings.future_date_cap_days if settings is not None else future_date_cap_days
+        )
         self._bronze = BronzeWriter(state)
         self._silver = SilverWriter(state)
-        self._link_detector = LinkDetector(state)
+        # Per-run scratchpad mapping ``source.name -> list[silver_source_id]``
+        # for the currently-running child. Populated by ``_ingest_one`` on
+        # successful ingest; consumed by ``_run_for_child`` to drive
+        # ``reconcile_stale`` after the transform stage (which would otherwise
+        # mask upstream disappearance by re-writing silver from the bronze
+        # back-catalogue and resetting ``missing_streak`` to 0).
+        self._current_run_seen: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ #
     # Entry points
@@ -196,7 +205,7 @@ class MedallionOrchestrator:
         return MedallionSyncReport(started, datetime.now(UTC), children)
 
     def transform_only(self, *, only_child: str | None = None) -> MedallionSyncReport:
-        """Run just the transform stage \u2014 reads existing bronze rows."""
+        """Run just the transform stage — reads existing bronze rows."""
         started = datetime.now(UTC)
         children: list[MedallionChildReport] = []
         for child in self._resolve_targets(only_child):
@@ -206,12 +215,11 @@ class MedallionOrchestrator:
         return MedallionSyncReport(started, datetime.now(UTC), children)
 
     def publish_only(self, *, only_child: str | None = None) -> MedallionSyncReport:
-        """Run just detect + publish stages."""
+        """Run just the publish stage."""
         started = datetime.now(UTC)
         children: list[MedallionChildReport] = []
         for child in self._resolve_targets(only_child):
             report = MedallionChildReport(child=child)
-            report.detect = self._stage_detect(child)
             report.publish = self._stage_publish(child)
             children.append(report)
         return MedallionSyncReport(started, datetime.now(UTC), children)
@@ -222,9 +230,38 @@ class MedallionOrchestrator:
 
     def _run_for_child(self, child: str) -> MedallionChildReport:
         report = MedallionChildReport(child=child)
+        # Reset per-run scratchpad: ``_ingest_one`` will populate it for
+        # each source that succeeds, and reconcile reads it below.
+        self._current_run_seen = {}
         report.ingest = self._stage_ingest(child)
         report.transform = self._stage_transform(child)
-        report.detect = self._stage_detect(child)
+        # Upstream-disappearance reconciliation runs AFTER transform — the
+        # transform stage re-writes silver from bronze's back-catalogue and
+        # resets ``missing_streak`` to 0, so we have to bump streaks here
+        # using the seen-ids stashed by ``_ingest_one`` for sources whose
+        # ingest succeeded this run. Best-effort; never aborts publish.
+        for source_name, seen_ids in self._current_run_seen.items():
+            try:
+                reconcile_stale(
+                    self.state,
+                    child=child,
+                    source=source_name,
+                    seen_ids=seen_ids,
+                    grace_syncs=self._stale_grace_syncs,
+                )
+            except Exception:
+                log.exception("reconcile_stale failed for %s/%s", child, source_name)
+        # Age-cap sweep — archives stale Overdue rows and date-less zombies
+        # whose anchor (due_at or first_seen_at) is older than the cutoff.
+        # Best-effort; failure here doesn't abort publish.
+        try:
+            apply_age_cap(
+                self.state,
+                child=child,
+                cutoff_days=self._active_cutoff_days,
+            )
+        except Exception:
+            log.exception("apply_age_cap failed for %s", child)
         report.publish = self._stage_publish(child)
         return report
 
@@ -246,22 +283,28 @@ class MedallionOrchestrator:
         # failure, skip silently until a successful ingest resets the clock.
         # This prevents hourly [FAIL] noise for an expected condition while still
         # preserving last known silver data in the sheet.
+        #
+        # If the source reports a token refresh newer than the last failure
+        # (via ``token_refreshed_at``), bypass the silence and attempt the
+        # ingest — the operator has just refreshed credentials.
         if source.silence_repeated_auth_expired:
             auth = self.state.get_auth(child, source.name)
             if auth is not None and auth.last_failure_kind == "auth_expired":
                 last_fail = auth.last_failure_at
                 last_ok = auth.last_success_at
                 if last_fail is not None and (last_ok is None or last_fail > last_ok):
-                    return IngestStageResult(
-                        child=child,
-                        source=source.name,
-                        ok=True,
-                        skipped=True,
-                        skip_reason=(
-                            f"token expired — run "
-                            f"`homework-hub refresh-ep --child {child}` to refresh"
-                        ),
-                    )
+                    refreshed = source.token_refreshed_at(child)
+                    if refreshed is None or refreshed <= last_fail:
+                        return IngestStageResult(
+                            child=child,
+                            source=source.name,
+                            ok=True,
+                            skipped=True,
+                            skip_reason=(
+                                f"token expired — run "
+                                f"`homework-hub refresh-ep --child {child}` to refresh"
+                            ),
+                        )
 
         try:
             records = source.fetch_raw(child)
@@ -281,7 +324,7 @@ class MedallionOrchestrator:
                 child, source.name, "schema_break", str(exc), started
             )
         except NotImplementedError as exc:
-            # A source hasn't implemented fetch_raw() yet \u2014 surface clearly
+            # A source hasn't implemented fetch_raw() yet — surface clearly
             # rather than crashing the whole run.
             return self._record_ingest_failure(
                 child, source.name, "not_implemented", str(exc), started
@@ -297,6 +340,31 @@ class MedallionOrchestrator:
             bronze_inserted=result.inserted,
         )
         self.state.record_success(child, source.name)
+
+        # Stash the silver source_ids that came back THIS sync so the
+        # per-child driver can run ``reconcile_stale`` after the transform
+        # stage. We can't reconcile here because the transform stage also
+        # re-writes silver from the bronze back-catalogue, which would reset
+        # ``missing_streak`` and mask any disappearance.
+        #
+        # ``RawRecord.source_id`` is the upstream's bronze key — which is
+        # NOT always the silver source_id (e.g. Classroom silver_id is
+        # ``course_id:stream_item_id``, derived only by the bronze→silver
+        # mapper). Run the mapper here so the seen-set matches silver.
+        adapter = _BRONZE_TO_SILVER.get(source.name)
+        seen_ids: list[str] = []
+        if adapter is not None:
+            for rec in records:
+                try:
+                    task = adapter(child=child, payload=rec.payload)
+                except Exception:
+                    # A single bad payload mustn't poison the seen set —
+                    # those rows will simply have streaks incremented and
+                    # eventually archive themselves if they stay broken.
+                    continue
+                seen_ids.append(task.source_id)
+        self._current_run_seen[source.name] = sorted(set(seen_ids))
+
         return IngestStageResult(
             child=child,
             source=source.name,
@@ -386,41 +454,6 @@ class MedallionOrchestrator:
         )
 
     # ------------------------------------------------------------------ #
-    # Stage: detect
-    # ------------------------------------------------------------------ #
-
-    def _stage_detect(self, child: str) -> DetectStageResult:
-        started = datetime.now(UTC)
-        try:
-            dr: DetectionResult = self._link_detector.detect(child)
-        except Exception as exc:
-            log.exception("link detection failed for %s", child)
-            self.state.record_sync_run(
-                child=child,
-                source="*detect",
-                outcome="error",
-                started_at=started,
-                finished_at=datetime.now(UTC),
-                error=str(exc),
-            )
-            return DetectStageResult(child=child, ok=False, error=str(exc))
-
-        self.state.record_sync_run(
-            child=child,
-            source="*detect",
-            outcome="ok",
-            started_at=started,
-            finished_at=datetime.now(UTC),
-        )
-        return DetectStageResult(
-            child=child,
-            ok=True,
-            inserted=dr.inserted,
-            updated=dr.updated,
-            unchanged=dr.unchanged,
-        )
-
-    # ------------------------------------------------------------------ #
     # Stage: publish
     # ------------------------------------------------------------------ #
 
@@ -454,7 +487,7 @@ class MedallionOrchestrator:
                 child=child,
                 ok=True,
                 skipped_reason=(
-                    f"No sheet_id in children.yaml \u2014 run "
+                    f"No sheet_id in children.yaml — run "
                     f"`homework-hub bootstrap-sheet --child {child}`"
                 ),
             )
@@ -462,6 +495,15 @@ class MedallionOrchestrator:
         try:
             tasks = self._silver.all_for_child(child)
             last_synced = datetime.now(UTC)
+            source_auth_rows = None
+            if self.settings is not None:
+                source_auth_rows = build_source_auth_rows(
+                    child=child,
+                    child_cfg=cfg,
+                    settings=self.settings,
+                    state=self.state,
+                    now=last_synced,
+                )
             pr: PublishResult = publish_for_child(
                 self.state,
                 self.sink,
@@ -469,6 +511,9 @@ class MedallionOrchestrator:
                 spreadsheet_id=cfg.sheet_id,
                 tasks=tasks,
                 last_synced=last_synced,
+                cutoff_days=self.history_cutoff_days,
+                future_date_cap_days=self._future_date_cap_days,
+                source_auth_rows=source_auth_rows,
             )
         except Exception as exc:
             log.exception("publish failed for %s", child)
@@ -493,8 +538,7 @@ class MedallionOrchestrator:
             child=child,
             ok=True,
             tasks_written=pr.tasks_written,
-            duplicates_written=pr.duplicates_written,
-            duplicates_state_updates=pr.duplicates_state_updates,
+            history_written=pr.history_written,
             user_edits_written=pr.user_edits_written,
         )
 
@@ -599,9 +643,7 @@ def summarise_medallion(report: MedallionSyncReport) -> str:
         lines.append(f"  {c.child}:")
         for r in c.ingest:
             if r.skipped:
-                lines.append(
-                    f"    [skip] ingest {r.source}: {r.skip_reason}"
-                )
+                lines.append(f"    [skip] ingest {r.source}: {r.skip_reason}")
             elif r.ok:
                 lines.append(
                     f"    [OK]   ingest {r.source}: "
@@ -620,15 +662,6 @@ def summarise_medallion(report: MedallionSyncReport) -> str:
                 )
             else:
                 lines.append(f"    [FAIL] transform: {t.error}")
-        if c.detect:
-            d = c.detect
-            if d.ok:
-                lines.append(
-                    f"    [OK]   detect: +{d.inserted} new link(s), "
-                    f"~{d.updated}, ={d.unchanged}"
-                )
-            else:
-                lines.append(f"    [FAIL] detect: {d.error}")
         if c.publish:
             p = c.publish
             if p.skipped_reason:
@@ -636,8 +669,8 @@ def summarise_medallion(report: MedallionSyncReport) -> str:
             elif p.ok:
                 lines.append(
                     f"    [OK]   publish: {p.tasks_written} task(s), "
-                    f"{p.duplicates_written} dup(s), "
-                    f"{p.duplicates_state_updates} state update(s)"
+                    f"{p.history_written} history, "
+                    f"{p.user_edits_written} edit(s)"
                 )
             else:
                 lines.append(f"    [FAIL] publish: {p.error}")
@@ -645,7 +678,6 @@ def summarise_medallion(report: MedallionSyncReport) -> str:
 
 
 __all__ = [
-    "DetectStageResult",
     "IngestStageResult",
     "MedallionChildReport",
     "MedallionOrchestrator",

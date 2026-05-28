@@ -41,7 +41,6 @@ helper but no longer applied at fetch time.
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -259,6 +258,29 @@ class EdroloStorageState:
                 out[c["name"]] = c["value"]
         return out
 
+    def token_expires_at(self) -> datetime | None:
+        """Return the expiry of the Edrolo ``sessionid`` cookie, or ``None``.
+
+        Edrolo issues ``sessionid`` as a session cookie (``expires == -1``
+        in Playwright's storage state), so most of the time this returns
+        ``None``. Kept for symmetry with the other sources and to surface
+        the value if Edrolo ever starts setting a persistent expiry.
+        """
+        for c in self.raw.get("cookies", []):
+            if c.get("name") != "sessionid":
+                continue
+            cd = (c.get("domain") or "").lstrip(".")
+            if cd != "app.edrolo.com" and not cd.endswith(".edrolo.com"):
+                continue
+            exp = c.get("expires")
+            if not isinstance(exp, (int, float)) or exp <= 0:
+                return None
+            try:
+                return datetime.fromtimestamp(float(exp), tz=UTC)
+            except (OSError, ValueError, OverflowError):
+                return None
+        return None
+
     def cookie_header(self, domain: str = "app.edrolo.com") -> str:
         """Render the matching cookies as a single Cookie header value."""
         return "; ".join(f"{k}={v}" for k, v in self.cookies_for_domain(domain).items())
@@ -269,47 +291,43 @@ class EdroloStorageState:
 # --------------------------------------------------------------------------- #
 
 
-def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> None:
-    """Open a headed Chromium, let the user complete Google SSO, dump storage state.
+# --------------------------------------------------------------------------- #
+# Zen Browser headed login (Mac-only)
+# --------------------------------------------------------------------------- #
 
-    Imported lazily so the server runtime (which never calls this) doesn't
-    need the Playwright browser binaries. Only meant to be run on the Mac.
+
+def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> None:
+    """Open a new tab in Zen Browser, let the user complete Google SSO, dump storage state.
+
+    Connects to a running Zen Browser via Marionette (port 2828). The
+    ``auth edrolo`` CLI command ensures Zen is launched with Marionette
+    before calling this function.
+
+    Polls until the ``sessionid`` cookie is present, which confirms the
+    Edrolo session is fully established.
     """
-    from playwright.sync_api import sync_playwright
+    from homework_hub.zen import zen_cookie_login
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
-        page = context.new_page()
-        page.goto(f"{base_url}/account/login/")
-        # Wait for the user to complete Google SSO and land on /account or a
-        # subpage. We poll the URL rather than rely on a single selector
-        # because Edrolo redirects through several pages post-login.
-        page.wait_for_url(
-            lambda url: "/account/login" not in url and "accounts.google.com" not in url,
-            timeout=300_000,  # 5 min for the human to finish 2FA
+
+    def _logged_in(url: str) -> bool:
+        return "/account/login" not in url and "accounts.google.com" not in url
+
+    cookies = zen_cookie_login(
+        f"{base_url}/account/login/",
+        _logged_in,
+    )
+
+    # Verify the sessionid cookie arrived.
+    by_name = {c["name"]: c["value"] for c in cookies}
+    if not by_name.get("sessionid"):
+        raise RuntimeError(
+            "Edrolo login completed but no 'sessionid' cookie was captured. "
+            "Try again and ensure the Edrolo dashboard fully loads before the "
+            "tab closes."
         )
-        # Poll until the SPA has set the ``sessionid`` cookie. Edrolo's hydration
-        # can be slow, especially on first login, so a fixed sleep isn't safe.
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline:
-            cookies = {c["name"]: c.get("value") for c in context.cookies()}
-            if cookies.get("sessionid"):
-                break
-            page.wait_for_timeout(500)
-        else:
-            browser.close()
-            raise RuntimeError(
-                "Edrolo headed login finished but no 'sessionid' cookie was set "
-                "within 60s. Try again and ensure the dashboard fully loads "
-                "before closing the browser."
-            )
-        # Tiny extra settle so any sibling cookies (csrftoken, etc.) land too.
-        page.wait_for_timeout(500)
-        state = context.storage_state()
-        EdroloStorageState(state).save(out_path)
-        browser.close()
+
+    EdroloStorageState({"cookies": cookies, "origins": []}).save(out_path)
 
 
 # --------------------------------------------------------------------------- #

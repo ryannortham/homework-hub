@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -111,6 +112,7 @@ def make_sync_job(
 def build_health_app(
     *,
     state: StateStore,
+    children_config_path: Path | None = None,
     scheduler: BackgroundScheduler | None = None,
     job_id: str = "homework_hub_sync",
 ) -> FastAPI:
@@ -126,12 +128,20 @@ def build_health_app(
 
     @app.get("/health")
     def health() -> dict[str, Any]:  # pragma: no cover - exercised via TestClient
-        return _health_payload(state=state, scheduler=scheduler, job_id=job_id)
+        return _health_payload(
+            state=state,
+            children_config_path=children_config_path,
+            scheduler=scheduler,
+            job_id=job_id,
+        )
 
     # Expose the inner function for unit tests that don't want to spin up
     # the TestClient. Attribute access is cheap and explicit.
     app.state.health_payload = lambda: _health_payload(
-        state=state, scheduler=scheduler, job_id=job_id
+        state=state,
+        children_config_path=children_config_path,
+        scheduler=scheduler,
+        job_id=job_id,
     )
 
     return app
@@ -140,15 +150,34 @@ def build_health_app(
 def _health_payload(
     *,
     state: StateStore,
-    scheduler: BackgroundScheduler | None,
-    job_id: str,
+    children_config_path: Path | None = None,
+    scheduler: BackgroundScheduler | None = None,
+    job_id: str = "homework_hub_sync",
 ) -> dict[str, Any]:
     auth_records = list(state.all_auth())
+
+    # Load ChildrenConfig dynamically to filter out disabled child-source pairs
+    cfg = None
+    if children_config_path is not None and children_config_path.exists():
+        try:
+            from homework_hub.config import ChildrenConfig
+
+            cfg = ChildrenConfig.load(children_config_path)
+        except Exception:
+            log.exception("Failed to load children config from %s", children_config_path)
 
     sources_payload: list[dict[str, Any]] = []
     any_failed = False
     any_seen = False
     for rec in auth_records:
+        if cfg is not None:
+            child_cfg = cfg.children.get(rec.child)
+            if child_cfg is None:
+                continue
+            source_cfg = getattr(child_cfg.sources, rec.source, None)
+            if source_cfg is None or not source_cfg.enabled:
+                continue
+
         any_seen = True
         last_success = rec.last_success_at
         last_failure = rec.last_failure_at
@@ -209,7 +238,11 @@ def run_daemon(settings: Settings) -> None:  # pragma: no cover - integration
         cron_expr=settings.sync_cron,
         job=make_sync_job(lambda: build_medallion_orchestrator(settings)),
     )
-    app = build_health_app(state=state, scheduler=scheduler)
+    app = build_health_app(
+        state=state,
+        children_config_path=settings.children_yaml,
+        scheduler=scheduler,
+    )
 
     scheduler.start()
     log.info(

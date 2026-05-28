@@ -57,6 +57,8 @@ def build_medallion_orchestrator(
         sources_for_child=sources_for_child,
         state=state,
         sink=sink,
+        history_cutoff_days=settings.history_cutoff_days,
+        settings=settings,
     )
 
 

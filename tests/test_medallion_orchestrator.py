@@ -2,13 +2,13 @@
 
 These exercise the orchestration glue with fake ``Source``s and a fake
 ``GoldSink``. The pipeline components themselves (BronzeWriter, SilverWriter,
-LinkDetector, publish_for_child) are real, hitting an in-memory state.db so
-we get true end-to-end behaviour for the medallion path without external
-network calls.
+publish_for_child) are real, hitting an in-memory state.db so we get true
+end-to-end behaviour for the medallion path without external network calls.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -78,9 +78,6 @@ class _RecordingSink:
         self.hidden: dict[str, bool] = {}
 
     def read_user_edits(self, spreadsheet_id: str) -> list[Any]:
-        return []
-
-    def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[Any]:
         return []
 
     def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
@@ -163,7 +160,6 @@ class TestRunFullPipeline:
         assert c.ingest[0].bronze_inserted == 1
         assert c.transform is not None and c.transform.ok
         assert c.transform.inserted == 1
-        assert c.detect is not None and c.detect.ok
         assert c.publish is not None and c.publish.ok
         assert c.publish.skipped_reason is not None
         assert "M5c" in c.publish.skipped_reason
@@ -208,8 +204,8 @@ class TestRunFullPipeline:
         assert c.publish is not None and c.publish.ok
         assert c.publish.skipped_reason is None
         assert c.publish.tasks_written >= 1
-        # Tabs written by publish_for_child: Tasks, Possible Duplicates,
-        # Settings, UserEdits. (Today is formula-only, no rows.)
+        # Tabs written by publish_for_child: Tasks, History, Settings, UserEdits.
+        # (Today is formula-only, no rows.)
         titles_written = {w[1] for w in sink.writes}
         assert {"Tasks", "Settings"}.issubset(titles_written)
 
@@ -229,10 +225,9 @@ class TestRunFullPipeline:
         orch.run()
         rows = state.recent_sync_runs(child="james", limit=50)
         sources = [r["source"] for r in rows]
-        # Ingest row + *transform + *detect + *publish (skipped)
+        # Ingest row + *transform + *publish (skipped)
         assert "classroom" in sources
         assert "*transform" in sources
-        assert "*detect" in sources
         assert "*publish" in sources
         publish_row = next(r for r in rows if r["source"] == "*publish")
         assert publish_row["outcome"] == "skipped_no_sink"
@@ -353,6 +348,78 @@ class TestIngestFailures:
         assert ep_r2.ok is False
         assert ep_r2.failure_kind == "auth_expired"
 
+    def test_silence_bypassed_when_token_refreshed_after_failure(self, state: StateStore):
+        """A fresh token on disk (token_refreshed_at newer than last_failure_at)
+        bypasses the silence so the next sync attempts ingest with the new token."""
+        ok_rec = RawRecord(
+            child="james", source="classroom", source_id="a1", payload=_classroom_payload()
+        )
+
+        class _FreshTokenSilentSource(_SilentAuthExpiredSource):
+            """Reports a token refresh time set by the test."""
+
+            def __init__(self, refreshed_at: datetime | None) -> None:
+                self._refreshed_at = refreshed_at
+
+            def token_refreshed_at(self, child: str) -> datetime | None:
+                return self._refreshed_at
+
+        state.record_failure("james", "eduperfect", kind="auth_expired", message="expired")
+        auth = state.get_auth("james", "eduperfect")
+        assert auth is not None and auth.last_failure_at is not None
+        fresh_token_time = auth.last_failure_at + timedelta(seconds=30)
+
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={
+                "james": [
+                    _FreshTokenSilentSource(fresh_token_time),
+                    _FakeSource("classroom", [ok_rec]),
+                ]
+            },
+            state=state,
+            sink=None,
+        )
+        report = orch.run()
+        ep_r = next(r for r in report.children[0].ingest if r.source == "eduperfect")
+        # Silence bypassed → source actually called → AuthExpiredError → [FAIL].
+        assert ep_r.skipped is False
+        assert ep_r.ok is False
+        assert ep_r.failure_kind == "auth_expired"
+
+    def test_silence_kept_when_token_refresh_older_than_failure(self, state: StateStore):
+        """If token mtime predates the last failure, the silence still applies."""
+        ok_rec = RawRecord(
+            child="james", source="classroom", source_id="a1", payload=_classroom_payload()
+        )
+
+        class _StaleTokenSilentSource(_SilentAuthExpiredSource):
+            def __init__(self, refreshed_at: datetime) -> None:
+                self._refreshed_at = refreshed_at
+
+            def token_refreshed_at(self, child: str) -> datetime | None:
+                return self._refreshed_at
+
+        state.record_failure("james", "eduperfect", kind="auth_expired", message="expired")
+        auth = state.get_auth("james", "eduperfect")
+        assert auth is not None and auth.last_failure_at is not None
+        stale_token_time = auth.last_failure_at - timedelta(minutes=1)
+
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={
+                "james": [
+                    _StaleTokenSilentSource(stale_token_time),
+                    _FakeSource("classroom", [ok_rec]),
+                ]
+            },
+            state=state,
+            sink=None,
+        )
+        report = orch.run()
+        ep_r = next(r for r in report.children[0].ingest if r.source == "eduperfect")
+        assert ep_r.skipped is True
+
     def test_non_silent_source_auth_expired_still_fails_on_repeat(self, state: StateStore):
         """Sources without silence_repeated_auth_expired=True always show [FAIL]."""
         orch = MedallionOrchestrator(
@@ -392,7 +459,6 @@ class TestStageEntryPoints:
         c = report.children[0]
         assert len(c.ingest) == 1 and c.ingest[0].ok
         assert c.transform is None
-        assert c.detect is None
         assert c.publish is None
 
     def test_transform_only_runs_against_existing_bronze(self, state: StateStore):
@@ -418,7 +484,7 @@ class TestStageEntryPoints:
         assert c.transform is not None and c.transform.ok
         assert c.transform.inserted == 1
 
-    def test_publish_only_runs_detect_and_publish(self, state: StateStore):
+    def test_publish_only_runs_publish(self, state: StateStore):
         orch = MedallionOrchestrator(
             children_config=_children_cfg(sheet_id="sheet-x"),
             sources_for_child={"james": []},
@@ -429,7 +495,6 @@ class TestStageEntryPoints:
         c = report.children[0]
         assert c.ingest == []
         assert c.transform is None
-        assert c.detect is not None and c.detect.ok
         assert c.publish is not None
         assert c.publish.skipped_reason is not None
 
@@ -561,7 +626,6 @@ class TestSummariseMedallion:
         assert "Medallion sync completed" in text
         assert "ingest classroom" in text
         assert "transform" in text
-        assert "detect" in text
         assert "publish" in text
         assert "[OK]" in text
 
@@ -614,3 +678,98 @@ class TestEduPerfectSilenceFlag:
 
         assert CompassSource.silence_repeated_auth_expired is False
         assert ClassroomSource.silence_repeated_auth_expired is False
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end cleansing — stale archive + recovery
+# --------------------------------------------------------------------------- #
+
+
+class TestCleansingEndToEnd:
+    def test_missing_task_archives_after_grace_then_recovers(self, state: StateStore):
+        """Two syncs without the task ⇒ archived (reason=upstream_removed).
+        Then it reappears ⇒ archive flags cleared automatically."""
+        rec = RawRecord(
+            child="james",
+            source="classroom",
+            source_id="abc1",
+            payload=_classroom_payload(),
+        )
+        sink = _RecordingSink()
+        source_present = _FakeSource("classroom", [rec])
+        source_empty = _FakeSource("classroom", [])
+
+        # Sync 1: task is present.
+        orch = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={"james": [source_present]},
+            state=state,
+            sink=sink,  # type: ignore[arg-type]
+            stale_grace_syncs=2,
+        )
+        orch.run()
+        assert state.list_archived(child="james") == []
+
+        # Syncs 2 & 3: task disappeared upstream — second hit crosses grace.
+        orch_empty = MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={"james": [source_empty]},
+            state=state,
+            sink=sink,  # type: ignore[arg-type]
+            stale_grace_syncs=2,
+        )
+        orch_empty.run()
+        orch_empty.run()
+        archived = state.list_archived(child="james")
+        assert len(archived) == 1
+        assert archived[0]["archived_reason"] == "upstream_removed"
+
+        # Sync 4: task reappears — archive flags cleared.
+        orch.run()
+        assert state.list_archived(child="james") == []
+
+    def test_failed_ingest_does_not_archive(self, state: StateStore):
+        """If ingest itself fails (auth expired), we must not falsely conclude
+        the task disappeared and archive it."""
+
+        class _ClassroomAuthExpired(Source):
+            name = "classroom"
+
+            def fetch(self, child):  # pragma: no cover
+                return []
+
+            def fetch_raw(self, child):
+                raise AuthExpiredError("token expired")
+
+        rec = RawRecord(
+            child="james",
+            source="classroom",
+            source_id="abc1",
+            payload=_classroom_payload(),
+        )
+        sink = _RecordingSink()
+        source_present = _FakeSource("classroom", [rec])
+
+        # Sync 1: establish silver row.
+        MedallionOrchestrator(
+            children_config=_children_cfg(sheet_id="sheet-x"),
+            sources_for_child={"james": [source_present]},
+            state=state,
+            sink=sink,  # type: ignore[arg-type]
+            stale_grace_syncs=1,
+        ).run()
+        assert state.silver_for_child(child="james")  # row exists
+
+        # Syncs 2 & 3: ingest fails. seen_ids is never populated for failed
+        # sources, so reconcile must NOT run for classroom and must NOT
+        # touch ``missing_streak`` on the existing silver row.
+        for _ in range(2):
+            MedallionOrchestrator(
+                children_config=_children_cfg(sheet_id="sheet-x"),
+                sources_for_child={"james": [_ClassroomAuthExpired()]},
+                state=state,
+                sink=sink,  # type: ignore[arg-type]
+                stale_grace_syncs=1,
+            ).run()
+
+        assert state.list_archived(child="james") == []

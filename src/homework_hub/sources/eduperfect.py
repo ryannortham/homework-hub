@@ -75,8 +75,7 @@ IAM_HOST = "iam.educationperfect.com"
 _EXPIRY_BUFFER = timedelta(minutes=5)
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:138.0) "
-    "Gecko/20100101 Firefox/138.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:138.0) " "Gecko/20100101 Firefox/138.0"
 )
 
 _ASSIGNED_CLASSWORK_QUERY = """
@@ -130,9 +129,7 @@ def map_ep_classwork_to_task(
     task_id = classwork.get("id")
     name = classwork.get("name")
     if not task_id or not name:
-        raise SchemaBreakError(
-            f"EP classwork missing id/name: keys={list(classwork.keys())}"
-        )
+        raise SchemaBreakError(f"EP classwork missing id/name: keys={list(classwork.keys())}")
 
     classes = classwork.get("classes") or []
     subject = classes[0].get("name", "Education Perfect") if classes else "Education Perfect"
@@ -211,9 +208,7 @@ class EduPerfectTokenFile:
         try:
             raw = json.loads(path.read_text())
         except json.JSONDecodeError as exc:
-            raise AuthExpiredError(
-                f"Education Perfect token at {path} is not valid JSON"
-            ) from exc
+            raise AuthExpiredError(f"Education Perfect token at {path} is not valid JSON") from exc
         for key in ("access_token", "expires_at"):
             if key not in raw:
                 raise AuthExpiredError(
@@ -302,7 +297,7 @@ def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
             try:
                 colon = buf.index(b":")
                 length = int(buf[:colon])
-                rest = buf[colon + 1:]
+                rest = buf[colon + 1 :]
                 if len(rest) >= length:
                     return json.loads(rest[:length])
             except (ValueError, json.JSONDecodeError):
@@ -330,7 +325,7 @@ def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
             "  /Applications/Zen.app/Contents/MacOS/zen \\\n"
             "    --marionette --marionette-port 2828 \\\n"
             "    --remote-allow-system-access \\\n"
-            f"    --profile \"$HOME/Library/Application Support/zen/Profiles/<profile>\"\n"
+            f'    --profile "$HOME/Library/Application Support/zen/Profiles/<profile>"\n'
             f"  Then re-run this command.\nOriginal error: {exc}"
         ) from exc
 
@@ -373,6 +368,7 @@ def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
 
     # Wait up to 20s for a token to appear
     import time
+
     deadline = time.monotonic() + 20.0
     token = None
     while time.monotonic() < deadline:
@@ -395,7 +391,9 @@ def run_headed_login(out_path: Path, *, base_url: str = APP_BASE_URL) -> None:
         while time.monotonic() < deadline2:
             _send(s, "Marionette:SetContext", {"value": "chrome"})
             _recv(s)
-            token = _exec(s, "return window.__ep_cookie_obs__ ? window.__ep_cookie_obs__.token : null;")
+            token = _exec(
+                s, "return window.__ep_cookie_obs__ ? window.__ep_cookie_obs__.token : null;"
+            )
             if token:
                 break
             _send(s, "Marionette:SetContext", {"value": "content"})
@@ -475,7 +473,7 @@ class EduPerfectClient:
     def get_school_id(self, user_id: str) -> str:
         """Resolve the student's school UUID from the user record."""
         result = self._query(_USER_SCHOOL_QUERY, {"userId": user_id})
-        user = (result.get("user") or {})
+        user = result.get("user") or {}
         memberships = user.get("memberships") or []
         for m in memberships:
             school = m.get("school") or {}
@@ -492,7 +490,7 @@ class EduPerfectClient:
                 _ASSIGNED_CLASSWORK_QUERY,
                 {"schoolId": school_id, "status": status},
             )
-            payload = (result.get("assignedClasswork") or {})
+            payload = result.get("assignedClasswork") or {}
             items = payload.get("result") or []
             if not isinstance(items, list):
                 raise SchemaBreakError(
@@ -544,9 +542,7 @@ class EduPerfectClient:
         try:
             data = resp.json()
         except json.JSONDecodeError as exc:
-            raise SchemaBreakError(
-                f"Non-JSON EP GraphQL response: {resp.text[:200]}"
-            ) from exc
+            raise SchemaBreakError(f"Non-JSON EP GraphQL response: {resp.text[:200]}") from exc
 
         errors = data.get("errors")
         if errors:
@@ -583,20 +579,27 @@ class EduPerfectSource(Source):
         client_factory: Any = None,
     ):
         self.token_path_for_child = token_path_for_child
-        self._client_factory = client_factory or (
-            lambda token: EduPerfectClient(token)
-        )
+        self._client_factory = client_factory or (lambda token: EduPerfectClient(token))
 
     def fetch(self, child: str) -> list[Task]:
         """Not used — EP runs entirely through the medallion fetch_raw path."""
         raise NotImplementedError("EduPerfectSource only supports fetch_raw")
 
+    def token_refreshed_at(self, child: str) -> datetime | None:
+        """Return the on-disk mtime of the child's EP token file, if present."""
+        path = self.token_path_for_child.get(child)
+        if path is None:
+            return None
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        return datetime.fromtimestamp(mtime, tz=UTC)
+
     def fetch_raw(self, child: str) -> list[RawRecord]:
         """Fetch EP assigned classwork as raw payloads for the bronze layer."""
         if child not in self.token_path_for_child:
-            raise SchemaBreakError(
-                f"No Education Perfect token path configured for {child}."
-            )
+            raise SchemaBreakError(f"No Education Perfect token path configured for {child}.")
         path = self.token_path_for_child[child]
         token_file = EduPerfectTokenFile.load(path)
 
@@ -607,6 +610,7 @@ class EduPerfectSource(Source):
             )
 
         import base64
+
         jwt_payload = json.loads(
             base64.urlsafe_b64decode(token_file.access_token.split(".")[1] + "==")
         )
@@ -627,9 +631,7 @@ class EduPerfectSource(Source):
         for item in classwork_items:
             task_id = item.get("id")
             if not task_id:
-                raise SchemaBreakError(
-                    f"EP classwork missing id: keys={sorted(item.keys())}"
-                )
+                raise SchemaBreakError(f"EP classwork missing id: keys={sorted(item.keys())}")
             records.append(
                 RawRecord(
                     child=child,

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -46,6 +47,8 @@ from homework_hub.sources.base import (
 )
 
 DEFAULT_BASE_URL = "https://classroom.google.com"
+
+logger = logging.getLogger(__name__)
 
 # Three views we scrape. URL paths are stable across Classroom releases.
 VIEW_PATHS: dict[str, str] = {
@@ -78,8 +81,29 @@ CARD_SELECTORS: dict[str, str] = {
 # JS run inside the page to extract structured cards. Returning a dict per
 # card is dramatically cheaper than serialising HTML and re-parsing it Python-
 # side, and it keeps the brittle DOM coupling in exactly one place.
+#
+# 2026-05 DOM regression: Google removed the ``.QRiHXd`` meta element that
+# used to carry ``data-course-id`` / ``data-stream-item-id`` attributes.
+# The IDs are still present in the card's ``href``
+# (``/u/0/c/<b64>/a/<b64>/details`` for assignments,
+# ``/u/0/c/<b64>/sa/<b64>/details`` for short-answer questions) as
+# urlsafe-base64-encoded ASCII numeric strings
+# (e.g. ``NjQwMjUzMDk0MjYx`` -> ``"640253094261"``). We decode them in JS so
+# ``source_id`` remains stable across this DOM change.
+# Legacy ``data-*`` lookup is kept as a fallback in case Google restores it.
 _EXTRACT_CARDS_JS = """
 () => {
+  const HREF_RE = /\\/c\\/([^/]+)\\/s?a\\/([^/]+)\\//;
+  const b64decode = (s) => {
+    try {
+      // atob handles standard base64; convert URL-safe variant first.
+      const std = s.replace(/-/g, '+').replace(/_/g, '/');
+      const pad = std.length % 4 === 0 ? '' : '='.repeat(4 - (std.length % 4));
+      return atob(std + pad);
+    } catch (e) {
+      return null;
+    }
+  };
   const out = [];
   for (const a of document.querySelectorAll('a.nUg0Te.Ixt5L')) {
     const meta = a.querySelector('.QRiHXd');
@@ -87,10 +111,14 @@ _EXTRACT_CARDS_JS = """
     const subjEl = a.querySelector('p.tWeh6');
     const dueEl = a.querySelector('p.tGZ0W.pOf0gc');
     const iconEl = a.querySelector('i.google-symbols');
+    const href = a.getAttribute('href') || '';
+    const m = href.match(HREF_RE);
+    const metaCourse = meta ? meta.getAttribute('data-course-id') : null;
+    const metaStream = meta ? meta.getAttribute('data-stream-item-id') : null;
     out.push({
-      href: a.getAttribute('href') || '',
-      course_id: meta ? meta.getAttribute('data-course-id') : null,
-      stream_item_id: meta ? meta.getAttribute('data-stream-item-id') : null,
+      href: href,
+      course_id: metaCourse || (m ? b64decode(m[1]) : null),
+      stream_item_id: metaStream || (m ? b64decode(m[2]) : null),
       stream_item_type: meta ? meta.getAttribute('data-stream-item-type') : null,
       title: titleEl ? titleEl.innerText.trim() : '',
       subject: subjEl ? subjEl.innerText.trim() : '',
@@ -302,7 +330,11 @@ def parse_due_text(
         mm = int(m.group("m")) if m.group("m") else 59
         return _make_dt(target, hh, mm, tz)
 
-    # Date without year: "Wednesday 6 May" — assume the next occurrence.
+    # Date without year: "Wednesday 6 May" — parse against the current year.
+    # We do NOT roll forward to next year for past dates: doing so silently
+    # turned legitimately-overdue / missed-from-last-year cards into phantom
+    # future homework. Past dates are returned as-is; the kid (or the
+    # silver-layer status mapper) can see they're overdue.
     m = _RE_DATE_NO_YEAR.match(cleaned)
     if m:
         month = _MONTHS.get(m.group("mon").lower())
@@ -313,11 +345,6 @@ def parse_due_text(
             candidate = date(today.year, month, day)
         except ValueError:
             return None
-        if candidate < today:
-            try:
-                candidate = candidate.replace(year=today.year + 1)
-            except ValueError:
-                return None
         hh = int(m.group("h")) if m.group("h") else 23
         mm = int(m.group("m")) if m.group("m") else 59
         return _make_dt(candidate, hh, mm, tz)
@@ -392,6 +419,28 @@ class ClassroomStorageState:
                 out[c["name"]] = c["value"]
         return out
 
+    def token_expires_at(self) -> datetime | None:
+        """Return the expiry of the Google ``SID`` session cookie, or ``None``.
+
+        Reads the ``expires`` Unix timestamp Playwright stamped on the
+        ``SID`` cookie when it was captured. Returns ``None`` for session
+        cookies (``expires <= 0``) or when ``SID`` is absent.
+        """
+        for c in self.raw.get("cookies", []):
+            if c.get("name") != "SID":
+                continue
+            cd = (c.get("domain") or "").lstrip(".")
+            if cd != "google.com" and not cd.endswith(".google.com"):
+                continue
+            exp = c.get("expires")
+            if not isinstance(exp, (int, float)) or exp <= 0:
+                return None
+            try:
+                return datetime.fromtimestamp(float(exp), tz=UTC)
+            except (OSError, ValueError, OverflowError):
+                return None
+        return None
+
 
 # --------------------------------------------------------------------------- #
 # Headed login (Mac-only)
@@ -399,29 +448,27 @@ class ClassroomStorageState:
 
 
 def run_headed_login(out_path: Path, *, base_url: str = DEFAULT_BASE_URL) -> None:
-    """Open a headed Chromium so the kid can complete Google SSO.
+    """Open a new tab in Zen Browser so the user can complete Google SSO.
 
-    Lazily imports playwright so the server runtime — which only does
-    headless replay — doesn't pay the cost.
+    Connects to a running Zen Browser via Marionette (port 2828). The
+    ``auth classroom`` CLI command ensures Zen is launched with Marionette
+    before calling this function.
+
+    After login, all cookies are extracted and saved as a Playwright-compatible
+    ``storage_state.json`` so the headless scraper can replay the session.
     """
-    from playwright.sync_api import sync_playwright
+    from homework_hub.zen import zen_cookie_login
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
-        page = context.new_page()
-        page.goto(f"{base_url}/u/0/a/not-turned-in/all")
-        # Wait until we land on an authenticated Classroom page (i.e. we've
-        # left accounts.google.com and the URL contains /a/ or /h).
-        page.wait_for_url(
-            lambda url: "accounts.google.com" not in url and "classroom.google.com" in url,
-            timeout=300_000,
-        )
-        # Allow SPA hydration so cookies are fully flushed.
-        page.wait_for_timeout(3_000)
-        ClassroomStorageState(context.storage_state()).save(out_path)
-        browser.close()
+
+    def _logged_in(url: str) -> bool:
+        return "accounts.google.com" not in url and "classroom.google.com" in url
+
+    cookies = zen_cookie_login(
+        f"{base_url}/u/0/a/not-turned-in/all",
+        _logged_in,
+    )
+    ClassroomStorageState({"cookies": cookies, "origins": []}).save(out_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -595,9 +642,16 @@ class ClassroomSource(Source):
                     course_id = card.get("course_id") or ""
                     stream_item_id = card.get("stream_item_id") or ""
                     if not course_id or not stream_item_id:
-                        raise SchemaBreakError(
-                            f"Classroom card missing id fields: {sorted(card.keys())}"
+                        logger.warning(
+                            "Classroom card skipped (missing ids) "
+                            "child=%s view=%s href=%r title=%r icon=%r",
+                            child,
+                            view,
+                            card.get("href"),
+                            card.get("title"),
+                            card.get("icon"),
                         )
+                        continue
                     source_id = f"{course_id}:{stream_item_id}"
                     records.append(
                         RawRecord(

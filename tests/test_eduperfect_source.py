@@ -115,12 +115,14 @@ class TestMapping:
     def test_raises_on_missing_id(self, classwork: dict):
         del classwork["id"]
         from homework_hub.sources.base import SchemaBreakError
+
         with pytest.raises(SchemaBreakError):
             map_ep_classwork_to_task(child="james", classwork=classwork)
 
     def test_raises_on_missing_name(self, classwork: dict):
         del classwork["name"]
         from homework_hub.sources.base import SchemaBreakError
+
         with pytest.raises(SchemaBreakError):
             map_ep_classwork_to_task(child="james", classwork=classwork)
 
@@ -131,11 +133,14 @@ class TestMapping:
 
 
 class TestStatusMapping:
-    @pytest.mark.parametrize("raw,expected", [
-        ("NOT_STARTED", Status.NOT_STARTED),
-        ("IN_PROGRESS",  Status.IN_PROGRESS),
-        ("COMPLETE",     Status.SUBMITTED),
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("NOT_STARTED", Status.NOT_STARTED),
+            ("IN_PROGRESS", Status.IN_PROGRESS),
+            ("COMPLETE", Status.SUBMITTED),
+        ],
+    )
     def test_known_statuses(self, classwork: dict, raw: str, expected: Status):
         classwork["progressStatus"] = raw
         t = map_ep_classwork_to_task(child="james", classwork=classwork)
@@ -168,11 +173,13 @@ class TestEduPerfectTokenFile:
 
     def test_load_missing_raises(self, tmp_path: Path):
         from homework_hub.sources.base import AuthExpiredError
+
         with pytest.raises(AuthExpiredError, match="run `homework-hub auth eduperfect"):
             EduPerfectTokenFile.load(tmp_path / "missing.json")
 
     def test_load_corrupt_raises(self, tmp_path: Path):
         from homework_hub.sources.base import AuthExpiredError
+
         p = tmp_path / "bad.json"
         p.write_text("not json{{")
         with pytest.raises(AuthExpiredError):
@@ -180,6 +187,7 @@ class TestEduPerfectTokenFile:
 
     def test_load_missing_key_raises(self, tmp_path: Path):
         from homework_hub.sources.base import AuthExpiredError
+
         p = tmp_path / "incomplete.json"
         p.write_text(json.dumps({"access_token": "tok"}))
         with pytest.raises(AuthExpiredError, match="missing 'expires_at'"):
@@ -230,10 +238,13 @@ class TestEduPerfectTokenFile:
 class TestDecodeJwtExp:
     def _make_jwt(self, exp: int) -> str:
         import base64
+
         header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
-        payload = base64.urlsafe_b64encode(
-            json.dumps({"exp": exp, "sub": "test"}).encode()
-        ).rstrip(b"=").decode()
+        payload = (
+            base64.urlsafe_b64encode(json.dumps({"exp": exp, "sub": "test"}).encode())
+            .rstrip(b"=")
+            .decode()
+        )
         return f"{header}.{payload}.fakesig"
 
     def test_valid_jwt(self):
@@ -280,12 +291,15 @@ class FakeEpClient:
 def _valid_jwt() -> str:
     """Build a minimal valid JWT with exp 1 hour from now."""
     import base64
+
     exp = int((datetime.now(UTC) + timedelta(hours=1)).timestamp())
     sub = "8f58aa43-d517-4f0b-87a6-5bcbc515db85"
     header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": exp, "sub": sub, "userId": sub}).encode()
-    ).rstrip(b"=").decode()
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": exp, "sub": sub, "userId": sub}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     return f"{header}.{payload}.fakesig"
 
 
@@ -325,18 +339,21 @@ class TestEduPerfectSourceFetchRaw:
 
     def test_expired_token_raises_auth_expired(self, tmp_path: Path):
         from homework_hub.sources.base import AuthExpiredError
+
         source = self._source(tmp_path, expired=True)
         with pytest.raises(AuthExpiredError, match="token expired"):
             source.fetch_raw("james")
 
     def test_missing_token_file_raises_auth_expired(self, tmp_path: Path):
         from homework_hub.sources.base import AuthExpiredError
+
         source = EduPerfectSource({"james": tmp_path / "missing.json"})
         with pytest.raises(AuthExpiredError):
             source.fetch_raw("james")
 
     def test_unknown_child_raises_schema_break(self, tmp_path: Path):
         from homework_hub.sources.base import SchemaBreakError
+
         token_path = tmp_path / "james-eduperfect.json"
         token_path.write_text(json.dumps(_token_raw(access_token=_valid_jwt())))
         source = EduPerfectSource({"james": token_path})

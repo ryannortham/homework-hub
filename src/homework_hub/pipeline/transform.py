@@ -178,7 +178,8 @@ class SilverWriter:
                 existing = conn.execute(
                     "SELECT subject_raw, subject_canonical, subject_short, "
                     "title, description, assigned_at, due_at, submitted_at, "
-                    "status_raw, status, task_type, checkpoints_json, url "
+                    "status_raw, status, task_type, checkpoints_json, url, "
+                    "archived_at, archived_reason "
                     "FROM silver_tasks "
                     "WHERE child = ? AND source = ? AND source_id = ?",
                     (task.child, task.source.value, task.source_id),
@@ -195,6 +196,23 @@ class SilverWriter:
                 else:
                     subject_canonical = subject_raw
                     subject_short = subject_raw
+
+                # Recovery path: if this row was previously archived because
+                # it disappeared from upstream and now it's back, drop the
+                # archive flags so the mapper-provided status takes over.
+                clear_archive_on_write = (
+                    existing is not None and existing["archived_reason"] == "upstream_removed"
+                )
+
+                # If this row is still archived for a non-recoverable reason
+                # (age_cap or manual), we keep it archived — no content
+                # update, just refresh seen timestamps. The kid un-archives
+                # via the CLI or by editing Status away from "Archived".
+                keep_archived = (
+                    existing is not None
+                    and existing["archived_at"] is not None
+                    and existing["archived_reason"] != "upstream_removed"
+                )
 
                 new_row = (
                     subject_raw,
@@ -218,8 +236,9 @@ class SilverWriter:
                         "(child, source, source_id, subject_raw, "
                         "subject_canonical, subject_short, title, description, "
                         "assigned_at, due_at, submitted_at, status_raw, status, "
-                        "task_type, checkpoints_json, url, bronze_id, last_synced) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "task_type, checkpoints_json, url, bronze_id, last_synced, "
+                        "first_seen_at, last_seen_at, missing_streak) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                         (
                             task.child,
                             task.source.value,
@@ -227,16 +246,47 @@ class SilverWriter:
                             *new_row,
                             bronze_id,
                             ts,
+                            ts,
+                            ts,
                         ),
                     )
                     inserted += 1
-                elif tuple(existing) == new_row:
-                    # No content change — still touch last_synced so the
-                    # Settings tab can show a fresh timestamp.
+                elif keep_archived:
+                    # Row is locked in archived state — only refresh seen
+                    # timestamps so the kid's status edit pipeline still
+                    # works. Content is frozen.
+                    #
+                    # NB: ``missing_streak`` is NOT reset here. The transform
+                    # stage replays bronze's back-catalogue every run, so
+                    # resetting the streak from a re-derivation would mask
+                    # upstream disappearance. The streak is owned by
+                    # ``reconcile_stale`` (after transform), which sees the
+                    # actual freshly-fetched ids.
                     conn.execute(
-                        "UPDATE silver_tasks SET last_synced = ?, bronze_id = ? "
+                        "UPDATE silver_tasks SET last_synced = ?, last_seen_at = ?, "
+                        "bronze_id = ? "
                         "WHERE child = ? AND source = ? AND source_id = ?",
                         (
+                            ts,
+                            ts,
+                            bronze_id,
+                            task.child,
+                            task.source.value,
+                            task.source_id,
+                        ),
+                    )
+                    unchanged += 1
+                elif tuple(existing)[:13] == new_row and not clear_archive_on_write:
+                    # No content change — still touch last_synced + last_seen_at
+                    # so the Settings tab + reconciliation can show a fresh
+                    # timestamp. See ``keep_archived`` branch for why
+                    # ``missing_streak`` is left alone here.
+                    conn.execute(
+                        "UPDATE silver_tasks SET last_synced = ?, last_seen_at = ?, "
+                        "bronze_id = ? "
+                        "WHERE child = ? AND source = ? AND source_id = ?",
+                        (
+                            ts,
                             ts,
                             bronze_id,
                             task.child,
@@ -246,17 +296,24 @@ class SilverWriter:
                     )
                     unchanged += 1
                 else:
+                    archive_clear_sql = (
+                        ", archived_at = NULL, archived_reason = NULL"
+                        if clear_archive_on_write
+                        else ""
+                    )
                     conn.execute(
                         "UPDATE silver_tasks SET "
                         "subject_raw = ?, subject_canonical = ?, "
                         "subject_short = ?, title = ?, description = ?, "
                         "assigned_at = ?, due_at = ?, submitted_at = ?, status_raw = ?, "
                         "status = ?, task_type = ?, checkpoints_json = ?, url = ?, "
-                        "bronze_id = ?, last_synced = ? "
+                        "bronze_id = ?, last_synced = ?, last_seen_at = ?"
+                        f"{archive_clear_sql} "
                         "WHERE child = ? AND source = ? AND source_id = ?",
                         (
                             *new_row,
                             bronze_id,
+                            ts,
                             ts,
                             task.child,
                             task.source.value,
@@ -273,7 +330,8 @@ class SilverWriter:
             rows = conn.execute(
                 "SELECT source, source_id, subject_raw, title, description, "
                 "assigned_at, due_at, submitted_at, status_raw, status, "
-                "task_type, checkpoints_json, url "
+                "task_type, checkpoints_json, url, last_synced, "
+                "first_seen_at, last_seen_at, archived_at, archived_reason "
                 "FROM silver_tasks WHERE child = ? "
                 "ORDER BY source, source_id",
                 (child,),
@@ -298,6 +356,21 @@ class SilverWriter:
                 task_type=TaskType(r["task_type"]) if r["task_type"] else TaskType.HOMEWORK,
                 checkpoints=json.loads(r["checkpoints_json"] or "[]"),
                 url=r["url"],
+                last_synced=(
+                    datetime.fromisoformat(r["last_synced"])
+                    if r["last_synced"]
+                    else datetime.now(UTC)
+                ),
+                first_seen_at=(
+                    datetime.fromisoformat(r["first_seen_at"]) if r["first_seen_at"] else None
+                ),
+                last_seen_at=(
+                    datetime.fromisoformat(r["last_seen_at"]) if r["last_seen_at"] else None
+                ),
+                archived_at=(
+                    datetime.fromisoformat(r["archived_at"]) if r["archived_at"] else None
+                ),
+                archived_reason=r["archived_reason"],
             )
             for r in rows
         ]

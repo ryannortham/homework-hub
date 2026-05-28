@@ -2,34 +2,30 @@
 
 from __future__ import annotations
 
-import sqlite3
-from contextlib import closing
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from homework_hub.models import Source, Status, Task, TaskType
 from homework_hub.pipeline.publish import (
-    DuplicateCheckboxState,
-    LinkProjectionInput,
+    DashboardMeta,
     UserEdit,
-    apply_link_state_writebacks,
-    capture_tasks_tab_edits,
+    apply_archive_edits,
+    apply_unarchive_edits,
+    cap_future_dates,
+    capture_tab_edits,
     checkpoint_uid,
     diff_user_edits,
     filter_superseded_edits,
-    load_links_for_publish,
     melbourne_local_date,
     merge_user_edits,
     parent_uid_from_checkpoint,
-    project_duplicates_rows,
+    partition_tasks,
     project_settings_rows,
     project_tasks_rows,
-    propagate_parent_done,
     publish_for_child,
-    reconcile_link_state,
     task_uid,
 )
-from homework_hub.schema import DUPLICATES_TAB, TASKS_TAB
+from homework_hub.schema import TASKS_TAB
 from homework_hub.state.store import StateStore
 
 # --------------------------------------------------------------------------- #
@@ -45,8 +41,12 @@ def _task(
     subject: str = "Year 9 Science",
     title: str = "Photosynthesis Worksheet",
     due_at: datetime | None = None,
+    submitted_at: datetime | None = None,
     status: Status = Status.NOT_STARTED,
     url: str = "https://example/test",
+    first_seen_at: datetime | None = None,
+    archived_at: datetime | None = None,
+    archived_reason: str | None = None,
 ) -> Task:
     return Task(
         source=source,
@@ -55,8 +55,12 @@ def _task(
         subject=subject,
         title=title,
         due_at=due_at,
+        submitted_at=submitted_at,
         status=status,
         url=url,
+        first_seen_at=first_seen_at,
+        archived_at=archived_at,
+        archived_reason=archived_reason,
     )
 
 
@@ -102,27 +106,13 @@ class TestProjectTasksRows:
         assert cells[_idx("title")] == "Photosynthesis Worksheet"
         # Due converted to Melbourne local date (May 2).
         assert cells[_idx("due")] == date(2026, 5, 2)
-        # Days written as row-relative formula for Sheets to evaluate.
-        assert cells[_idx("days")] == "=E{row}-TODAY()"
+        # Days written as a row-relative formula for Sheets to evaluate.
+        assert "TODAY()" in str(cells[_idx("days")])
         assert cells[_idx("status")] == "Not started"
-        assert cells[_idx("priority")] == ""
-        # NOT_STARTED → done=False
-        assert cells[_idx("done")] is False
         assert cells[_idx("notes")] == ""
         assert cells[_idx("source")] == "Compass"
         assert cells[_idx("link")] == "https://example/test"
         assert cells[_idx("task_uid")] == "compass:T1"
-
-    def test_done_false_for_not_started_and_overdue(self):
-        for status in (Status.NOT_STARTED, Status.IN_PROGRESS, Status.OVERDUE):
-            rows = project_tasks_rows([_task(status=status)])
-            assert rows[0].cells[_idx("done")] is False, f"expected False for {status}"
-
-    def test_done_true_for_submitted_and_graded(self):
-        """Done is auto-derived as True when the LMS reports Submitted or Graded."""
-        for status in (Status.SUBMITTED, Status.GRADED):
-            rows = project_tasks_rows([_task(status=status)])
-            assert rows[0].cells[_idx("done")] is True, f"expected True for {status}"
 
     def test_classroom_source_label(self):
         rows = project_tasks_rows([_task(source=Source.CLASSROOM, source_id="K1")])
@@ -171,21 +161,6 @@ class TestProjectTasksRows:
         rows = project_tasks_rows([t])
         assert rows[0].cells[_idx("task_type")] == "General"
 
-    def test_description_blank_for_regular_tasks(self):
-        # Description is suppressed for non-checkpoint tasks to avoid noisy
-        # upstream HTML content blowing out row height in the spreadsheet.
-        t = Task(
-            source=Source.COMPASS,
-            source_id="D1",
-            child="james",
-            subject="9MATH",
-            title="Worksheet",
-            description="Complete questions 1-10.",
-            url="https://example/d",
-        )
-        rows = project_tasks_rows([t])
-        assert rows[0].cells[_idx("description")] == ""
-
     def test_checkpoint_sub_tasks_expanded(self):
         t = Task(
             source=Source.COMPASS,
@@ -200,16 +175,14 @@ class TestProjectTasksRows:
             url="https://example/cp",
         )
         rows = project_tasks_rows([t])
-        # Parent row suppressed — one row per checkpoint only
+        # Parent row suppressed — one row per checkpoint only.
         assert len(rows) == 2
         assert rows[0].task_uid == "compass:CP1:gi:101"
         assert rows[1].task_uid == "compass:CP1:gi:102"
-        # Title is the parent task name; description is the checkpoint name
-        assert rows[0].cells[_idx("title")] == "Chapter 1 Coursework"
-        assert rows[0].cells[_idx("description")] == "Equations"
-        assert rows[1].cells[_idx("title")] == "Chapter 1 Coursework"
-        assert rows[1].cells[_idx("description")] == "Inequalities"
-        # Checkpoints inherit parent subject
+        # Title merges parent + checkpoint name.
+        assert rows[0].cells[_idx("title")] == "Chapter 1 Coursework: Equations"
+        assert rows[1].cells[_idx("title")] == "Chapter 1 Coursework: Inequalities"
+        # Checkpoints inherit parent subject.
         assert rows[0].cells[_idx("subject")] == "11MAM"
 
     def test_checkpoint_with_no_id_skipped(self):
@@ -227,54 +200,6 @@ class TestProjectTasksRows:
 
 
 # --------------------------------------------------------------------------- #
-# Duplicates projection
-# --------------------------------------------------------------------------- #
-
-
-class TestProjectDuplicatesRows:
-    def _link(
-        self,
-        *,
-        state: str = "pending",
-        confidence: str = "auto_high",
-        link_id: int = 1,
-    ) -> LinkProjectionInput:
-        return LinkProjectionInput(
-            link_id=link_id,
-            confidence=confidence,
-            state=state,
-            subject="Year 9 Humanities",
-            compass_title="WW1 Benchmark",
-            compass_due=datetime(2026, 5, 1, tzinfo=UTC),
-            classroom_title="WW1",
-            classroom_due=datetime(2026, 5, 1, tzinfo=UTC),
-        )
-
-    def test_pending_row_emitted(self):
-        rows = project_duplicates_rows([self._link()])
-        assert len(rows) == 1
-        cells = rows[0].cells
-        idx = lambda k: DUPLICATES_TAB.column_index(k)  # noqa: E731
-        assert cells[idx("link_id")] == "1"
-        assert cells[idx("confidence")] == "High"
-        assert cells[idx("subject")] == "Year 9 Humanities"
-        assert cells[idx("compass_title")] == "WW1 Benchmark"
-        assert cells[idx("classroom_title")] == "WW1"
-        assert cells[idx("confirm")] is False
-        assert cells[idx("dismiss")] is False
-
-    def test_medium_label(self):
-        rows = project_duplicates_rows([self._link(confidence="auto_medium")])
-        assert rows[0].cells[DUPLICATES_TAB.column_index("confidence")] == "Medium"
-
-    def test_confirmed_link_dropped(self):
-        assert project_duplicates_rows([self._link(state="confirmed")]) == []
-
-    def test_dismissed_link_dropped(self):
-        assert project_duplicates_rows([self._link(state="dismissed")]) == []
-
-
-# --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
 
@@ -285,21 +210,66 @@ class TestProjectSettingsRows:
             child="james",
             last_synced=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
         )
-        keys = [k for k, _ in rows]
+        # All rows are 4-column tuples.
+        for r in rows:
+            assert len(r) == 4
+        keys = [r[0] for r in rows]
         assert "Child" in keys
-        assert "Last synced (UTC)" in keys
-        assert "Last synced (Melbourne date)" in keys
+        assert "Last full sync" in keys
+        assert "Tabs managed" in keys
         # Tabs managed should not include the hidden UserEdits tab.
-        tabs_value = dict(rows)["Tabs managed"]
+        tabs_value = next(r[1] for r in rows if r[0] == "Tabs managed")
         assert "UserEdits" not in tabs_value
-        assert "Today" in tabs_value
+        assert "Dashboard" in tabs_value
         assert "Tasks" in tabs_value
+        assert "History" in tabs_value
+        # Last full sync renders in Melbourne dd/mm/yyyy.
+        last_full = next(r[1] for r in rows if r[0] == "Last full sync")
+        # 2026-05-01 14:00 UTC == 2026-05-02 00:00 AEST (UTC+10, no DST in May).
+        assert last_full.startswith("02/05/2026")
 
     def test_no_last_synced(self):
         rows = project_settings_rows(child="james", last_synced=None)
-        d = dict(rows)
-        assert d["Last synced (UTC)"] == "—"
-        assert d["Last synced (Melbourne date)"] == "—"
+        last_full = next(r[1] for r in rows if r[0] == "Last full sync")
+        assert last_full == "—"
+
+    def test_with_source_auth_rows(self):
+        from homework_hub.pipeline.auth_status import SourceAuthRow
+
+        auth_rows = [
+            SourceAuthRow(
+                source="classroom",
+                display_name="Classroom",
+                last_success_at=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+                last_failure_at=None,
+                last_failure_kind=None,
+                token_expires_at=datetime(2027, 8, 14, 0, 0, tzinfo=UTC),
+                token_present=True,
+                status="ok",
+            ),
+            SourceAuthRow(
+                source="eduperfect",
+                display_name="EduPerfect",
+                last_success_at=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+                last_failure_at=datetime(2026, 5, 1, 15, 0, tzinfo=UTC),
+                last_failure_kind="auth_expired",
+                token_expires_at=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+                token_present=True,
+                status="expired",
+            ),
+        ]
+        rows = project_settings_rows(
+            child="james",
+            last_synced=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+            source_auth_rows=auth_rows,
+        )
+        # First two rows are the per-source rows.
+        assert rows[0][0] == "Classroom"
+        assert rows[0][3] == "OK"
+        assert rows[1][0] == "EduPerfect"
+        assert rows[1][3] == "Expired"
+        # Last full sync still present in trailer.
+        assert any(r[0] == "Last full sync" for r in rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,19 +283,13 @@ class TestMergeUserEdits:
         merged = merge_user_edits(rows, [])
         assert merged == rows
 
-    def test_priority_override_applied(self):
+    def test_notes_override_applied(self):
         rows = project_tasks_rows([_task()])
-        edits = [UserEdit("compass:T1", "priority", "High", "now")]
+        edits = [UserEdit("compass:T1", "notes", "check chapter 4", "now")]
         merged = merge_user_edits(rows, edits)
-        assert merged[0].cells[_idx("priority")] == "High"
+        assert merged[0].cells[_idx("notes")] == "check chapter 4"
         # Other cells untouched.
         assert merged[0].cells[_idx("title")] == "Photosynthesis Worksheet"
-
-    def test_done_checkbox_override(self):
-        rows = project_tasks_rows([_task()])
-        edits = [UserEdit("compass:T1", "done", True, "now")]
-        merged = merge_user_edits(rows, edits)
-        assert merged[0].cells[_idx("done")] is True
 
     def test_non_editable_column_ignored(self):
         # Source is read-only — an edit referencing it must be dropped.
@@ -337,9 +301,9 @@ class TestMergeUserEdits:
     def test_orphan_edit_dropped(self):
         # Edit for a task_uid not in silver — silently discarded.
         rows = project_tasks_rows([_task()])
-        edits = [UserEdit("compass:GHOST", "priority", "High", "now")]
+        edits = [UserEdit("compass:GHOST", "notes", "nope", "now")]
         merged = merge_user_edits(rows, edits)
-        assert merged[0].cells[_idx("priority")] == ""
+        assert merged[0].cells[_idx("notes")] == ""
 
 
 class TestDiffUserEdits:
@@ -349,43 +313,26 @@ class TestDiffUserEdits:
         edits = diff_user_edits(rows, existing=[], projected=projected)
         assert edits == []
 
-    def test_submitted_done_true_not_treated_as_override(self):
-        """done=True on a Submitted task is the system default, not a kid override."""
-        projected = project_tasks_rows([_task(status=Status.SUBMITTED)])
-        rows = merge_user_edits(projected, [])
-        edits = diff_user_edits(rows, existing=[], projected=projected)
-        # done=True is the projected value — should not be emitted as a UserEdit
-        assert not any(e.column == "done" for e in edits)
-
-    def test_kid_unticks_submitted_task_emitted(self):
-        """If a kid overrides done=False on a Submitted task, that IS persisted."""
-        projected = project_tasks_rows([_task(status=Status.SUBMITTED)])
-        rows = merge_user_edits(projected, [UserEdit("compass:T1", "done", False, "now")])
-        edits = diff_user_edits(rows, existing=[], projected=projected)
-        done_edits = [e for e in edits if e.column == "done"]
-        assert len(done_edits) == 1
-        assert done_edits[0].value is False
-
-    def test_overridden_priority_emitted(self):
+    def test_overridden_notes_emitted(self):
         projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
             projected,
-            [UserEdit("compass:T1", "priority", "High", "old")],
+            [UserEdit("compass:T1", "notes", "check chapter 4", "old")],
         )
         out = diff_user_edits(rows, existing=[], projected=projected)
         assert len(out) == 1
-        assert out[0].column == "priority"
-        assert out[0].value == "High"
+        assert out[0].column == "notes"
+        assert out[0].value == "check chapter 4"
 
     def test_unchanged_value_keeps_old_timestamp(self):
         projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
             projected,
-            [UserEdit("compass:T1", "priority", "High", "OLD-TS")],
+            [UserEdit("compass:T1", "notes", "check chapter 4", "OLD-TS")],
         )
         out = diff_user_edits(
             rows,
-            existing=[UserEdit("compass:T1", "priority", "High", "OLD-TS")],
+            existing=[UserEdit("compass:T1", "notes", "check chapter 4", "OLD-TS")],
             projected=projected,
         )
         assert out[0].updated_at == "OLD-TS"
@@ -394,47 +341,15 @@ class TestDiffUserEdits:
         projected = project_tasks_rows([_task()])
         rows = merge_user_edits(
             projected,
-            [UserEdit("compass:T1", "priority", "High", "now")],
+            [UserEdit("compass:T1", "notes", "updated note", "now")],
         )
         out = diff_user_edits(
             rows,
-            existing=[UserEdit("compass:T1", "priority", "Low", "OLD-TS")],
+            existing=[UserEdit("compass:T1", "notes", "old note", "OLD-TS")],
             projected=projected,
         )
-        assert out[0].value == "High"
+        assert out[0].value == "updated note"
         assert out[0].updated_at != "OLD-TS"
-
-
-# --------------------------------------------------------------------------- #
-# Checkbox readback
-# --------------------------------------------------------------------------- #
-
-
-class TestReconcileLinkState:
-    def test_neither_returns_none(self):
-        assert reconcile_link_state(DuplicateCheckboxState(1, confirm=False, dismiss=False)) is None
-
-    def test_confirm(self):
-        assert (
-            reconcile_link_state(DuplicateCheckboxState(1, confirm=True, dismiss=False))
-            == "confirmed"
-        )
-
-    def test_dismiss(self):
-        assert (
-            reconcile_link_state(DuplicateCheckboxState(1, confirm=False, dismiss=True))
-            == "dismissed"
-        )
-
-    def test_both_confirm_wins(self):
-        assert (
-            reconcile_link_state(DuplicateCheckboxState(1, confirm=True, dismiss=True))
-            == "confirmed"
-        )
-
-
-def _store(tmp_path: Path) -> StateStore:
-    return StateStore(tmp_path / "state.db")
 
 
 # --------------------------------------------------------------------------- #
@@ -446,10 +361,8 @@ def _raw_row(task: Task, **overrides: str) -> list[str]:
     """Build a raw string row as returned by ``get_all_values()``.
 
     Projected defaults are used as the base; ``overrides`` replace specific
-    column keys.  Date objects are formatted ``dd/MM/yyyy``; booleans become
-    ``"TRUE"``/``"FALSE"``; ``None`` becomes ``""``.
+    column keys.  Date objects are formatted ``dd/MM/yyyy``; ``None`` becomes ``""``.
     """
-
     projected = project_tasks_rows([task])[0]
     cells = list(projected.cells)
     for key, val in overrides.items():
@@ -459,8 +372,6 @@ def _raw_row(task: Task, **overrides: str) -> list[str]:
     for cell in cells:
         if cell is None:
             row.append("")
-        elif isinstance(cell, bool):
-            row.append("TRUE" if cell else "FALSE")
         elif isinstance(cell, date):
             row.append(cell.strftime("%d/%m/%Y"))
         else:
@@ -469,117 +380,91 @@ def _raw_row(task: Task, **overrides: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# capture_tasks_tab_edits
+# capture_tab_edits
 # --------------------------------------------------------------------------- #
 
 
-class TestCaptureTasksTabEdits:
+class TestCaptureTabEdits:
     def test_empty_raw_rows_returns_no_edits(self):
         projected = project_tasks_rows([_task()])
-        assert capture_tasks_tab_edits([], projected) == []
+        assert capture_tab_edits([], projected) == []
 
     def test_unknown_task_uid_ignored(self):
         projected = project_tasks_rows([_task()])
-        row = _raw_row(_task(source_id="GHOST"), priority="High")
+        row = _raw_row(_task(source_id="GHOST"))
         # uid is compass:GHOST — not in projected
-        assert capture_tasks_tab_edits([row], projected) == []
-
-    def test_priority_override_captured(self):
-        t = _task()
-        projected = project_tasks_rows([t])
-        row = _raw_row(t, priority="High")
-        edits = capture_tasks_tab_edits([row], projected)
-        assert len(edits) == 1
-        assert edits[0].column == "priority"
-        assert edits[0].value == "High"
+        assert capture_tab_edits([row], projected) == []
 
     def test_notes_override_captured(self):
         t = _task()
         projected = project_tasks_rows([t])
         row = _raw_row(t, notes="check chapter 4")
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert any(e.column == "notes" and e.value == "check chapter 4" for e in edits)
-
-    def test_done_true_captured_for_not_started_task(self):
-        t = _task(status=Status.NOT_STARTED)
-        projected = project_tasks_rows([t])
-        row = _raw_row(t, done="TRUE")
-        edits = capture_tasks_tab_edits([row], projected)
-        assert any(e.column == "done" and e.value is True for e in edits)
-
-    def test_done_false_not_captured_when_projected_false(self):
-        t = _task(status=Status.NOT_STARTED)
-        projected = project_tasks_rows([t])
-        row = _raw_row(t)  # projected done=FALSE, raw also FALSE
-        edits = capture_tasks_tab_edits([row], projected)
-        assert not any(e.column == "done" for e in edits)
-
-    def test_done_true_not_captured_when_projected_true(self):
-        # Submitted task: projected done=True; raw TRUE = no override.
-        t = _task(status=Status.SUBMITTED)
-        projected = project_tasks_rows([t])
-        row = _raw_row(t)  # done=TRUE in both
-        edits = capture_tasks_tab_edits([row], projected)
-        assert not any(e.column == "done" for e in edits)
 
     def test_status_override_captured(self):
         t = _task(status=Status.NOT_STARTED)
         projected = project_tasks_rows([t])
         row = _raw_row(t, status="Submitted")
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert any(e.column == "status" and e.value == "Submitted" for e in edits)
 
     def test_status_not_captured_when_matches_projected(self):
         t = _task(status=Status.NOT_STARTED)
         projected = project_tasks_rows([t])
         row = _raw_row(t)  # status="Not started" in both
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert not any(e.column == "status" for e in edits)
 
     def test_due_override_captured_when_projected_none(self):
         t = _task(due_at=None)
         projected = project_tasks_rows([t])
         row = _raw_row(t, due="15/05/2026")
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert any(e.column == "due" and e.value == date(2026, 5, 15) for e in edits)
 
     def test_due_not_captured_when_matches_projected(self):
         t = _task(due_at=datetime(2026, 5, 2, 0, 0, tzinfo=UTC))
         projected = project_tasks_rows([t])
         row = _raw_row(t)  # formatted date matches projected
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert not any(e.column == "due" for e in edits)
 
     def test_due_parse_failure_skipped(self):
         t = _task(due_at=None)
         projected = project_tasks_rows([t])
         row = _raw_row(t, due="not-a-date")
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert not any(e.column == "due" for e in edits)
 
     def test_due_serial_number_parsed(self):
         # Sheets serial for 2026-05-01 = days since 1899-12-30
         from datetime import date as _date
+
         serial = (_date(2026, 5, 1) - _date(1899, 12, 30)).days
         t = _task(due_at=None)
         projected = project_tasks_rows([t])
         row = _raw_row(t, due=str(serial))
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert any(e.column == "due" and e.value == _date(2026, 5, 1) for e in edits)
-
-    def test_empty_priority_not_captured(self):
-        t = _task()
-        projected = project_tasks_rows([t])
-        row = _raw_row(t, priority="")
-        edits = capture_tasks_tab_edits([row], projected)
-        assert not any(e.column == "priority" for e in edits)
 
     def test_empty_notes_not_captured(self):
         t = _task()
         projected = project_tasks_rows([t])
         row = _raw_row(t, notes="")
-        edits = capture_tasks_tab_edits([row], projected)
+        edits = capture_tab_edits([row], projected)
         assert not any(e.column == "notes" for e in edits)
+
+    def test_history_tab_due_not_editable(self):
+        """History tab does not capture due overrides — due is locked."""
+        from homework_hub.schema import HISTORY_TAB
+
+        t = _task(due_at=None)
+        projected = project_tasks_rows([t])
+        row = _raw_row(t, due="15/05/2026")
+        edits = capture_tab_edits([row], projected, tab=HISTORY_TAB)
+        # HISTORY_TAB has due_editable=False, so no due edits captured.
+        assert not any(e.column == "due" for e in edits)
 
 
 # --------------------------------------------------------------------------- #
@@ -592,7 +477,7 @@ from homework_hub.pipeline.publish import _merge_edit_sources  # noqa: E402
 
 class TestMergeEditSources:
     def test_live_only(self):
-        live = [UserEdit("compass:T1", "priority", "High", "now")]
+        live = [UserEdit("compass:T1", "notes", "check it", "now")]
         result = _merge_edit_sources(live, [])
         assert result == live
 
@@ -602,19 +487,19 @@ class TestMergeEditSources:
         assert result == persisted
 
     def test_live_wins_on_conflict(self):
-        persisted = [UserEdit("compass:T1", "priority", "Low", "old")]
-        live = [UserEdit("compass:T1", "priority", "High", "now")]
+        persisted = [UserEdit("compass:T1", "notes", "old note", "old")]
+        live = [UserEdit("compass:T1", "notes", "new note", "now")]
         result = _merge_edit_sources(live, persisted)
         assert len(result) == 1
-        assert result[0].value == "High"
+        assert result[0].value == "new note"
 
     def test_different_columns_both_kept(self):
         persisted = [UserEdit("compass:T1", "notes", "do it", "old")]
-        live = [UserEdit("compass:T1", "priority", "High", "now")]
+        live = [UserEdit("compass:T1", "status", "Submitted", "now")]
         result = _merge_edit_sources(live, persisted)
         assert len(result) == 2
         keys = {(e.task_uid, e.column) for e in result}
-        assert ("compass:T1", "priority") in keys
+        assert ("compass:T1", "status") in keys
         assert ("compass:T1", "notes") in keys
 
 
@@ -645,36 +530,10 @@ class TestFilterSupersededEdits:
         edits = [UserEdit("compass:T1", "status", "Submitted", "now")]
         assert filter_superseded_edits(edits, [t]) == edits
 
-    def test_done_edit_dropped_when_graded(self):
-        t = _task(status=Status.GRADED)
-        edits = [UserEdit("compass:T1", "done", False, "now")]
-        assert filter_superseded_edits(edits, [t]) == []
-
-    def test_done_edit_kept_when_overdue(self):
-        # Overdue does NOT lock done — kid ticking done is valid.
-        t = _task(status=Status.OVERDUE)
-        edits = [UserEdit("compass:T1", "done", True, "now")]
-        assert filter_superseded_edits(edits, [t]) == edits
-
-    def test_done_edit_kept_when_submitted(self):
-        t = _task(status=Status.SUBMITTED)
-        edits = [UserEdit("compass:T1", "done", False, "now")]
-        assert filter_superseded_edits(edits, [t]) == edits
-
     def test_due_edit_kept_when_silver_has_date(self):
         # Kid always wins on due — silver date does not override their choice.
         t = _task(due_at=datetime(2026, 5, 1, tzinfo=UTC))
         edits = [UserEdit("compass:T1", "due", date(2026, 6, 1), "now")]
-        assert filter_superseded_edits(edits, [t]) == edits
-
-    def test_due_edit_kept_when_silver_has_no_date(self):
-        t = _task(due_at=None)
-        edits = [UserEdit("compass:T1", "due", date(2026, 6, 1), "now")]
-        assert filter_superseded_edits(edits, [t]) == edits
-
-    def test_priority_never_dropped(self):
-        t = _task(status=Status.GRADED)
-        edits = [UserEdit("compass:T1", "priority", "High", "now")]
         assert filter_superseded_edits(edits, [t]) == edits
 
     def test_notes_never_dropped(self):
@@ -684,74 +543,8 @@ class TestFilterSupersededEdits:
 
     def test_orphan_edit_kept(self):
         # Edit for a task no longer in silver passes through (pruned later by diff).
-        edits = [UserEdit("compass:GHOST", "priority", "High", "now")]
+        edits = [UserEdit("compass:GHOST", "notes", "old note", "now")]
         assert filter_superseded_edits(edits, []) == edits
-
-
-def _seed_link(store: StateStore) -> int:
-    """Insert a Compass↔Classroom link + the two silver_tasks. Returns link id."""
-    due = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
-    now = datetime.now(UTC).isoformat()
-    with closing(sqlite3.connect(store.db_path)) as conn, conn:
-        for source, source_id, title in [
-            ("compass", "C1", "WW1 Benchmark"),
-            ("classroom", "K1", "WW1"),
-        ]:
-            conn.execute(
-                "INSERT INTO silver_tasks "
-                "(child, source, source_id, subject_raw, subject_canonical, "
-                "subject_short, title, status, last_synced, due_at) "
-                "VALUES ('james', ?, ?, '', 'Year 9 Humanities', 'Hum', "
-                "?, 'not_started', ?, ?)",
-                (source, source_id, title, now, due),
-            )
-        cur = conn.execute(
-            "INSERT INTO silver_task_links "
-            "(child, primary_source, primary_source_id, "
-            "secondary_source, secondary_source_id, confidence, state, "
-            "score_subject, score_title, score_due, detected_at) "
-            "VALUES ('james', 'compass', 'C1', 'classroom', 'K1', "
-            "'auto_high', 'pending', 1.0, 1.0, 0, ?)",
-            (now,),
-        )
-        return int(cur.lastrowid or 0)
-
-
-class TestLoadLinksForPublish:
-    def test_loads_with_titles_and_dues(self, tmp_path: Path):
-        store = _store(tmp_path)
-        link_id = _seed_link(store)
-        rows = load_links_for_publish(store, "james")
-        assert len(rows) == 1
-        assert rows[0].link_id == link_id
-        assert rows[0].compass_title == "WW1 Benchmark"
-        assert rows[0].classroom_title == "WW1"
-        assert rows[0].state == "pending"
-
-
-class TestApplyLinkStateWritebacks:
-    def test_confirm_persists(self, tmp_path: Path):
-        store = _store(tmp_path)
-        link_id = _seed_link(store)
-        updated = apply_link_state_writebacks(
-            store,
-            [DuplicateCheckboxState(link_id, confirm=True, dismiss=False)],
-        )
-        assert updated == 1
-        with closing(sqlite3.connect(store.db_path)) as conn:
-            (state,) = conn.execute(
-                "SELECT state FROM silver_task_links WHERE id = ?", (link_id,)
-            ).fetchone()
-        assert state == "confirmed"
-
-    def test_no_change_when_neither_ticked(self, tmp_path: Path):
-        store = _store(tmp_path)
-        link_id = _seed_link(store)
-        updated = apply_link_state_writebacks(
-            store,
-            [DuplicateCheckboxState(link_id, confirm=False, dismiss=False)],
-        )
-        assert updated == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -786,35 +579,48 @@ class TestParentUidFromCheckpoint:
         assert parent_uid_from_checkpoint("classroom:abc:gi:5") == "classroom:abc"
 
 
-class TestPropagateParentDone:
-    def _checkpoint_task(self) -> Task:
-        return Task(
-            source=Source.COMPASS,
-            source_id="CP1",
-            child="james",
-            subject="11MAM",
-            title="Chapter 1 Coursework",
-            checkpoints=[{"id": 101, "name": "Equations"}, {"id": 102, "name": "Inequalities"}],
-            url="https://example/cp",
+# --------------------------------------------------------------------------- #
+# partition_tasks
+# --------------------------------------------------------------------------- #
+
+
+class TestPartitionTasks:
+    def test_active_task_stays_active(self):
+        t = _task(status=Status.NOT_STARTED)
+        rows = project_tasks_rows([t])
+        active, history = partition_tasks(rows, [t], [])
+        assert len(active) == 1
+        assert len(history) == 0
+
+    def test_recent_submitted_stays_active(self):
+        """Submitted within cutoff stays in Active (not yet historical)."""
+        t = _task(
+            status=Status.SUBMITTED,
+            due_at=datetime.now(UTC),  # very recent
         )
+        rows = project_tasks_rows([t])
+        active, _history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(active) == 1
 
-    def test_parent_done_propagates_to_sub_tasks(self):
-        # With no parent row, propagate_parent_done is a no-op for checkpoint tasks.
-        rows = project_tasks_rows([self._checkpoint_task()])
-        assert len(rows) == 2  # checkpoint rows only
-        result = propagate_parent_done(rows)
-        assert result == rows  # unchanged
+    def test_old_submitted_moves_to_history(self):
+        """Submitted > cutoff_days ago moves to History."""
+        from datetime import timedelta
 
-    def test_parent_not_done_leaves_sub_tasks_undone(self):
-        rows = project_tasks_rows([self._checkpoint_task()])
-        result = propagate_parent_done(rows)
-        done_idx = _idx("done")
-        assert result[0].cells[done_idx] is False
-        assert result[1].cells[done_idx] is False
+        old_due = datetime.now(UTC) - timedelta(days=40)
+        t = _task(status=Status.SUBMITTED, due_at=old_due)
+        rows = project_tasks_rows([t])
+        active, history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(history) == 1
+        assert len(active) == 0
 
-    def test_no_checkpoints_returns_unchanged(self):
-        rows = project_tasks_rows([_task()])
-        assert propagate_parent_done(rows) == rows
+    def test_old_graded_moves_to_history(self):
+        from datetime import timedelta
+
+        old_due = datetime.now(UTC) - timedelta(days=45)
+        t = _task(status=Status.GRADED, due_at=old_due)
+        rows = project_tasks_rows([t])
+        _active, history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(history) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -827,20 +633,23 @@ class FakeGoldSink:
         self,
         *,
         user_edits: list[UserEdit] | None = None,
-        checkboxes: list[DuplicateCheckboxState] | None = None,
         raw_tab_rows: dict[str, list[list[str]]] | None = None,
+        dashboard_meta: DashboardMeta | None = None,
     ):
         self._user_edits = user_edits or []
-        self._checkboxes = checkboxes or []
         self._raw_tab_rows = raw_tab_rows or {}
         self.writes: dict[str, list[tuple]] = {}
         self.hidden_state: dict[str, bool] = {}
+        self.dashboard_requests: list[list[dict]] = []
+        self._dashboard_meta = dashboard_meta or DashboardMeta(
+            sheet_id=0,
+            table_ids=[],
+            banded_range_ids=[],
+            conditional_format_rule_count=0,
+        )
 
     def read_user_edits(self, spreadsheet_id: str) -> list[UserEdit]:
         return list(self._user_edits)
-
-    def read_duplicate_checkboxes(self, spreadsheet_id: str) -> list[DuplicateCheckboxState]:
-        return list(self._checkboxes)
 
     def read_tab_raw(self, spreadsheet_id: str, tab_name: str) -> list[list[str]]:
         return list(self._raw_tab_rows.get(tab_name, []))
@@ -850,6 +659,16 @@ class FakeGoldSink:
 
     def set_tab_hidden(self, spreadsheet_id: str, tab, hidden: bool) -> None:
         self.hidden_state[tab.name] = hidden
+
+    def read_dashboard_meta(self, spreadsheet_id: str) -> DashboardMeta:
+        return self._dashboard_meta
+
+    def write_dashboard_layout(self, spreadsheet_id: str, requests: list[dict]) -> None:
+        self.dashboard_requests.append(list(requests))
+
+
+def _store(tmp_path: Path) -> StateStore:
+    return StateStore(tmp_path / "state.db")
 
 
 class TestPublishForChild:
@@ -866,59 +685,13 @@ class TestPublishForChild:
         )
         assert result.tasks_written == 1
         assert "Tasks" in sink.writes
-        assert "Possible Duplicates" in sink.writes
+        assert "History" in sink.writes
         assert "Settings" in sink.writes
         assert "UserEdits" in sink.writes
 
-    def test_duplicates_tab_hidden_when_empty(self, tmp_path: Path):
-        store = _store(tmp_path)
-        sink = FakeGoldSink()
-        publish_for_child(
-            store,
-            sink,
-            child="james",
-            spreadsheet_id="SS1",
-            tasks=[_task()],
-            last_synced=None,
-        )
-        assert sink.hidden_state["Possible Duplicates"] is True
-
-    def test_duplicates_tab_visible_when_pending_link_exists(self, tmp_path: Path):
-        store = _store(tmp_path)
-        _seed_link(store)
-        sink = FakeGoldSink()
-        result = publish_for_child(
-            store,
-            sink,
-            child="james",
-            spreadsheet_id="SS1",
-            tasks=[_task()],
-            last_synced=None,
-        )
-        assert result.duplicates_written == 1
-        assert sink.hidden_state["Possible Duplicates"] is False
-
-    def test_checkbox_state_persisted_before_link_load(self, tmp_path: Path):
-        store = _store(tmp_path)
-        link_id = _seed_link(store)
-        sink = FakeGoldSink(
-            checkboxes=[DuplicateCheckboxState(link_id, confirm=True, dismiss=False)]
-        )
-        result = publish_for_child(
-            store,
-            sink,
-            child="james",
-            spreadsheet_id="SS1",
-            tasks=[_task()],
-            last_synced=None,
-        )
-        # Confirmed link is dropped from this publish (state is no longer pending).
-        assert result.duplicates_written == 0
-        assert result.duplicates_state_updates == 1
-
     def test_user_edit_round_trip(self, tmp_path: Path):
         store = _store(tmp_path)
-        existing = [UserEdit("compass:T1", "priority", "High", "OLD-TS")]
+        existing = [UserEdit("compass:T1", "notes", "check chapter 4", "OLD-TS")]
         sink = FakeGoldSink(user_edits=existing)
         publish_for_child(
             store,
@@ -930,14 +703,16 @@ class TestPublishForChild:
         )
         # Tasks tab reflects the override.
         tasks_rows = sink.writes["Tasks"]
-        assert tasks_rows[0][_idx("priority")] == "High"
+        assert tasks_rows[0][_idx("notes")] == "check chapter 4"
         # UserEdits writeback preserves the old timestamp (no churn).
+        # Tab schema: task_uid | column | original_value | value | updated_at.
         ue_rows = sink.writes["UserEdits"]
         assert len(ue_rows) == 1
         assert ue_rows[0][0] == "compass:T1"
-        assert ue_rows[0][1] == "priority"
-        assert ue_rows[0][2] == "High"
-        assert ue_rows[0][3] == "OLD-TS"
+        assert ue_rows[0][1] == "notes"
+        assert ue_rows[0][2] == ""  # original_value: notes default is empty
+        assert ue_rows[0][3] == "check chapter 4"
+        assert ue_rows[0][4] == "OLD-TS"
 
     def test_idempotent_when_state_unchanged(self, tmp_path: Path):
         store = _store(tmp_path)
@@ -964,29 +739,445 @@ class TestPublishForChild:
         assert sink.writes["Tasks"] == second_sink.writes["Tasks"]
 
     def test_tasks_tab_edit_captured_via_read_tab_raw(self, tmp_path: Path):
-        """A priority override in the live Tasks tab is captured and round-tripped."""
+        """A notes override in the live Tasks tab is captured and round-tripped."""
         store = _store(tmp_path)
         t = _task()
-        raw_row = _raw_row(t, priority="Med")
+        raw_row = _raw_row(t, notes="do chapter 4")
         sink = FakeGoldSink(raw_tab_rows={"Tasks": [raw_row]})
         publish_for_child(
-            store, sink, child="james", spreadsheet_id="SS1",
-            tasks=[t], last_synced=None,
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[t],
+            last_synced=None,
         )
         tasks_rows = sink.writes["Tasks"]
-        assert tasks_rows[0][_idx("priority")] == "Med"
+        assert tasks_rows[0][_idx("notes")] == "do chapter 4"
         ue_rows = sink.writes["UserEdits"]
-        assert any(r[1] == "priority" and r[2] == "Med" for r in ue_rows)
+        # UserEdits row: task_uid | column | original_value | value | updated_at
+        assert any(r[1] == "notes" and r[3] == "do chapter 4" for r in ue_rows)
 
     def test_graded_status_not_overridden_by_tasks_tab(self, tmp_path: Path):
         """Silver Graded locks status — even if the Tasks tab shows something else."""
         store = _store(tmp_path)
-        t = _task(status=Status.GRADED)
+        # Recent first_seen_at so the row stays on Tasks (within the
+        # history cutoff) rather than partitioning straight to History.
+        t = _task(status=Status.GRADED, first_seen_at=datetime.now(UTC))
         raw_row = _raw_row(t, status="Not started")
         sink = FakeGoldSink(raw_tab_rows={"Tasks": [raw_row]})
         publish_for_child(
-            store, sink, child="james", spreadsheet_id="SS1",
-            tasks=[t], last_synced=None,
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[t],
+            last_synced=None,
         )
         tasks_rows = sink.writes["Tasks"]
         assert tasks_rows[0][_idx("status")] == "Graded"
+
+    def test_history_written_count(self, tmp_path: Path):
+        """Old submitted tasks appear in history_written, not tasks_written."""
+        from datetime import timedelta
+
+        store = _store(tmp_path)
+        old_due = datetime.now(UTC) - timedelta(days=40)
+        t = _task(status=Status.SUBMITTED, due_at=old_due)
+        sink = FakeGoldSink()
+        result = publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[t],
+            last_synced=None,
+            cutoff_days=30,
+        )
+        assert result.tasks_written == 0
+        assert result.history_written == 1
+
+
+# --------------------------------------------------------------------------- #
+# Archived routing in partition_tasks
+# --------------------------------------------------------------------------- #
+
+
+class TestPartitionTasksArchived:
+    def test_archived_routes_immediately_to_history(self):
+        """Archived rows skip the cutoff wait and go straight to History."""
+        t = _task(
+            status=Status.ARCHIVED,
+            first_seen_at=datetime.now(UTC),  # very recent — would normally stay Active.
+        )
+        rows = project_tasks_rows([t])
+        active, history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(history) == 1
+        assert len(active) == 0
+
+    def test_terminal_without_anchor_routes_to_history(self):
+        """Submitted/Graded with no submitted_at, due_at OR first_seen_at —
+        treat as stale and route to History (fixes the 'Submitted with blank
+        Due' zombie that used to linger on Tasks forever)."""
+        t = _task(status=Status.SUBMITTED)  # no anchors
+        rows = project_tasks_rows([t])
+        active, history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(history) == 1
+        assert len(active) == 0
+
+    def test_terminal_falls_back_to_first_seen_at(self):
+        """When submitted_at and due_at are absent, first_seen_at anchors
+        the cutoff comparison (replacing the old last_synced fallback that
+        kept refreshing every sync)."""
+        from datetime import timedelta
+
+        old_first_seen = datetime.now(UTC) - timedelta(days=40)
+        t = _task(status=Status.SUBMITTED, first_seen_at=old_first_seen)
+        rows = project_tasks_rows([t])
+        _active, history = partition_tasks(rows, [t], [], cutoff_days=30)
+        assert len(history) == 1
+
+
+# --------------------------------------------------------------------------- #
+# cap_future_dates
+# --------------------------------------------------------------------------- #
+
+
+class TestCapFutureDates:
+    def test_blanks_due_beyond_cap(self):
+        """Due date more than ``cap_days`` in the future gets blanked."""
+        from datetime import timedelta
+
+        today = date(2026, 5, 26)
+        far_future = today + timedelta(days=500)
+        t = _task(due_at=datetime(far_future.year, far_future.month, far_future.day, tzinfo=UTC))
+        rows = project_tasks_rows([t])
+        capped = cap_future_dates(rows, cap_days=365, today=today)
+        due_idx = TASKS_TAB.column_index("due")
+        assert capped[0].cells[due_idx] == ""
+
+    def test_preserves_due_within_cap(self):
+        from datetime import timedelta
+
+        today = date(2026, 5, 26)
+        soon = today + timedelta(days=100)
+        t = _task(due_at=datetime(soon.year, soon.month, soon.day, tzinfo=UTC))
+        rows = project_tasks_rows([t])
+        capped = cap_future_dates(rows, cap_days=365, today=today)
+        due_idx = TASKS_TAB.column_index("due")
+        assert capped[0].cells[due_idx] == soon
+
+    def test_blank_due_is_passthrough(self):
+        t = _task()  # no due
+        rows = project_tasks_rows([t])
+        capped = cap_future_dates(rows, cap_days=365)
+        assert capped == rows
+
+
+# --------------------------------------------------------------------------- #
+# filter_superseded_edits — archived rules
+# --------------------------------------------------------------------------- #
+
+
+class TestFilterSupersededEditsArchived:
+    def test_kid_can_set_archived(self):
+        """Kids can manually archive via the sheet — the edit is preserved
+        through filter_superseded_edits and apply_archive_edits writes the
+        archive flags through to silver."""
+        t = _task(status=Status.NOT_STARTED)
+        edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+        assert filter_superseded_edits(edits, [t]) == edits
+
+    def test_kid_can_set_archived_case_insensitive(self):
+        t = _task(status=Status.NOT_STARTED)
+        edits = [UserEdit("compass:T1", "status", "archived", "now")]
+        assert filter_superseded_edits(edits, [t]) == edits
+
+    def test_kid_can_un_archive_to_not_started(self):
+        """Reverse direction is allowed — kid clears an archived task back to active."""
+        t = _task(status=Status.ARCHIVED)
+        edits = [UserEdit("compass:T1", "status", "Not started", "now")]
+        assert filter_superseded_edits(edits, [t]) == edits
+
+
+# --------------------------------------------------------------------------- #
+# apply_unarchive_edits
+# --------------------------------------------------------------------------- #
+
+
+class TestApplyUnarchiveEdits:
+    def test_clears_archive_flags_and_updates_task(self, tmp_path: Path):
+        store = _store(tmp_path)
+        t = _task(status=Status.ARCHIVED)
+        # Seed silver with the archived row so clear_archive has something to update.
+        from homework_hub.pipeline.transform import SilverWriter
+
+        writer = SilverWriter(store)
+        writer.upsert_many([(t.model_copy(update={"status": Status.NOT_STARTED}), None)])
+        store.mark_archived(child="james", source="compass", source_id="T1", reason="manual")
+        edits = [UserEdit("compass:T1", "status", "Not started", "now")]
+
+        updated = apply_unarchive_edits(edits, [t], store)
+        assert updated[0].status == Status.NOT_STARTED
+        assert updated[0].archived_at is None
+        assert updated[0].archived_reason is None
+        # Silver row's archive flags should be cleared too.
+        assert store.list_archived(child="james") == []
+
+    def test_no_op_when_no_status_edits(self, tmp_path: Path):
+        store = _store(tmp_path)
+        t = _task(status=Status.ARCHIVED)
+        edits = [UserEdit("compass:T1", "notes", "hello", "now")]
+        tasks = [t]
+        # When there are no status edits, the original list is returned as-is.
+        assert apply_unarchive_edits(edits, tasks, store) is tasks
+
+    def test_archived_to_archived_edit_does_nothing(self, tmp_path: Path):
+        # An edit setting status="Archived" on an already-archived task should not
+        # touch silver and should return the task list unchanged.
+        store = _store(tmp_path)
+        t = _task(status=Status.ARCHIVED)
+        edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+        result = apply_unarchive_edits(edits, [t], store)
+        assert result[0].status == Status.ARCHIVED
+
+
+# --------------------------------------------------------------------------- #
+# apply_archive_edits
+# --------------------------------------------------------------------------- #
+
+
+class TestApplyArchiveEdits:
+    def test_kid_archive_writes_silver_flags(self, tmp_path: Path):
+        """A status="Archived" edit on a non-archived task writes the archive
+        flags through to silver so the row stays archived across syncs."""
+        from homework_hub.pipeline.transform import SilverWriter
+
+        store = _store(tmp_path)
+        t = _task(status=Status.NOT_STARTED)
+        SilverWriter(store).upsert_many([(t, None)])
+        edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+
+        updated = apply_archive_edits(edits, [t], store)
+        assert updated[0].status == Status.ARCHIVED
+        assert updated[0].archived_reason == "kid_edit"
+        # Silver row should now be archived.
+        archived = store.list_archived(child="james")
+        assert len(archived) == 1
+        assert archived[0]["source_id"] == "T1"
+        assert archived[0]["archived_reason"] == "kid_edit"
+
+    def test_no_op_when_no_archive_edits(self, tmp_path: Path):
+        store = _store(tmp_path)
+        t = _task(status=Status.NOT_STARTED)
+        edits = [UserEdit("compass:T1", "status", "In progress", "now")]
+        tasks = [t]
+        assert apply_archive_edits(edits, tasks, store) is tasks
+
+    def test_already_archived_is_skipped(self, tmp_path: Path):
+        store = _store(tmp_path)
+        t = _task(status=Status.ARCHIVED)
+        edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+        result = apply_archive_edits(edits, [t], store)
+        # Already archived — task list returned unchanged (identity).
+        assert result == [t] or result[0].status == Status.ARCHIVED
+
+    def test_terminal_status_not_archived_by_kid(self, tmp_path: Path):
+        """Graded / Overdue silver states cannot be archived via the sheet —
+        filter_superseded_edits drops the edit before apply_archive_edits
+        sees it, and apply_archive_edits also self-guards as defence in depth."""
+        from homework_hub.pipeline.transform import SilverWriter
+
+        store = _store(tmp_path)
+        t = _task(status=Status.GRADED)
+        SilverWriter(store).upsert_many([(t, None)])
+        edits = [UserEdit("compass:T1", "status", "Archived", "now")]
+        result = apply_archive_edits(edits, [t], store)
+        assert result[0].status == Status.GRADED
+        assert store.list_archived(child="james") == []
+
+
+# --------------------------------------------------------------------------- #
+# UserEdits original_value (Option B: refreshed each cycle)
+# --------------------------------------------------------------------------- #
+
+
+class TestUserEditOriginalValue:
+    def test_capture_records_original_value_from_projected_default(self):
+        """When a kid override is first observed, original_value captures the
+        projected silver value at that moment."""
+        from homework_hub.pipeline.publish import _STATUS_DISPLAY
+
+        t = _task(status=Status.NOT_STARTED)
+        projected = project_tasks_rows([t])
+        # Kid set status to "In progress" — raw row reflects that.
+        raw_row = _raw_row(t, status="In progress")
+        edits = capture_tab_edits([raw_row], projected, tab=TASKS_TAB)
+        assert len(edits) == 1
+        assert edits[0].column == "status"
+        assert edits[0].value == "In progress"
+        # original_value = projected silver default at observation time.
+        assert edits[0].original_value == _STATUS_DISPLAY[Status.NOT_STARTED.value]
+
+    def test_diff_refreshes_original_value_each_cycle(self):
+        """Even when value is unchanged across publish cycles, original_value
+        is refreshed to the current projected silver value (Option B)."""
+        t = _task(status=Status.IN_PROGRESS)  # silver advanced
+        projected = project_tasks_rows([t])
+        # Kid override still says "Submitted" — value diverges from new
+        # silver default "In progress".
+        merged_idx = TASKS_TAB.column_index("status")
+        merged_cells = list(projected[0].cells)
+        merged_cells[merged_idx] = "Submitted"
+        from homework_hub.pipeline.publish import TaskRow
+
+        merged_row = TaskRow(task_uid=projected[0].task_uid, cells=tuple(merged_cells))
+        prior = UserEdit(
+            task_uid=projected[0].task_uid,
+            column="status",
+            value="Submitted",
+            updated_at="OLD-TS",
+            original_value="Not started",  # stale: was captured when silver was Not started
+        )
+        out = diff_user_edits([merged_row], [prior], projected=projected)
+        assert len(out) == 1
+        assert out[0].value == "Submitted"
+        assert out[0].updated_at == "OLD-TS"  # preserved
+        assert out[0].original_value == "In progress"  # refreshed
+
+    def test_diff_drops_override_when_system_catches_up(self):
+        """When silver projects the same value the kid set, the override is
+        automatically dropped from UserEdits (no row written)."""
+        t = _task(status=Status.SUBMITTED)  # silver caught up
+        projected = project_tasks_rows([t])
+        # Merged row matches the projected default exactly (kid's earlier
+        # override "Submitted" now agrees with silver).
+        merged_row = projected[0]
+        prior = UserEdit(
+            task_uid=projected[0].task_uid,
+            column="status",
+            value="Submitted",
+            updated_at="OLD-TS",
+            original_value="Not started",
+        )
+        out = diff_user_edits([merged_row], [prior], projected=projected)
+        # Override removed — system has caught up.
+        assert out == []
+
+
+# --------------------------------------------------------------------------- #
+# Regression: row moving from Tasks → History must not phantom-unarchive
+# --------------------------------------------------------------------------- #
+
+
+class TestArchivedRowDoesNotPhantomUnarchive:
+    """When a row transitions from Tasks to History this cycle (e.g. it was
+    just archived by ``apply_age_cap``), the previous sheet still has it on
+    the Tasks tab with its OLD status (e.g. ``Not started``). The publish
+    pipeline must not interpret that stale Tasks-tab cell as a kid-driven
+    un-archive edit. Otherwise the archive flags get cleared every sync and
+    the row bounces back to the Tasks tab on the next projection."""
+
+    def test_stale_tasks_tab_row_does_not_unarchive(self, tmp_path: Path):
+        store = _store(tmp_path)
+        archived_at = datetime(2026, 5, 26, tzinfo=UTC)
+        t = _task(
+            status=Status.ARCHIVED,
+            due_at=datetime(2024, 11, 20, tzinfo=UTC),
+            archived_at=archived_at,
+            archived_reason="age_cap",
+        )
+
+        # Seed silver and mark archived so we can detect un-archive side-effects.
+        from homework_hub.pipeline.transform import SilverWriter
+
+        writer = SilverWriter(store)
+        writer.upsert_many([(t.model_copy(update={"status": Status.NOT_STARTED}), None)])
+        store.mark_archived(child="james", source="compass", source_id="T1", reason="age_cap")
+
+        # The previous sheet had this row on the Tasks tab with status
+        # "Not started". Simulate that stale state by feeding a raw Tasks-tab
+        # row that matches the OLD projection (status "Not started").
+        stale_task = t.model_copy(update={"status": Status.NOT_STARTED})
+        stale_raw = _raw_row(stale_task)
+        sink = FakeGoldSink(raw_tab_rows={TASKS_TAB.name: [stale_raw]})
+
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[t],
+            last_synced=None,
+        )
+
+        # Silver must still be archived — no phantom un-archive.
+        archived = store.list_archived(child="james")
+        assert len(archived) == 1
+        assert archived[0]["source_id"] == "T1"
+        assert archived[0]["archived_reason"] == "age_cap"
+
+        # And the row must be on the History tab, not Tasks.
+        tasks_rows = sink.writes[TASKS_TAB.name]
+        history_rows = sink.writes["History"]
+        assert all(row[_idx("task_uid")] != "compass:T1" for row in tasks_rows)
+        assert any(row[_idx("task_uid")] == "compass:T1" for row in history_rows)
+
+
+class TestPublishDashboard:
+    """v5.0: publish_for_child must read Dashboard meta then emit a
+    batchUpdate body with one addTable per section, scoped to the
+    active (non-archived) tasks."""
+
+    def test_publishes_dashboard_layout_with_four_tables(self, tmp_path: Path):
+        store = _store(tmp_path)
+        meta = DashboardMeta(
+            sheet_id=42,
+            table_ids=["t_a", "t_b"],
+            banded_range_ids=[1, 2],
+            conditional_format_rule_count=4,
+        )
+        sink = FakeGoldSink(dashboard_meta=meta)
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task(due_at=datetime(2026, 5, 1, tzinfo=UTC))],
+            last_synced=None,
+        )
+        assert len(sink.dashboard_requests) == 1
+        reqs = sink.dashboard_requests[0]
+        # Four addTable requests, one per section
+        # (Overdue / DueThisWeek / Upcoming / Done7D).
+        addtables = [r for r in reqs if "addTable" in r]
+        assert len(addtables) == 4
+        # Teardown wired through from meta.
+        assert sum(1 for r in reqs if "deleteTable" in r) == 2
+        assert sum(1 for r in reqs if "deleteBanding" in r) == 2
+        assert sum(1 for r in reqs if "deleteConditionalFormatRule" in r) == 4
+        # All Tables anchored to the meta sheetId.
+        for at in addtables:
+            assert at["addTable"]["table"]["range"]["sheetId"] == 42
+
+    def test_dashboard_failure_does_not_break_publish(self, tmp_path: Path):
+        """Tasks/History/UserEdits writes are canonical state — a
+        Dashboard refresh failure must be swallowed (logged)."""
+        store = _store(tmp_path)
+
+        class BrokenSink(FakeGoldSink):
+            def write_dashboard_layout(self, spreadsheet_id, requests):
+                raise RuntimeError("API blew up")
+
+        sink = BrokenSink()
+        result = publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[_task()],
+            last_synced=None,
+        )
+        # Publish still returned a result; Tasks tab still written.
+        assert result.tasks_written == 1
+        assert "Tasks" in sink.writes

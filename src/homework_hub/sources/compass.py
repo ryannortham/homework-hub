@@ -63,10 +63,10 @@ _STATUS_MAP: dict[int, Status] = {
 # inspecting the badge labels in the Compass web app.
 # Unknown categoryId values fall back to HOMEWORK (safe default).
 _CATEGORY_TYPE_MAP: dict[int, TaskType] = {
-    1: TaskType.GENERAL,    # Coursework, topic tests (no semester report)
-    2: TaskType.HOMEWORK,   # Homework sheets, lesson tasks
-    3: TaskType.GENERAL,    # Projects / advocacy tasks
-    5: TaskType.ASSESSMENT, # BENCHMARKs, SACs, formative assessments
+    1: TaskType.GENERAL,  # Coursework, topic tests (no semester report)
+    2: TaskType.HOMEWORK,  # Homework sheets, lesson tasks
+    3: TaskType.GENERAL,  # Projects / advocacy tasks
+    5: TaskType.ASSESSMENT,  # BENCHMARKs, SACs, formative assessments
 }
 
 
@@ -121,9 +121,7 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
     if due_at is None and status in (Status.SUBMITTED, Status.GRADED):
         due_at = submitted_at or assigned_at
 
-    task_type = _CATEGORY_TYPE_MAP.get(
-        learning_task.get("categoryId") or 0, TaskType.HOMEWORK
-    )
+    task_type = _CATEGORY_TYPE_MAP.get(learning_task.get("categoryId") or 0, TaskType.HOMEWORK)
 
     # Extract sub-task checkpoints from gradingItems where the teacher has used
     # the "Checkpoints" grading scheme (measureUniqueId == "Checkpoints").

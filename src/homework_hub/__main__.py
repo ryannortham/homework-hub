@@ -43,7 +43,7 @@ def cli(ctx: click.Context) -> None:
 @cli.command()
 @click.option("--child", default=None, help="Child name; omit to sync all.")
 def sync(child: str | None) -> None:
-    """Run a one-shot full medallion sync (ingest \u2192 transform \u2192 detect \u2192 publish)."""
+    """Run a one-shot full medallion sync (ingest \u2192 transform \u2192 publish)."""
     settings = Settings()
     orchestrator = build_medallion_orchestrator(settings)
     report = orchestrator.run(only_child=child)
@@ -79,7 +79,7 @@ def transform(child: str | None) -> None:
 @cli.command()
 @click.option("--child", default=None, help="Child name; omit to publish for all.")
 def publish(child: str | None) -> None:
-    """Run only the detect + publish stages."""
+    """Run only the publish stage."""
     settings = Settings()
     orchestrator = build_medallion_orchestrator(settings)
     report = orchestrator.publish_only(only_child=child)
@@ -119,6 +119,93 @@ def replay(child: str | None) -> None:
         raise SystemExit(2)
 
 
+def _ensure_zen_marionette(child: str | None = None, force: bool = False) -> None:
+    """Ensure Zen Browser is running with Marionette and the correct child profile; prompt to relaunch if not.
+
+    Mirrors the Zen-launch logic in ``refresh-ep`` so all auth commands share
+    the same behaviour.
+    """
+    from homework_hub.zen import (
+        DEFAULT_PORT,
+        find_zen_processes,
+        get_child_profile_path,
+        is_zen_running_with_profile,
+        kill_zen_processes,
+        launch_zen_with_marionette,
+        marionette_reachable,
+        wait_for_marionette,
+    )
+
+    profile_path = get_child_profile_path(child)
+    is_correct_profile = is_zen_running_with_profile(profile_path)
+
+    if marionette_reachable(DEFAULT_PORT) and is_correct_profile:
+        return
+
+    existing = find_zen_processes()
+    if existing:
+        if not is_correct_profile:
+            click.echo(
+                f"Zen is running (PIDs: {existing}) but not with the correct profile for "
+                f"{child or 'default'}.\n"
+                f"Target profile: {profile_path}"
+            )
+        else:
+            click.echo(
+                f"Zen is running (PIDs: {existing}) but Marionette is not reachable "
+                f"on port {DEFAULT_PORT}.\n"
+                "Marionette must be enabled at launch — it cannot be hot-attached."
+            )
+
+        if not force and not click.confirm(
+            "Kill the running Zen instance and relaunch with the correct profile and Marionette?",
+            default=False,
+        ):
+            raise click.ClickException("Aborted. Quit Zen yourself and re-run, or use --force.")
+        click.echo("Stopping existing Zen…")
+        kill_zen_processes(existing)
+
+    click.echo(f"Launching Zen with Marionette for {child or 'default'}…")
+    try:
+        launch_zen_with_marionette(profile=profile_path)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo("Waiting for Marionette to come up…")
+    if not wait_for_marionette(DEFAULT_PORT, timeout=20.0):
+        raise click.ClickException(
+            f"Marionette did not become available on port {DEFAULT_PORT} within 20s. "
+            "Check /tmp/zen-marionette.log for details."
+        )
+    import time
+
+    time.sleep(2.0)
+    click.echo("  Marionette ready.")
+
+
+def _push_token(out_path: Path, host: str, dest: str, child: str, trigger_sync: bool) -> None:
+    """Copy a token file to the remote host and optionally trigger a sync."""
+    import subprocess
+
+    remote = f"{host}:{dest}{out_path.name}"
+    click.echo(f"Copying token to {remote}…")
+    result = subprocess.run(["scp", str(out_path), remote], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"scp failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    click.echo("  Token copied.")
+
+    if trigger_sync:
+        click.echo(f"Triggering sync for {child} on {host}…")
+        result = subprocess.run(
+            ["ssh", host, f"docker exec homework-hub homework-hub sync --child {child}"],
+            text=True,
+        )
+        if result.returncode not in (0, 2):
+            raise click.ClickException(f"Sync command exited with code {result.returncode}")
+
+
 @cli.group()
 def auth() -> None:
     """Per-source authentication helpers."""
@@ -137,24 +224,59 @@ def auth() -> None:
     default="https://classroom.google.com",
     help="Override Classroom base URL (rarely needed).",
 )
-def auth_classroom(child: str, token_path: Path | None, base_url: str) -> None:
-    """Run a headed Playwright login for Classroom and dump storage_state.json.
+@click.option(
+    "--host",
+    default="root@192.168.1.100",
+    show_default=True,
+    help="SSH destination to copy token to.",
+)
+@click.option(
+    "--dest",
+    default="/mnt/tank/Apps/HomeworkHub/Config/tokens/",
+    show_default=True,
+    help="Remote directory for the token file.",
+)
+@click.option(
+    "--trigger-sync/--no-trigger-sync",
+    default=True,
+    help="Trigger a sync on the remote host after copying (default: yes).",
+)
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Skip the confirm prompt before killing an existing Zen instance.",
+)
+def auth_classroom(
+    child: str,
+    token_path: Path | None,
+    base_url: str,
+    host: str,
+    dest: str,
+    trigger_sync: bool,
+    force: bool,
+) -> None:
+    """Login to Classroom via Zen Browser and save the session cookies.
 
-    Mordialloc's Workspace admin blocks third-party OAuth apps, so we replay
-    the kid's authenticated browser session instead. Opens a real Chromium
-    window so Google SSO (including 2FA) works without being detected as a
-    bot. The kid signs in once on the Mac; the resulting cookies are copied
-    to the server. Re-run when Discord alerts on expiry.
+    Opens a new tab in Zen Browser (launching it with Marionette if needed)
+    so Google SSO works with a real Firefox fingerprint. Complete sign-in in
+    the Zen window; the tab closes automatically once authenticated.
+    The resulting token is copied to TrueNAS and a sync is triggered.
+    Re-run when Discord alerts on auth expiry.
     """
     from homework_hub.sources.classroom import run_headed_login
+
+    _ensure_zen_marionette(child=child, force=force)
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "classroom")
 
-    click.echo(f"Opening headed Chromium for {child} (Google Classroom)…")
-    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
+    click.echo(f"Opening new Zen tab for {child} (Google Classroom)…")
+    click.echo("Complete the Google sign-in in the Zen window; the tab closes automatically.")
     run_headed_login(out_path, base_url=base_url)
     click.echo(f"Classroom storage state saved → {out_path}")
+    _push_token(out_path, host, dest, child, trigger_sync)
 
 
 @auth.command("compass")
@@ -245,22 +367,191 @@ def auth_eduperfect(child: str, token_path: Path | None) -> None:
     default="https://app.edrolo.com",
     help="Override Edrolo base URL (rarely needed).",
 )
-def auth_edrolo(child: str, token_path: Path | None, base_url: str) -> None:
-    """Run a headed Playwright login for Edrolo and dump storage_state.json.
+@click.option(
+    "--host",
+    default="root@192.168.1.100",
+    show_default=True,
+    help="SSH destination to copy token to.",
+)
+@click.option(
+    "--dest",
+    default="/mnt/tank/Apps/HomeworkHub/Config/tokens/",
+    show_default=True,
+    help="Remote directory for the token file.",
+)
+@click.option(
+    "--trigger-sync/--no-trigger-sync",
+    default=True,
+    help="Trigger a sync on the remote host after copying (default: yes).",
+)
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Skip the confirm prompt before killing an existing Zen instance.",
+)
+def auth_edrolo(
+    child: str,
+    token_path: Path | None,
+    base_url: str,
+    host: str,
+    dest: str,
+    trigger_sync: bool,
+    force: bool,
+) -> None:
+    """Login to Edrolo via Zen Browser and save the session cookies.
 
-    Opens a real Chromium window so Google SSO (including 2FA) works without
-    being detected as a bot. The kid signs in once on the Mac; the resulting
-    cookies are copied to the server. Re-run when Discord alerts on expiry.
+    Opens a new tab in Zen Browser (launching it with Marionette if needed)
+    so Google SSO works with a real Firefox fingerprint. Complete sign-in in
+    the Zen window; the tab closes automatically once authenticated.
+    The resulting token is copied to TrueNAS and a sync is triggered.
+    Re-run when Discord alerts on auth expiry.
     """
     from homework_hub.sources.edrolo import run_headed_login
+
+    _ensure_zen_marionette(child=child, force=force)
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "edrolo")
 
-    click.echo(f"Opening headed Chromium for {child} (Edrolo)…")
-    click.echo("Complete the Google sign-in in the browser; window closes automatically.")
+    click.echo(f"Opening new Zen tab for {child} (Edrolo)…")
+    click.echo("Complete the Google sign-in in the Zen window; the tab closes automatically.")
     run_headed_login(out_path, base_url=base_url)
     click.echo(f"Edrolo storage state saved → {out_path}")
+    _push_token(out_path, host, dest, child, trigger_sync)
+
+
+@auth.command("extract-from-zen")
+@click.option(
+    "--child",
+    default=None,
+    help="Restrict extraction to one child (james|tahlia). Omit to extract all.",
+)
+@click.option(
+    "--profile",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Override Zen profile path. Defaults to the configured release profile.",
+)
+@click.option(
+    "--host",
+    default="root@192.168.1.100",
+    show_default=True,
+    help="SSH destination to copy tokens to.",
+)
+@click.option(
+    "--dest",
+    default="/mnt/tank/Apps/HomeworkHub/Config/tokens/",
+    show_default=True,
+    help="Remote directory for token files.",
+)
+@click.option(
+    "--trigger-sync/--no-trigger-sync",
+    default=True,
+    help="Trigger a sync per child on the remote host after copying (default: yes).",
+)
+def auth_extract_from_zen(
+    child: str | None,
+    profile: Path | None,
+    host: str,
+    dest: str,
+    trigger_sync: bool,
+) -> None:
+    """Extract persistent cookies from a running Zen Browser's SQLite store.
+
+    Reads ``cookies.sqlite`` directly — no Marionette, no browser restart.
+    Use this when Zen is already open in its normal session and you just
+    want to harvest the existing logins.
+
+    Container map (Firefox Multi-Account Containers):
+
+    - default (``''``)           — Ryan personal (no homework data)
+    - ``^userContextId=1``       — Tahlia/James school + Edrolo + Compass
+    - ``^userContextId=2``       — Ryan work (no homework data)
+
+    Per-source extraction:
+
+    - **Tahlia Edrolo** (Container 1): ``sessionid`` on ``app.edrolo.com``
+    - **James Classroom** (Container 1): Google ``SID`` on ``.google.com``
+
+    EP ``access_token`` and Compass ``ASP.NET_SessionId`` are session
+    cookies (in-memory only) and cannot be extracted via SQLite — use
+    ``refresh-ep`` and ``auth compass`` respectively for those.
+    """
+    from homework_hub.sources.classroom import ClassroomStorageState
+    from homework_hub.sources.edrolo import EdroloStorageState
+    from homework_hub.zen import ZEN_PROFILE, extract_cookies_from_zen_sqlite
+
+    settings = Settings()
+    profile_path = profile or ZEN_PROFILE
+    if not profile_path.exists():
+        raise click.ClickException(f"Zen profile not found: {profile_path}")
+
+    container1 = "^userContextId=1"
+    successes: list[tuple[str, str, Path]] = []  # (child, source, token_path)
+    skipped: list[str] = []
+
+    # --- Tahlia Edrolo --------------------------------------------------- #
+    if child in (None, "tahlia"):
+        click.echo("Extracting Tahlia Edrolo (Container 1) …")
+        edrolo_cookies = extract_cookies_from_zen_sqlite(
+            profile_path, ["edrolo.com"], origin_attrs=container1
+        )
+        names = {c["name"] for c in edrolo_cookies}
+        if "sessionid" in names:
+            out_path = settings.child_token_path("tahlia", "edrolo")
+            state = EdroloStorageState({"cookies": edrolo_cookies, "origins": []})
+            state.save(out_path)
+            click.echo(f"  saved {len(edrolo_cookies)} cookie(s) → {out_path}")
+            successes.append(("tahlia", "edrolo", out_path))
+        else:
+            skipped.append("tahlia edrolo (no sessionid in Container 1)")
+
+    # --- James Classroom ------------------------------------------------- #
+    if child in (None, "james"):
+        click.echo("Extracting James Classroom (Container 1, .google.com) …")
+        google_cookies = extract_cookies_from_zen_sqlite(
+            profile_path, ["google.com", "google.com.au"], origin_attrs=container1
+        )
+        names = {c["name"] for c in google_cookies}
+        if "SID" in names:
+            out_path = settings.child_token_path("james", "classroom")
+            state = ClassroomStorageState({"cookies": google_cookies, "origins": []})
+            state.save(out_path)
+            click.echo(f"  saved {len(google_cookies)} cookie(s) → {out_path}")
+            successes.append(("james", "classroom", out_path))
+        else:
+            skipped.append("james classroom (no Google SID in Container 1)")
+
+    if not successes:
+        click.echo("\nNo tokens extracted.")
+        for s in skipped:
+            click.echo(f"  skipped: {s}")
+        raise click.ClickException("Nothing to push.")
+
+    # --- Push + sync ----------------------------------------------------- #
+    click.echo("")
+    pushed_children: set[str] = set()
+    for c, src, path in successes:
+        click.echo(f"Pushing {c} {src} …")
+        _push_token(path, host, dest, c, trigger_sync=False)
+        pushed_children.add(c)
+
+    for s in skipped:
+        click.echo(f"skipped: {s}")
+
+    if trigger_sync:
+        import subprocess
+
+        for c in sorted(pushed_children):
+            click.echo(f"\nTriggering sync for {c} …")
+            result = subprocess.run(
+                ["ssh", host, f"docker exec homework-hub homework-hub sync --child {c}"],
+                text=True,
+            )
+            if result.returncode not in (0, 2):
+                raise click.ClickException(f"Sync for {c} exited with code {result.returncode}")
 
 
 @cli.command("refresh-ep")
@@ -313,55 +604,17 @@ def refresh_ep(
     at least once on this Mac. The FusionAuth SSO cookie persists across
     reboots, so subsequent refreshes are silent.
     """
-    import subprocess
-
     from homework_hub.sources.eduperfect import run_headed_login
-    from homework_hub.zen import (
-        DEFAULT_PORT,
-        find_zen_processes,
-        kill_zen_processes,
-        launch_zen_with_marionette,
-        marionette_reachable,
-        wait_for_marionette,
-    )
 
     settings = Settings()
     out_path = token_path or settings.child_token_path(child, "eduperfect")
 
     # 1. Ensure Marionette is reachable, launching Zen if needed.
-    if not marionette_reachable(DEFAULT_PORT):
-        existing = find_zen_processes()
-        if existing:
-            click.echo(
-                f"Zen is running (PIDs: {existing}) but Marionette is not "
-                f"reachable on port {DEFAULT_PORT}.\n"
-                "Marionette must be enabled at launch — it cannot be hot-attached."
-            )
-            if not force and not click.confirm(
-                "Kill the running Zen instance and relaunch with Marionette?",
-                default=False,
-            ):
-                raise click.ClickException("Aborted. Quit Zen yourself and re-run, or use --force.")
-            click.echo("Stopping existing Zen…")
-            kill_zen_processes(existing)
+    _ensure_zen_marionette(child=child, force=force)
+    # EP dashboard needs a moment to start loading before we navigate.
+    import time
 
-        click.echo("Launching Zen with Marionette…")
-        try:
-            launch_zen_with_marionette()
-        except RuntimeError as exc:
-            raise click.ClickException(str(exc)) from exc
-
-        click.echo("Waiting for Marionette to come up…")
-        if not wait_for_marionette(DEFAULT_PORT, timeout=20.0):
-            raise click.ClickException(
-                f"Marionette did not become available on port {DEFAULT_PORT} "
-                "within 20 seconds. Check /tmp/zen-marionette.log for details."
-            )
-        # Brief pause for the EP dashboard to start loading before we navigate.
-        import time
-
-        time.sleep(3.0)
-        click.echo("  Marionette ready.")
+    time.sleep(1.0)
 
     # 2. Capture token from Zen Marionette.
     click.echo(f"Capturing EP token for {child}…")
@@ -392,25 +645,8 @@ def refresh_ep(
     except Exception:
         click.echo(f"  Token saved → {out_path}")
 
-    # 3. Copy to remote host.
-    remote = f"{host}:{dest}{out_path.name}"
-    click.echo(f"Copying token to {remote}…")
-    result = subprocess.run(["scp", str(out_path), remote], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise click.ClickException(
-            f"scp failed (exit {result.returncode}): {result.stderr.strip()}"
-        )
-    click.echo("  Token copied.")
-
-    # 4. Trigger sync on remote host with live output.
-    if trigger_sync:
-        click.echo(f"Triggering sync for {child} on {host}…")
-        result = subprocess.run(
-            ["ssh", host, f"docker exec homework-hub homework-hub sync --child {child}"],
-            text=True,
-        )
-        if result.returncode not in (0, 2):  # 2 = sync ran with non-fatal failures
-            raise click.ClickException(f"Sync command exited with code {result.returncode}")
+    # 3. Copy to remote host and optionally trigger sync.
+    _push_token(out_path, host, dest, child, trigger_sync)
 
 
 @cli.command("bootstrap-sheet")
@@ -457,6 +693,146 @@ def bootstrap_sheet(child: str, title: str | None, share_with: tuple[str, ...]) 
     click.echo(f"Shared with service account {sa_email} (writer)")
     if share_with:
         click.echo(f"Also shared with: {', '.join(share_with)}")
+
+
+@cli.command("reapply-template")
+@click.option(
+    "--child",
+    default=None,
+    help="Reapply to a single child's sheet. Defaults to every child with a sheet_id.",
+)
+def reapply_template(child: str | None) -> None:
+    """Push schema-driven Dashboard layout + dropdown rules to EXISTING sheets
+    without recreating them. Use after the schema changes (e.g. a renamed
+    landing tab, new formulas, new dropdown values like ``"Archived"``)
+    so already-bootstrapped sheets pick up the new shape.
+
+    Uses the daemon's service-account credentials (which already have writer
+    access to every kid's sheet), so no human OAuth flow is needed.
+    """
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+
+    from homework_hub.config import ChildrenConfig
+    from homework_hub.schema import DASHBOARD_TABLE_IDS
+    from homework_hub.secrets import from_env
+    from homework_hub.sheet_template import refresh_layout_requests
+    from homework_hub.sinks.sheets_client import (
+        SheetsAPIError,
+        load_service_account_credentials,
+    )
+    from homework_hub.wiring import SERVICE_ACCOUNT_BW_NAME, build_medallion_orchestrator
+
+    settings = Settings()
+    cfg = ChildrenConfig.load(settings.children_yaml)
+
+    if child is not None and child not in cfg.children:
+        raise click.ClickException(f"Unknown child '{child}' in children.yaml")
+
+    targets = (
+        [(child, cfg.children[child])]
+        if child is not None
+        else [(name, c) for name, c in cfg.children.items() if c.sheet_id]
+    )
+    if not targets:
+        click.echo("No children with sheet_id set; nothing to do.")
+        return
+
+    bw = from_env()
+    raw = bw.get_notes(SERVICE_ACCOUNT_BW_NAME)
+    creds = load_service_account_credentials(raw)
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+    click.echo(f"Reapplying template to {len(targets)} sheet(s)…")
+    for name, ch in targets:
+        if not ch.sheet_id:
+            click.echo(f"  {name}: no sheet_id; skipped")
+            continue
+        try:
+            # Fetch live tab→sheetId mapping + stateful artefacts on the
+            # Dashboard tab (charts, bandings, merges, conditional rules)
+            # so the refresh can tear them down before re-adding — otherwise
+            # they'd stack up on every reapply.
+            meta = (
+                service.spreadsheets()
+                .get(
+                    spreadsheetId=ch.sheet_id,
+                    fields=(
+                        "sheets.properties(title,sheetId,index,gridProperties),"
+                        "sheets.charts.chartId,"
+                        "sheets.bandedRanges(bandedRangeId,range),"
+                        "sheets.merges,"
+                        "sheets.conditionalFormats,"
+                        "sheets.tables(tableId)"
+                    ),
+                )
+                .execute()
+            )
+            sheets = sorted(meta.get("sheets", []), key=lambda s: s["properties"].get("index", 0))
+            overrides = {s["properties"]["title"]: s["properties"]["sheetId"] for s in sheets}
+            existing_tab_names = [s["properties"]["title"] for s in sheets]
+            # Dashboard is always the first tab (index 0 in the sorted list);
+            # collect its stateful artefacts.
+            dash = sheets[0] if sheets else {}
+            dash_sid = dash.get("properties", {}).get("sheetId")
+            chart_ids = [c["chartId"] for c in dash.get("charts", []) if "chartId" in c]
+            banded_ids = [
+                b["bandedRangeId"] for b in dash.get("bandedRanges", []) if "bandedRangeId" in b
+            ]
+            # Merges fetched under ``sheets[i].merges`` omit ``sheetId``
+            # in the API response (it's implicit from the parent sheet),
+            # but ``unmergeCells`` requires the GridRange to carry it.
+            # Inject the parent sheet's id so the teardown can address
+            # the merges by their explicit range.
+            merges = [{**m, "sheetId": dash_sid} for m in dash.get("merges", [])]
+            cf_rules = dash.get("conditionalFormats", [])
+            # v5.0 Dashboard Tables — torn down before frame re-emit so
+            # the publish step that follows can recreate them sized to
+            # the current data.
+            dash_table_ids = [
+                t["tableId"]
+                for t in dash.get("tables", [])
+                if t.get("tableId") in DASHBOARD_TABLE_IDS
+            ]
+            requests = refresh_layout_requests(
+                sheet_id_overrides=overrides,
+                existing_tab_names=existing_tab_names,
+                existing_chart_ids=chart_ids,
+                existing_banded_range_ids=banded_ids,
+                existing_merge_ranges=merges,
+                existing_conditional_format_rule_count=len(cf_rules),
+                existing_dashboard_table_ids=dash_table_ids,
+            )
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=ch.sheet_id,
+                body={"requests": requests},
+            ).execute()
+            click.echo(f"  {name}: frame OK ({ch.sheet_id}, {len(requests)} requests)")
+        except HttpError as exc:
+            raise SheetsAPIError(
+                f"Failed to reapply template to {name} ({ch.sheet_id}): {exc}"
+            ) from exc
+
+    # After every per-child frame reapply succeeds, run publish_only so
+    # the Dashboard's three task-list Tables materialise sized to the
+    # current data. Frame reapply alone leaves the lists region empty;
+    # publish populates it. Reported per-child so a single failure
+    # doesn't hide the others.
+    settings = Settings()
+    orchestrator = build_medallion_orchestrator(settings)
+    failures = 0
+    for name, _ch in targets:
+        click.echo(f"Publishing {name} so Dashboard tables materialise…")
+        try:
+            report = orchestrator.publish_only(only_child=name)
+            click.echo(summarise_medallion(report))
+            if report.any_failures:
+                failures += 1
+        except Exception as exc:
+            failures += 1
+            click.echo(f"  {name}: publish failed: {exc}", err=True)
+    if failures:
+        raise SystemExit(2)
 
 
 @cli.group()
@@ -589,78 +965,6 @@ def subjects_remove(match_type: str, pattern: str) -> None:
     click.echo(f"Removed {removed} rule(s).")
 
 
-@cli.group()
-def links() -> None:
-    """Inspect or re-run cross-source duplicate detection.
-
-    Confirmation/dismissal of pending links is done by kids via the
-    Possible Duplicates sheet checkboxes — there is no CLI verb for it.
-    """
-
-
-def _build_link_detector() -> tuple[Settings, object]:
-    from homework_hub.pipeline.link_detector import LinkDetector
-    from homework_hub.state.store import StateStore
-
-    settings = Settings()
-    store = StateStore(settings.state_db)
-    return settings, LinkDetector(store)
-
-
-@links.command("list")
-@click.option(
-    "--child",
-    default=None,
-    help="Child name; omit to list links for every child in children.yaml.",
-)
-def links_list(child: str | None) -> None:
-    """Print every silver_task_link row, grouped by child."""
-    from homework_hub.config import ChildrenConfig
-
-    settings, detector = _build_link_detector()
-    cfg = ChildrenConfig.load(settings.children_yaml)
-    targets = [child] if child else list(cfg.children.keys())
-
-    any_rows = False
-    for name in targets:
-        rows = detector.list_for_child(name)
-        if not rows:
-            continue
-        any_rows = True
-        click.echo(f"\n== {name} ({len(rows)} link(s)) ==")
-        for r in rows:
-            click.echo(
-                f"  #{r['id']:<4} {r['confidence']:<11} {r['state']:<10} "
-                f"{r['primary_source']}:{r['primary_source_id']} ↔ "
-                f"{r['secondary_source']}:{r['secondary_source_id']} "
-                f"(Δdays={r['score_due']}, title={r['score_title']:.2f})"
-            )
-    if not any_rows:
-        click.echo("No links found.")
-
-
-@links.command("detect")
-@click.option(
-    "--child",
-    default=None,
-    help="Child name; omit to re-detect for every child in children.yaml.",
-)
-def links_detect(child: str | None) -> None:
-    """Re-run the duplicate detector against current silver_tasks."""
-    from homework_hub.config import ChildrenConfig
-
-    settings, detector = _build_link_detector()
-    cfg = ChildrenConfig.load(settings.children_yaml)
-    targets = [child] if child else list(cfg.children.keys())
-
-    for name in targets:
-        result = detector.detect(name)
-        click.echo(
-            f"{name}: inserted={result.inserted} updated={result.updated} "
-            f"unchanged={result.unchanged}"
-        )
-
-
 @cli.command()
 def status() -> None:
     """Print the most recent success/failure per child + source."""
@@ -676,10 +980,18 @@ def status() -> None:
         click.echo(f"{child_name} ({child_cfg.display_name})")
         click.echo(f"  sheet_id: {child_cfg.sheet_id or '— not bootstrapped —'}")
         for src in ("classroom", "compass", "eduperfect", "edrolo"):
+            # Check if source is enabled in config
+            source_cfg = getattr(child_cfg.sources, src, None)
+            enabled = source_cfg is not None and source_cfg.enabled
+
             rec = records.get((child_name, src))
             if rec is None:
+                if not enabled:
+                    continue
                 click.echo(f"  {src:9s}  — never synced —")
                 continue
+
+            status_suffix = "" if enabled else " (disabled)"
             success = rec.last_success_at.isoformat() if rec.last_success_at else "never"
             failure = ""
             if rec.last_failure_at:
@@ -687,7 +999,82 @@ def status() -> None:
                     f"  last_failure: {rec.last_failure_at.isoformat()} "
                     f"({rec.last_failure_kind}: {rec.last_failure_message})"
                 )
-            click.echo(f"  {src:9s}  last_success: {success}{failure}")
+            click.echo(f"  {src:9s}{status_suffix}  last_success: {success}{failure}")
+
+
+# --------------------------------------------------------------------------- #
+# Archive / un-archive — manual silver-row lifecycle controls
+# --------------------------------------------------------------------------- #
+
+
+@cli.command("archive")
+@click.option("--child", required=True, help="Child key as defined in children.yaml.")
+@click.option("--uid", required=True, help="task_uid in the form '<source>:<source_id>'.")
+@click.option(
+    "--reason",
+    type=click.Choice(["manual", "upstream_removed", "age_cap"]),
+    default="manual",
+    show_default=True,
+)
+def archive_cmd(child: str, uid: str, reason: str) -> None:
+    """Manually archive a silver task. Routes the row to the History tab."""
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    state = StateStore(settings.state_db)
+    source, _, source_id = uid.partition(":")
+    if not source or not source_id:
+        raise click.ClickException(f"Invalid uid {uid!r}; expected '<source>:<source_id>'.")
+    ok = state.mark_archived(child=child, source=source, source_id=source_id, reason=reason)
+    if not ok:
+        raise click.ClickException(f"No silver row for child={child} uid={uid}.")
+    click.echo(f"Archived {uid} for {child} (reason={reason}).")
+
+
+@cli.command("unarchive")
+@click.option("--child", required=True)
+@click.option("--uid", required=True, help="task_uid in the form '<source>:<source_id>'.")
+def unarchive_cmd(child: str, uid: str) -> None:
+    """Clear the archive flags on a silver task. Status reverts to ``not_started``
+    so the source mapper (or kid's UserEdit) can take over on next sync."""
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    state = StateStore(settings.state_db)
+    source, _, source_id = uid.partition(":")
+    if not source or not source_id:
+        raise click.ClickException(f"Invalid uid {uid!r}; expected '<source>:<source_id>'.")
+    ok = state.clear_archive(child=child, source=source, source_id=source_id)
+    if not ok:
+        raise click.ClickException(f"No silver row for child={child} uid={uid}.")
+    click.echo(f"Un-archived {uid} for {child}.")
+
+
+@cli.command("list-archived")
+@click.option("--child", required=True)
+@click.option(
+    "--reason",
+    type=click.Choice(["manual", "upstream_removed", "age_cap"]),
+    default=None,
+    help="Filter to a single archive reason.",
+)
+def list_archived_cmd(child: str, reason: str | None) -> None:
+    """List archived silver tasks for a child, newest first."""
+    from homework_hub.state.store import StateStore
+
+    settings = Settings()
+    state = StateStore(settings.state_db)
+    rows = state.list_archived(child=child, reason=reason)
+    if not rows:
+        click.echo(f"No archived tasks for {child}" + (f" (reason={reason})." if reason else "."))
+        return
+    for r in rows:
+        uid = f"{r['source']}:{r['source_id']}"
+        due = r["due_at"] or "—"
+        click.echo(
+            f"{r['archived_at']}  {r['archived_reason']:17s}  {uid:50s}  "
+            f"due={due}  {r['subject_raw']} — {r['title']}"
+        )
 
 
 if __name__ == "__main__":

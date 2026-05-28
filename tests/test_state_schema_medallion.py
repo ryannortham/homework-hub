@@ -115,6 +115,11 @@ class TestSilverTasks:
             "url",
             "bronze_id",
             "last_synced",
+            "first_seen_at",
+            "last_seen_at",
+            "missing_streak",
+            "archived_at",
+            "archived_reason",
         }
 
     def test_composite_pk(self, conn: sqlite3.Connection):
@@ -214,132 +219,6 @@ class TestDimSubjects:
             )
 
 
-class TestSilverTaskLinks:
-    def test_table_exists_with_expected_columns(self, conn: sqlite3.Connection):
-        cols = _columns(conn, "silver_task_links")
-        assert set(cols) == {
-            "id",
-            "child",
-            "primary_source",
-            "primary_source_id",
-            "secondary_source",
-            "secondary_source_id",
-            "confidence",
-            "state",
-            "score_subject",
-            "score_title",
-            "score_due",
-            "detected_at",
-        }
-
-    def test_default_state_is_pending(self, conn: sqlite3.Connection):
-        with conn:
-            conn.execute(
-                "INSERT INTO silver_task_links "
-                "(child, primary_source, primary_source_id, "
-                "secondary_source, secondary_source_id, confidence, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "james",
-                    "compass",
-                    "1",
-                    "classroom",
-                    "abc",
-                    "auto_high",
-                    "2026-04-26T00:00:00+00:00",
-                ),
-            )
-        state = conn.execute("SELECT state FROM silver_task_links").fetchone()[0]
-        assert state == "pending"
-
-    def test_confidence_check_constraint(self, conn: sqlite3.Connection):
-        with pytest.raises(sqlite3.IntegrityError), conn:
-            conn.execute(
-                "INSERT INTO silver_task_links "
-                "(child, primary_source, primary_source_id, "
-                "secondary_source, secondary_source_id, confidence, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("james", "compass", "1", "classroom", "abc", "guess", "2026-04-26T00:00:00+00:00"),
-            )
-
-    def test_state_check_constraint(self, conn: sqlite3.Connection):
-        with pytest.raises(sqlite3.IntegrityError), conn:
-            conn.execute(
-                "INSERT INTO silver_task_links "
-                "(child, primary_source, primary_source_id, "
-                "secondary_source, secondary_source_id, confidence, "
-                "state, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "james",
-                    "compass",
-                    "1",
-                    "classroom",
-                    "abc",
-                    "auto_high",
-                    "maybe",
-                    "2026-04-26T00:00:00+00:00",
-                ),
-            )
-
-    def test_unique_pair_per_child(self, conn: sqlite3.Connection):
-        row = (
-            "james",
-            "compass",
-            "1",
-            "classroom",
-            "abc",
-            "auto_high",
-            "2026-04-26T00:00:00+00:00",
-        )
-        with conn:
-            conn.execute(
-                "INSERT INTO silver_task_links "
-                "(child, primary_source, primary_source_id, "
-                "secondary_source, secondary_source_id, confidence, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                row,
-            )
-        with pytest.raises(sqlite3.IntegrityError), conn:
-            conn.execute(
-                "INSERT INTO silver_task_links "
-                "(child, primary_source, primary_source_id, "
-                "secondary_source, secondary_source_id, confidence, detected_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                row,
-            )
-
-
-class TestSyncRuns:
-    def test_table_exists_with_expected_columns(self, conn: sqlite3.Connection):
-        cols = _columns(conn, "sync_runs")
-        assert set(cols) == {
-            "id",
-            "started_at",
-            "finished_at",
-            "child",
-            "source",
-            "outcome",
-            "bronze_inserted",
-            "silver_upserted",
-            "error",
-        }
-
-    def test_default_counters_zero(self, conn: sqlite3.Connection):
-        with conn:
-            conn.execute(
-                "INSERT INTO sync_runs (started_at, child, source, outcome) " "VALUES (?, ?, ?, ?)",
-                ("2026-04-26T00:00:00+00:00", "james", "compass", "ok"),
-            )
-        row = conn.execute(
-            "SELECT bronze_inserted, silver_upserted, finished_at, error FROM sync_runs"
-        ).fetchone()
-        assert row[0] == 0
-        assert row[1] == 0
-        assert row[2] is None
-        assert row[3] is None
-
-
 class TestSchemaCoexistence:
     """Medallion tables coexist with auth_status (M1)."""
 
@@ -362,7 +241,6 @@ class TestSchemaCoexistence:
             "bronze_records",
             "silver_tasks",
             "dim_subjects",
-            "silver_task_links",
             "sync_runs",
         }.issubset(names)
 

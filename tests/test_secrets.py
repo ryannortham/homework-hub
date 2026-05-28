@@ -102,7 +102,9 @@ class TestUnlock:
         r.expect(["bw", "unlock", "--passwordenv"], 0, "tok\n")
         cli = _cli(r)
         cli.unlock()
-        set_calls = [c for c in r.calls if c[0][:3] == ["bw", "config", "server"] and len(c[0]) == 4]
+        set_calls = [
+            c for c in r.calls if c[0][:3] == ["bw", "config", "server"] and len(c[0]) == 4
+        ]
         assert len(set_calls) == 1
 
     def test_unlock_caches_session(self):

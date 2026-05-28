@@ -192,8 +192,18 @@ class TestMapping:
 
     def test_checkpoints_extracted_from_grading_items(self, lt):
         lt["gradingItems"] = [
-            {"id": 201, "name": "Equations", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
-            {"id": 202, "name": "Graphs", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
+            {
+                "id": 201,
+                "name": "Equations",
+                "measureUniqueId": "Checkpoints",
+                "isPrimaryGrade": False,
+            },
+            {
+                "id": 202,
+                "name": "Graphs",
+                "measureUniqueId": "Checkpoints",
+                "isPrimaryGrade": False,
+            },
         ]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert len(t.checkpoints) == 2
@@ -202,8 +212,18 @@ class TestMapping:
 
     def test_primary_grade_checkpoint_excluded(self, lt):
         lt["gradingItems"] = [
-            {"id": 301, "name": "Overall", "measureUniqueId": "Checkpoints", "isPrimaryGrade": True},
-            {"id": 302, "name": "Part A", "measureUniqueId": "Checkpoints", "isPrimaryGrade": False},
+            {
+                "id": 301,
+                "name": "Overall",
+                "measureUniqueId": "Checkpoints",
+                "isPrimaryGrade": True,
+            },
+            {
+                "id": 302,
+                "name": "Part A",
+                "measureUniqueId": "Checkpoints",
+                "isPrimaryGrade": False,
+            },
         ]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert len(t.checkpoints) == 1
@@ -211,7 +231,12 @@ class TestMapping:
 
     def test_non_checkpoint_grading_items_excluded(self, lt):
         lt["gradingItems"] = [
-            {"id": 401, "name": "Outcome 1", "measureUniqueId": "LearningOutcomes", "isPrimaryGrade": False},
+            {
+                "id": 401,
+                "name": "Outcome 1",
+                "measureUniqueId": "LearningOutcomes",
+                "isPrimaryGrade": False,
+            },
         ]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.checkpoints == []
@@ -246,9 +271,7 @@ class TestMapping:
         # showTaskDueDates=False pattern: no dueDateTimestamp, empty submittedTimestamp,
         # but createdTimestamp/activityStart is available. Fall back to assigned_at.
         del lt["dueDateTimestamp"]
-        lt["students"] = [
-            {"userId": 1, "submissionStatus": 1, "submittedTimestamp": ""}
-        ]
+        lt["students"] = [{"userId": 1, "submissionStatus": 1, "submittedTimestamp": ""}]
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         # assigned_at comes from activityStart in the fixture (2026-04-15T00:00:00)
         assert t.due_at == datetime(2026, 4, 15, 0, 0, 0, tzinfo=UTC)

@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     log_dir: Path = Path("/logs")
     sync_cron: str = "7 * * * *"
     health_port: int = 30062
+    history_cutoff_days: int = 30
+    # Days past due (or past first_seen for date-less tasks) before a non-terminal
+    # task is auto-archived. Catches stale Overdue rows and forgotten date-less
+    # zombies.
+    active_cutoff_days: int = 60
+    # Consecutive successful syncs a task must be missing from upstream before
+    # being auto-archived with reason ``upstream_removed``.
+    stale_grace_syncs: int = 2
+    # Any parsed due_at more than this many days in the future is treated as
+    # corrupt (parser drift) and blanked on the gold sheet.
+    future_date_cap_days: int = 365
 
     @property
     def children_yaml(self) -> Path:
