@@ -79,18 +79,12 @@ _FB_DATA_RE = re.compile(
 # Workplan sections in practice use type 2 (multiple choice: "Not started" /
 # "In progress" / "Complete") but we accept any of 0-4 to be forgiving.
 _TASK_QUESTION_TYPES = frozenset({0, 1, 2, 3, 4})
-# Common identity / housekeeping fields that prefix workplan forms. Matched
-# case-insensitively against the question title.
-_SKIP_TITLE_PATTERNS = (
-    "name",
-    "student name",
-    "class",
-    "email",
-    "date",
-    "agreement",
-    "i understand",
-    "acknowledge",
-)
+# Section titles must look like a textbook section heading: a chapter number,
+# a section letter, then a space and at least one more character of body text.
+# Examples kept: "6A Language of Polynomials", "10C Whatever", "7E Graphing".
+# Examples rejected: "Chapter review", "Revision - ...", "Name", any teacher
+# free-text housekeeping question, and malformed bare entries like "6A".
+_SECTION_TITLE_RE = re.compile(r"^\d+[A-Z]\s+\S")
 
 
 # --------------------------------------------------------------------------- #
@@ -277,15 +271,17 @@ def parse_form_questions(html: str) -> list[FormQuestion]:
 
 
 def filter_section_questions(questions: list[FormQuestion]) -> list[FormQuestion]:
-    """Drop identity / housekeeping questions; keep one row per chapter section."""
+    """Keep only questions whose title looks like a textbook section heading
+    (``<chapter-number><section-letter> <body>``). Everything else — identity
+    fields, "Chapter review", "Revision - ...", teacher free text, and
+    malformed entries — is dropped."""
     keep: list[FormQuestion] = []
     for q in questions:
         if q.qtype not in _TASK_QUESTION_TYPES:
             continue
         if not q.title:
             continue
-        lowered = q.title.lower().strip()
-        if any(pat in lowered for pat in _SKIP_TITLE_PATTERNS):
+        if not _SECTION_TITLE_RE.match(q.title.strip()):
             continue
         keep.append(q)
     return keep

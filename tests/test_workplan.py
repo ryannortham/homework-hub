@@ -238,6 +238,44 @@ class TestFilterSectionQuestions:
         kept = filter_section_questions([FormQuestion("", 2)])
         assert kept == []
 
+    def test_drops_chapter_review_and_revision(self):
+        qs = [
+            FormQuestion("6A Language of Polynomials", 2),
+            FormQuestion("Chapter review", 2),
+            FormQuestion(
+                "Revision - Which of the following learning habits "
+                "have you completed in preperation for the assessment",
+                2,
+            ),
+            FormQuestion("6J Applications", 2),
+        ]
+        kept = filter_section_questions(qs)
+        assert [q.title for q in kept] == [
+            "6A Language of Polynomials",
+            "6J Applications",
+        ]
+
+    def test_drops_malformed_section_headings(self):
+        # Bare "6A" with no body text, lowercase letter, missing number,
+        # punctuation glued to the letter — all rejected.
+        qs = [
+            FormQuestion("6A", 2),
+            FormQuestion("6a Lowercase", 2),
+            FormQuestion("A Translations", 2),
+            FormQuestion("6A. Punctuated", 2),
+            FormQuestion("6A Translations", 2),
+        ]
+        kept = filter_section_questions(qs)
+        assert [q.title for q in kept] == ["6A Translations"]
+
+    def test_keeps_multi_digit_chapters(self):
+        qs = [
+            FormQuestion("10C Whatever", 2),
+            FormQuestion("12Z Last Section", 2),
+        ]
+        kept = filter_section_questions(qs)
+        assert [q.title for q in kept] == ["10C Whatever", "12Z Last Section"]
+
 
 # --------------------------------------------------------------------------- #
 # _build_task
