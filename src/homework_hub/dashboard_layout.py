@@ -207,6 +207,7 @@ class DashboardTask:
     due: date | None
     status: str
     link: str
+    submitted: date | None = None
 
 
 @dataclass(frozen=True)
@@ -280,18 +281,40 @@ def filter_upcoming(tasks: list[DashboardTask], today: date) -> list[DashboardTa
 
 def filter_done(tasks: list[DashboardTask], today: date) -> list[DashboardTask]:
     """Done in the last 7 days = ``status IN {Submitted, Graded}`` AND
-    ``today - 7 <= due <= today``.
+    the task was completed in the window ``today - 7 <= completed <= today``.
 
-    Sorted by due **descending** so the most recently completed work
-    appears first.
+    The "completed" date prefers the silver ``submitted_at`` (stamped
+    when the source first reports the task as done, or synthesised at
+    transition time when the source doesn't expose a submission
+    timestamp). When neither is available — typically for legacy rows
+    that pre-date the transition-stamp — we fall back to ``due`` so the
+    list isn't empty for older completions.
+
+    Sorted by completion date **descending** so the most recently
+    completed work appears first.
     """
     cutoff = today - timedelta(days=_DONE_WINDOW_DAYS)
-    out = [
-        t
-        for t in tasks
-        if t.status in _DONE_STATUSES and t.due is not None and cutoff <= t.due <= today
-    ]
-    return _sort_by_due(out, descending=True)
+    out: list[DashboardTask] = []
+    for t in tasks:
+        if t.status not in _DONE_STATUSES:
+            continue
+        completed = t.submitted or t.due
+        if completed is None:
+            continue
+        if cutoff <= completed <= today:
+            out.append(t)
+    return _sort_by_completed(out, descending=True)
+
+
+def _sort_by_completed(
+    tasks: list[DashboardTask], *, descending: bool = False
+) -> list[DashboardTask]:
+    sentinel = date.min if descending else date.max
+    return sorted(
+        tasks,
+        key=lambda t: (t.submitted or t.due or sentinel, t.title.lower()),
+        reverse=descending,
+    )
 
 
 def _sort_by_due(tasks: list[DashboardTask], *, descending: bool = False) -> list[DashboardTask]:
@@ -310,23 +333,43 @@ def _sort_by_due(tasks: list[DashboardTask], *, descending: bool = False) -> lis
 # --------------------------------------------------------------------------- #
 
 
-def task_rows_to_dashboard_tasks(rows: list[Any]) -> list[DashboardTask]:
+def task_rows_to_dashboard_tasks(
+    rows: list[Any],
+    tasks: list[Any] | None = None,
+) -> list[DashboardTask]:
     """Project ``TaskRow``s (from publish) into the minimal Dashboard shape.
 
     ``rows`` is a list of :class:`~homework_hub.pipeline.publish.TaskRow`
     instances; typed as ``Any`` here to avoid the import cycle.
+
+    ``tasks`` is the parallel silver ``Task`` list. When provided, each
+    DashboardTask is enriched with a Melbourne-local ``submitted`` date
+    derived from the silver row's ``submitted_at`` (joined by ``task_uid``).
+    Required for "Done this week" to surface tasks whose due date is in
+    the future but which have been marked completed by the source. Typed
+    as ``Any`` to avoid the publish → dashboard_layout circular import.
     """
+    from homework_hub.pipeline.publish import melbourne_local_date
+
     subj_idx = TASKS_TAB.column_index("subject")
     title_idx = TASKS_TAB.column_index("title")
     due_idx = TASKS_TAB.column_index("due")
     status_idx = TASKS_TAB.column_index("status")
     link_idx = TASKS_TAB.column_index("link")
+    uid_idx = TASKS_TAB.column_index("task_uid")
+
+    submitted_by_uid: dict[str, date | None] = {}
+    if tasks:
+        for t in tasks:
+            uid = f"{t.source.value}:{t.source_id}"
+            submitted_by_uid[uid] = melbourne_local_date(t.submitted_at)
 
     out: list[DashboardTask] = []
     for r in rows:
         cells = r.cells
         due_cell = cells[due_idx]
         due = due_cell if isinstance(due_cell, date) else None
+        uid = str(cells[uid_idx] or "")
         out.append(
             DashboardTask(
                 subject=str(cells[subj_idx] or ""),
@@ -334,6 +377,7 @@ def task_rows_to_dashboard_tasks(rows: list[Any]) -> list[DashboardTask]:
                 due=due,
                 status=str(cells[status_idx] or ""),
                 link=str(cells[link_idx] or ""),
+                submitted=submitted_by_uid.get(uid),
             )
         )
     return out

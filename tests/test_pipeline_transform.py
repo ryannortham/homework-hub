@@ -303,6 +303,118 @@ class TestSilverWriterUpsert:
         result = writer.upsert_many([(_task(source_id="1", submitted_at=ts), None)])
         assert result.updated == 1
 
+    def test_submitted_at_synthesised_on_insert_when_status_done(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """Sources like classroom / edrolo / eduperfect don't emit a
+        submission timestamp. The writer stamps ``submitted_at`` on
+        insert when the row arrives in a done state so the Dashboard's
+        'Done this week' has something to filter on."""
+        import sqlite3
+
+        now = datetime(2026, 5, 28, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=None), None)],
+            now=now,
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val == now.isoformat()
+
+    def test_submitted_at_not_synthesised_for_non_done(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        import sqlite3
+
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.NOT_STARTED, submitted_at=None), None)]
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val is None
+
+    def test_submitted_at_stamped_on_transition_to_done(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """Existing non-done row → done. ``submitted_at`` is stamped
+        even though the source provides no value."""
+        import sqlite3
+
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.NOT_STARTED, submitted_at=None), None)]
+        )
+        now = datetime(2026, 5, 28, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=None), None)],
+            now=now,
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val == now.isoformat()
+
+    def test_submitted_at_preserved_across_done_resync(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """A second sync of an already-done row with no source-provided
+        ``submitted_at`` must preserve the originally-stamped value, not
+        bump it to the new sync time."""
+        import sqlite3
+
+        first = datetime(2026, 5, 20, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=None), None)],
+            now=first,
+        )
+        later = datetime(2026, 5, 28, 9, 0, 0, tzinfo=UTC)
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=None), None)],
+            now=later,
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val == first.isoformat()
+
+    def test_submitted_at_cleared_on_transition_off_done(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """If a source flips the status back from done (e.g. teacher
+        un-submits in Classroom), the stale stamp is cleared so the
+        next transition re-records the true completion time."""
+        import sqlite3
+
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=None), None)],
+            now=datetime(2026, 5, 20, 9, 0, 0, tzinfo=UTC),
+        )
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.IN_PROGRESS, submitted_at=None), None)]
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val is None
+
+    def test_source_provided_submitted_at_wins_over_synthesis(
+        self, writer: SilverWriter, store: StateStore
+    ):
+        """Compass supplies a real submission timestamp; we must not
+        clobber it with the sync-time stamp."""
+        import sqlite3
+
+        source_ts = datetime(2026, 5, 15, 14, 30, 0, tzinfo=UTC)
+        writer.upsert_many(
+            [(_task(source_id="1", status=Status.SUBMITTED, submitted_at=source_ts), None)],
+            now=datetime(2026, 5, 28, 9, 0, 0, tzinfo=UTC),
+        )
+        conn = sqlite3.connect(store.db_path)
+        val = conn.execute("SELECT submitted_at FROM silver_tasks").fetchone()[0]
+        conn.close()
+        assert val == source_ts.isoformat()
+
     def test_task_type_persisted(self, writer: SilverWriter, store: StateStore):
         t = Task(
             source=SourceEnum.COMPASS,
@@ -447,3 +559,204 @@ class TestSilverWriterArchival:
                 "SELECT missing_streak FROM silver_tasks WHERE source_id = 'A'"
             ).fetchone()
         assert streak == 1
+
+
+# --------------------------------------------------------------------------- #
+# One-shot bronze → silver.submitted_at backfill (in StateStore._migrate)
+# --------------------------------------------------------------------------- #
+
+
+class TestSubmittedAtBackfillFromBronze:
+    """When the medallion db pre-dates the transition-stamp logic, many
+    silver done rows have ``submitted_at IS NULL``. ``_migrate`` walks
+    each one's bronze trail to find the earliest ``fetched_at`` whose
+    payload contains a source-specific done marker and uses that as the
+    historical completion time."""
+
+    def _seed_silver_done(
+        self, store: StateStore, *, source: str, source_id: str, status_raw: str = "complete"
+    ) -> None:
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "INSERT INTO silver_tasks (child, source, source_id, title, status, "
+                "status_raw, last_synced) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "james",
+                    source,
+                    source_id,
+                    "T",
+                    "submitted",
+                    status_raw,
+                    "2026-05-28T00:00:00+00:00",
+                ),
+            )
+
+    def _seed_bronze(
+        self, store: StateStore, *, source: str, source_id: str, fetched_at: str, payload: str
+    ) -> None:
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "INSERT INTO bronze_records (child, source, source_id, payload_json, "
+                "payload_hash, fetched_at) VALUES (?,?,?,?,?,?)",
+                ("james", source, source_id, payload, f"{source_id}-{fetched_at}", fetched_at),
+            )
+
+    def _run_migrate(self, store: StateStore) -> None:
+        import sqlite3
+
+        from homework_hub.state.store import _migrate
+
+        with sqlite3.connect(store.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            _migrate(conn)
+            conn.commit()
+
+    def _read_submitted(self, store: StateStore, source_id: str) -> str | None:
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            row = conn.execute(
+                "SELECT submitted_at FROM silver_tasks WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def test_eduperfect_first_complete_payload_wins(self, store: StateStore):
+        self._seed_silver_done(store, source="eduperfect", source_id="100")
+        self._seed_bronze(
+            store,
+            source="eduperfect",
+            source_id="100",
+            fetched_at="2026-05-20T00:00:00+00:00",
+            payload='{"progressStatus":"IN_PROGRESS"}',
+        )
+        self._seed_bronze(
+            store,
+            source="eduperfect",
+            source_id="100",
+            fetched_at="2026-05-22T10:00:00+00:00",
+            payload='{"progressStatus":"COMPLETE"}',
+        )
+        self._seed_bronze(
+            store,
+            source="eduperfect",
+            source_id="100",
+            fetched_at="2026-05-28T00:00:00+00:00",
+            payload='{"progressStatus":"COMPLETE"}',
+        )
+        self._run_migrate(store)
+        assert self._read_submitted(store, "100") == "2026-05-22T10:00:00+00:00"
+
+    def test_compass_submission_status_marker(self, store: StateStore):
+        self._seed_silver_done(store, source="compass", source_id="200")
+        self._seed_bronze(
+            store,
+            source="compass",
+            source_id="200",
+            fetched_at="2026-05-10T00:00:00+00:00",
+            payload='{"submissionStatus":0}',
+        )
+        self._seed_bronze(
+            store,
+            source="compass",
+            source_id="200",
+            fetched_at="2026-05-15T09:00:00+00:00",
+            payload='{"submissionStatus":1,"submittedTimestamp":"2026-05-15T09:00:00"}',
+        )
+        self._run_migrate(store)
+        assert self._read_submitted(store, "200") == "2026-05-15T09:00:00+00:00"
+
+    def test_edrolo_resolved_stage_archived(self, store: StateStore):
+        self._seed_silver_done(
+            store, source="edrolo", source_id="300", status_raw="archived"
+        )
+        self._seed_bronze(
+            store,
+            source="edrolo",
+            source_id="300",
+            fetched_at="2026-03-01T00:00:00+00:00",
+            payload='{"task":{"resolved_stage":"OPEN"}}',
+        )
+        self._seed_bronze(
+            store,
+            source="edrolo",
+            source_id="300",
+            fetched_at="2026-04-15T00:00:00+00:00",
+            payload='{"task":{"resolved_stage":"ARCHIVED"}}',
+        )
+        self._run_migrate(store)
+        assert self._read_submitted(store, "300") == "2026-04-15T00:00:00+00:00"
+
+    def test_no_matching_marker_leaves_null(self, store: StateStore):
+        self._seed_silver_done(store, source="eduperfect", source_id="400")
+        self._seed_bronze(
+            store,
+            source="eduperfect",
+            source_id="400",
+            fetched_at="2026-05-01T00:00:00+00:00",
+            payload='{"progressStatus":"IN_PROGRESS"}',
+        )
+        self._run_migrate(store)
+        assert self._read_submitted(store, "400") is None
+
+    def test_does_not_overwrite_existing_submitted_at(self, store: StateStore):
+        import sqlite3
+
+        # Seed silver with an existing submitted_at value — backfill
+        # must leave it alone.
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "INSERT INTO silver_tasks (child, source, source_id, title, status, "
+                "status_raw, submitted_at, last_synced) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    "james",
+                    "compass",
+                    "500",
+                    "T",
+                    "graded",
+                    "graded",
+                    "2026-05-01T00:00:00+00:00",
+                    "2026-05-28T00:00:00+00:00",
+                ),
+            )
+        self._seed_bronze(
+            store,
+            source="compass",
+            source_id="500",
+            fetched_at="2026-05-15T00:00:00+00:00",
+            payload='{"submissionStatus":3}',
+        )
+        self._run_migrate(store)
+        assert self._read_submitted(store, "500") == "2026-05-01T00:00:00+00:00"
+
+    def test_non_done_rows_untouched(self, store: StateStore):
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "INSERT INTO silver_tasks (child, source, source_id, title, status, "
+                "status_raw, last_synced) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "james",
+                    "eduperfect",
+                    "600",
+                    "T",
+                    "not_started",
+                    "not_started",
+                    "2026-05-28T00:00:00+00:00",
+                ),
+            )
+        self._seed_bronze(
+            store,
+            source="eduperfect",
+            source_id="600",
+            fetched_at="2026-05-22T00:00:00+00:00",
+            payload='{"progressStatus":"COMPLETE"}',
+        )
+        self._run_migrate(store)
+        # Row isn't in done state — backfill skips it.
+        assert self._read_submitted(store, "600") is None

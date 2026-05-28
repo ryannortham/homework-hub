@@ -111,9 +111,15 @@ class TestFilters:
 
 
 class TestFilterDone:
-    """Done(7d): status IN {Submitted, Graded} AND due within last 7 days."""
+    """Done(7d): status IN {Submitted, Graded} AND completed within last 7 days.
 
-    def test_includes_submitted_and_graded_within_window(self):
+    "Completed" prefers ``submitted`` (silver ``submitted_at`` projected
+    to a Melbourne local date) and falls back to ``due`` for legacy
+    rows that pre-date transition-time stamping.
+    """
+
+    def test_includes_submitted_and_graded_within_window_by_due_fallback(self):
+        # No `submitted` set → falls back to `due`. Covers legacy rows.
         tasks = [
             DashboardTask("S", "sub-today", TODAY, "Submitted", ""),
             DashboardTask("S", "grad-yesterday", date(2026, 5, 27), "Graded", ""),
@@ -122,13 +128,44 @@ class TestFilterDone:
         done = filter_done(tasks, TODAY)
         assert {t.title for t in done} == {"sub-today", "grad-yesterday", "sub-7d-ago"}
 
-    def test_excludes_outside_window(self):
+    def test_uses_submitted_when_present_over_due(self):
+        # Future due (Sunday) but submitted today — must surface.
+        # Mirrors james's Japanese EP tasks (due 2026-05-31, status=Submitted).
+        tasks = [
+            DashboardTask(
+                "Japanese",
+                "Chapter 1 Task 1 Verb meanings",
+                date(2026, 5, 31),
+                "Submitted",
+                "",
+                submitted=TODAY,
+            ),
+        ]
+        done = filter_done(tasks, TODAY)
+        assert [t.title for t in done] == ["Chapter 1 Task 1 Verb meanings"]
+
+    def test_excludes_outside_window_by_due_fallback(self):
         tasks = [
             DashboardTask("S", "too-old", date(2026, 5, 20), "Submitted", ""),  # 8d ago
             DashboardTask("S", "future", date(2026, 5, 30), "Submitted", ""),  # tomorrow
         ]
         done = filter_done(tasks, TODAY)
         assert done == []
+
+    def test_excludes_when_submitted_outside_window(self):
+        # `submitted` outranks `due`, so an old `submitted` excludes a row
+        # that would otherwise qualify by `due`.
+        tasks = [
+            DashboardTask(
+                "S",
+                "old-completion",
+                TODAY,
+                "Submitted",
+                "",
+                submitted=date(2026, 5, 19),
+            ),
+        ]
+        assert filter_done(tasks, TODAY) == []
 
     def test_excludes_non_done_statuses(self):
         tasks = [
@@ -139,7 +176,7 @@ class TestFilterDone:
         ]
         assert filter_done(tasks, TODAY) == []
 
-    def test_sorted_by_due_descending(self):
+    def test_sorted_by_completed_descending(self):
         tasks = [
             DashboardTask("S", "older", date(2026, 5, 23), "Submitted", ""),
             DashboardTask("S", "newest", date(2026, 5, 28), "Graded", ""),
@@ -148,8 +185,20 @@ class TestFilterDone:
         done = filter_done(tasks, TODAY)
         assert [t.title for t in done] == ["newest", "middle", "older"]
 
-    def test_skips_rows_with_no_due_date(self):
-        tasks = [DashboardTask("S", "no-due", None, "Submitted", "")]
+    def test_sort_prefers_submitted_over_due(self):
+        # A row with submitted=today should beat a row with due=today
+        # but submitted=yesterday.
+        tasks = [
+            DashboardTask("S", "due-today-sub-yest", TODAY, "Submitted", "",
+                          submitted=date(2026, 5, 27)),
+            DashboardTask("S", "due-yest-sub-today", date(2026, 5, 27), "Submitted", "",
+                          submitted=TODAY),
+        ]
+        done = filter_done(tasks, TODAY)
+        assert [t.title for t in done] == ["due-yest-sub-today", "due-today-sub-yest"]
+
+    def test_skips_rows_with_no_due_or_submitted(self):
+        tasks = [DashboardTask("S", "no-dates", None, "Submitted", "")]
         assert filter_done(tasks, TODAY) == []
 
 
@@ -505,6 +554,70 @@ class TestTaskRowProjection:
         assert out == [
             DashboardTask("Maths", "Algebra", date(2026, 5, 30), "Not started", "https://x")
         ]
+
+    def test_overlays_submitted_from_silver_tasks(self):
+        """When the silver Task list is passed, submitted_at is converted
+        to a Melbourne-local date and joined onto the projected row by
+        task_uid. This is the bridge that lets ``filter_done`` use the
+        completion date instead of the due date."""
+        from datetime import UTC, datetime
+
+        from homework_hub.models import Source, Status, Task
+
+        class _Row:
+            def __init__(self, cells: list[Any]) -> None:
+                self.cells = cells
+
+        row = _Row(
+            [
+                "Japanese",
+                "Homework",
+                "Chapter 1 Task 1",
+                date(2026, 5, 31),
+                3,
+                "Submitted",
+                "",
+                "manual",
+                "https://x",
+                "eduperfect:12215183",
+            ]
+        )
+        # 2026-05-28 22:30 UTC == 2026-05-29 08:30 AEST → Melbourne date 29 May.
+        submitted_utc = datetime(2026, 5, 28, 22, 30, tzinfo=UTC)
+        silver_task = Task(
+            source=Source.EDUPERFECT,
+            source_id="12215183",
+            child="james",
+            subject="Japanese",
+            title="Chapter 1 Task 1",
+            status=Status.SUBMITTED,
+            submitted_at=submitted_utc,
+        )
+        out = task_rows_to_dashboard_tasks([row], tasks=[silver_task])
+        assert len(out) == 1
+        assert out[0].submitted == date(2026, 5, 29)
+
+    def test_submitted_none_when_silver_task_missing(self):
+        class _Row:
+            def __init__(self, cells: list[Any]) -> None:
+                self.cells = cells
+
+        row = _Row(
+            [
+                "Maths",
+                "Homework",
+                "Orphan",
+                date(2026, 5, 30),
+                2,
+                "Submitted",
+                "",
+                "manual",
+                "https://x",
+                "compass:GHOST",
+            ]
+        )
+        out = task_rows_to_dashboard_tasks([row], tasks=[])
+        assert out[0].submitted is None
 
 
 class TestProtectDashboardRequest:

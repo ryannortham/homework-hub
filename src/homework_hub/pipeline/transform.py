@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from homework_hub.models import Source as SourceEnum
-from homework_hub.models import Task, TaskType
+from homework_hub.models import Status, Task, TaskType
 from homework_hub.pipeline.subjects import SubjectResolver
 from homework_hub.sources.classroom import map_classroom_card_to_task
 from homework_hub.sources.compass import map_learning_task_to_task
@@ -149,6 +149,11 @@ class TransformResult:
     unchanged: int
 
 
+# Statuses we treat as "done" for the purpose of synthesising
+# ``submitted_at`` when a source doesn't expose a submission timestamp.
+_DONE_STATUSES = frozenset({Status.SUBMITTED, Status.GRADED})
+
+
 class SilverWriter:
     """Writes canonical ``Task`` rows to ``silver_tasks`` (latest wins)."""
 
@@ -214,6 +219,28 @@ class SilverWriter:
                     and existing["archived_reason"] != "upstream_removed"
                 )
 
+                # Synthesise submitted_at when the source didn't provide one.
+                # Most sources (classroom, edrolo, eduperfect) leave it
+                # NULL even when a task is plainly done, which kneecaps
+                # any "completed this week" UI. Stamp transitions:
+                #   • Insert with status ∈ done  → stamp ts.
+                #   • Update non-done → done    → stamp ts.
+                #   • Update done → done with existing stamp → preserve it.
+                #   • Update done → non-done    → clear stamp.
+                # Source-provided submitted_at always wins when present.
+                effective_submitted_iso: str | None
+                if task.submitted_at is not None:
+                    effective_submitted_iso = task.submitted_at.isoformat()
+                else:
+                    incoming_done = task.status in _DONE_STATUSES
+                    existing_submitted = existing["submitted_at"] if existing else None
+                    if not incoming_done:
+                        effective_submitted_iso = None
+                    elif existing_submitted:
+                        effective_submitted_iso = existing_submitted
+                    else:
+                        effective_submitted_iso = ts
+
                 new_row = (
                     subject_raw,
                     subject_canonical,
@@ -222,7 +249,7 @@ class SilverWriter:
                     task.description,
                     task.assigned_at.isoformat() if task.assigned_at else None,
                     task.due_at.isoformat() if task.due_at else None,
-                    task.submitted_at.isoformat() if task.submitted_at else None,
+                    effective_submitted_iso,
                     task.status_raw,
                     task.status.value,
                     task.task_type.value,

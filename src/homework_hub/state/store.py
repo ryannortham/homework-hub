@@ -464,3 +464,99 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE silver_tasks SET last_seen_at = last_synced WHERE last_seen_at IS NULL"
         )
+
+    # One-shot backfill: for any silver row that is currently in a done
+    # state (submitted / graded) but has no ``submitted_at`` — typically
+    # classroom / edrolo / eduperfect rows where the source doesn't
+    # expose a submission timestamp — infer the completion time from
+    # bronze. We pick the ``fetched_at`` of the earliest bronze record
+    # whose status-relevant field looks done.
+    #
+    # This gives "Done this week" something to filter on for legacy
+    # rows. Going forward, ``SilverWriter.upsert_many`` stamps
+    # ``submitted_at`` at the moment a row transitions into a done
+    # state, so this backfill is a one-time catch-up.
+    #
+    # Safe to re-run: only updates rows where submitted_at IS NULL.
+    with suppress(sqlite3.OperationalError):
+        _backfill_submitted_at_from_bronze(conn)
+
+
+# Status tokens that mark a bronze payload as "done" for each source.
+# Mirrors the source-side status mappers but operates on the raw JSON
+# substring so the backfill stays cheap (no payload parsing).
+_BRONZE_DONE_MARKERS: dict[str, tuple[str, ...]] = {
+    "eduperfect": ('"progressStatus":"COMPLETE"',),
+    "classroom": (
+        '"state":"TURNED_IN"',
+        '"state":"RETURNED"',
+        '"late":true',
+    ),
+    "edrolo": (
+        '"completion_status":"COMPLETED"',
+        '"resolved_stage":"ARCHIVED"',  # edrolo auto-archives old completions
+    ),
+    "compass": (
+        '"submissionStatus":1',  # submitted on time
+        '"submissionStatus":2',  # submitted late
+        '"submissionStatus":3',  # marked / returned
+    ),
+}
+
+
+def _backfill_submitted_at_from_bronze(conn: sqlite3.Connection) -> None:
+    """For every (child, source, source_id) that's silver-done with a
+    NULL ``submitted_at``, look up the earliest bronze record whose
+    payload contains a done-state marker and copy its ``fetched_at``
+    into ``submitted_at``.
+
+    Implementation: load candidate rows + their bronze trails into
+    memory, do the marker test in Python, and write back the values
+    with executemany. The done set is small (tens to low hundreds per
+    child) so the memory cost is negligible compared to a per-row
+    correlated subquery.
+    """
+    candidates = conn.execute(
+        "SELECT child, source, source_id FROM silver_tasks "
+        "WHERE status IN ('submitted','graded') AND submitted_at IS NULL"
+    ).fetchall()
+    if not candidates:
+        return
+
+    updates: list[tuple[str, str, str, str]] = []
+    for row in candidates:
+        source = row["source"] if isinstance(row, sqlite3.Row) else row[0]
+        # Schema-flexible row access — fall back to indices when row_factory
+        # isn't sqlite3.Row.
+        if isinstance(row, sqlite3.Row):
+            child = row["child"]
+            source = row["source"]
+            source_id = row["source_id"]
+        else:
+            child, source, source_id = row
+
+        markers = _BRONZE_DONE_MARKERS.get(source)
+        if not markers:
+            continue
+
+        bronze_trail = conn.execute(
+            "SELECT fetched_at, payload_json FROM bronze_records "
+            "WHERE child = ? AND source = ? AND source_id = ? "
+            "ORDER BY fetched_at ASC",
+            (child, source, source_id),
+        ).fetchall()
+
+        for br in bronze_trail:
+            fetched_at = br["fetched_at"] if isinstance(br, sqlite3.Row) else br[0]
+            payload = br["payload_json"] if isinstance(br, sqlite3.Row) else br[1]
+            if any(m in payload for m in markers):
+                updates.append((fetched_at, child, source, source_id))
+                break
+
+    if updates:
+        conn.executemany(
+            "UPDATE silver_tasks SET submitted_at = ? "
+            "WHERE child = ? AND source = ? AND source_id = ? "
+            "AND submitted_at IS NULL",
+            updates,
+        )

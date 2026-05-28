@@ -1004,7 +1004,7 @@ def publish_for_child(
         meta = sink.read_dashboard_meta(spreadsheet_id)
         today = melbourne_local_date(datetime.now(UTC))
         assert today is not None  # datetime.now(UTC) is never None
-        dash_tasks = task_rows_to_dashboard_tasks(active_rows)
+        dash_tasks = task_rows_to_dashboard_tasks(active_rows, tasks=tasks)
         dash_requests = build_dashboard_requests(
             dash_sheet_id=meta.sheet_id,
             tasks=dash_tasks,
