@@ -507,6 +507,17 @@ def zen_cookie_login(
                 expiry = -1
             elif expiry > 9999999999:  # > 10 digits implies milliseconds (or microseconds)
                 expiry = expiry // 1000
+            # Modern browsers (and Playwright) silently drop cookies whose
+            # ``SameSite=None`` is paired with ``Secure=False`` because that
+            # combination is forbidden by the cookie spec. Google's auth
+            # cookies (SID/HSID/APISID) come through the Firefox cookie
+            # store as ``secure=False; sameSite=None`` for legacy reasons
+            # but are only ever sent over HTTPS in practice. Force
+            # ``Secure=True`` for these so Playwright actually replays them.
+            same_site = c.get("sameSite", "None")
+            secure = c.get("secure", False)
+            if same_site == "None" and not secure:
+                secure = True
             cookies.append(
                 {
                     "name": c.get("name", ""),
@@ -515,8 +526,8 @@ def zen_cookie_login(
                     "path": c.get("path", "/"),
                     "expires": expiry,
                     "httpOnly": c.get("httpOnly", False),
-                    "secure": c.get("secure", False),
-                    "sameSite": c.get("sameSite", "None"),
+                    "secure": secure,
+                    "sameSite": same_site,
                 }
             )
     return cookies

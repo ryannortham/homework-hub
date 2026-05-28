@@ -564,7 +564,8 @@ class WorkplanFetcher:
                 raise AuthExpiredError("workplan: form redirected to login")
 
             html = page.content()
-            if "Page Not Found" in html or "form is no longer accepting" in html.lower():
+            lowered = html.lower()
+            if "page not found" in lowered or "form is no longer accepting" in lowered:
                 raise SchemaBreakError("workplan: form unavailable (404 / closed)")
 
             try:
