@@ -62,6 +62,7 @@ RUN set -eux; \
     apt-get purge -y --auto-remove curl unzip
 
 ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOMEWORK_HUB_CONFIG_DIR=/config \
@@ -78,6 +79,7 @@ RUN groupadd --system --gid 568 app \
 
 WORKDIR /app
 COPY --from=builder --chown=568:568 /opt/venv /opt/venv
+COPY --from=builder --chown=568:568 /build/src /app/src
 
 # Install Chromium + its system deps via Playwright. The image gains ~450MB
 # but it's the price of bypassing the school's OAuth block on Classroom.
