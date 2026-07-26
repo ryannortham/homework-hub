@@ -146,7 +146,7 @@ class TestDashboardLayout:
         ]
         assert len(scorecards) == 4
         titles = {r["addChart"]["chart"]["spec"]["title"] for r in scorecards}
-        assert titles == {"Overdue", "Due this week", "Upcoming", "Done this week"}
+        assert titles == {"Overdue", "Due this week", "Upcoming", "No due date"}
         # All anchored to Dashboard (sheetId 0) at cell B3 (row 2, col 1).
         # Position differentiation is by pixel offset, not by cell anchor.
         for r in scorecards:
@@ -201,10 +201,13 @@ class TestDashboardDataTab:
             rows = uc["rows"]
             assert len(rows) == 4
             labels = [row["values"][0]["userEnteredValue"]["stringValue"] for row in rows]
-            assert labels == ["Overdue", "Due this week", "Upcoming", "Done this week"]
+            assert labels == ["Overdue", "Due this week", "Upcoming", "No due date"]
             formulas = [row["values"][1]["userEnteredValue"]["formulaValue"] for row in rows]
             for f in formulas:
                 assert f.startswith("=COUNTIF") and "Tasks!" in f
+            no_due_formula = formulas[-1]
+            assert 'Tasks!A2:A,"<>"' in no_due_formula
+            assert 'Tasks!D2:D,""' in no_due_formula
             return
         raise AssertionError("DashboardData seed write not emitted")
 
@@ -235,12 +238,11 @@ class TestDashboardDataTab:
             assert formula.startswith("=QUERY(Tasks!A2:F")
             assert "group by A" in formula
             # Filter must mirror the dashboard tile semantics: always
-            # exclude Archived; only count Submitted/Graded if Due is
-            # within the last 7 days (matches Done-this-week section).
+            # exclude terminal states and include blank-due pending work.
             assert "Archived" in formula
             assert "Submitted" in formula
             assert "Graded" in formula
-            assert "TODAY()-7" in formula
+            assert "D is null" in formula
             return
         raise AssertionError("DashboardData Subjects QUERY seed not emitted")
 

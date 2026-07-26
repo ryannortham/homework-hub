@@ -814,7 +814,7 @@ def reapply_template(child: str | None) -> None:
             ) from exc
 
     # After every per-child frame reapply succeeds, run publish_only so
-    # the Dashboard's three task-list Tables materialise sized to the
+    # the Dashboard's task-list Tables materialise sized to the
     # current data. Frame reapply alone leaves the lists region empty;
     # publish populates it. Reported per-child so a single failure
     # doesn't hide the others.

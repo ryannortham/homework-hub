@@ -199,6 +199,8 @@ class TestDashboardTableIds:
         from homework_hub.schema import (
             DASHBOARD_DONE_TABLE_ID,
             DASHBOARD_DONE_TABLE_NAME,
+            DASHBOARD_NO_DUE_DATE_TABLE_ID,
+            DASHBOARD_NO_DUE_DATE_TABLE_NAME,
             DASHBOARD_OVERDUE_TABLE_ID,
             DASHBOARD_OVERDUE_TABLE_NAME,
             DASHBOARD_TABLE_IDS,
@@ -212,6 +214,7 @@ class TestDashboardTableIds:
         ids = (
             DASHBOARD_OVERDUE_TABLE_ID,
             DASHBOARD_WEEK_TABLE_ID,
+            DASHBOARD_NO_DUE_DATE_TABLE_ID,
             DASHBOARD_UPCOMING_TABLE_ID,
             DASHBOARD_DONE_TABLE_ID,
         )
@@ -219,11 +222,12 @@ class TestDashboardTableIds:
             assert isinstance(tid, str)
             assert tid
         # Distinct.
-        assert len(set(ids)) == 4
+        assert len(set(ids)) == 5
         # Aggregated tuple matches.
         assert ids == DASHBOARD_TABLE_IDS
         # Names are the user-visible section labels.
         assert DASHBOARD_OVERDUE_TABLE_NAME == "Overdue"
         assert DASHBOARD_WEEK_TABLE_NAME == "DueThisWeek"
+        assert DASHBOARD_NO_DUE_DATE_TABLE_NAME == "NoDueDate"
         assert DASHBOARD_UPCOMING_TABLE_NAME == "Upcoming"
         assert DASHBOARD_DONE_TABLE_NAME == "DoneThisWeek"

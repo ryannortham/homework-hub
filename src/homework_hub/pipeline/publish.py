@@ -993,7 +993,7 @@ def publish_for_child(
         ],
     )
 
-    # 7. Refresh the Dashboard's three task-list Tables. The Dashboard
+    # 7. Refresh the Dashboard's dynamic task-list Tables. The Dashboard
     # frame (greeting / floating KPI scorecards / donut) is template-owned
     # and stays put; this step re-emits the lists region sized to the
     # current active row count. Failures here are logged but don't fail

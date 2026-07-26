@@ -1153,7 +1153,7 @@ class TestPublishDashboard:
     batchUpdate body with one addTable per section, scoped to the
     active (non-archived) tasks."""
 
-    def test_publishes_dashboard_layout_with_four_tables(self, tmp_path: Path):
+    def test_publishes_dashboard_layout_with_five_tables(self, tmp_path: Path):
         store = _store(tmp_path)
         meta = DashboardMeta(
             sheet_id=42,
@@ -1172,10 +1172,10 @@ class TestPublishDashboard:
         )
         assert len(sink.dashboard_requests) == 1
         reqs = sink.dashboard_requests[0]
-        # Four addTable requests, one per section
-        # (Overdue / DueThisWeek / Upcoming / Done7D).
+        # Five addTable requests, one per section
+        # (Overdue / DueThisWeek / NoDueDate / Upcoming / Done7D).
         addtables = [r for r in reqs if "addTable" in r]
-        assert len(addtables) == 4
+        assert len(addtables) == 5
         # Teardown wired through from meta.
         assert sum(1 for r in reqs if "deleteTable" in r) == 2
         assert sum(1 for r in reqs if "deleteBanding" in r) == 2

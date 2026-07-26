@@ -1,6 +1,7 @@
-"""Dynamic Dashboard layout builder (v5.0).
+"""Dynamic Dashboard layout builder (v5.1).
 
-The Dashboard's three task lists (Overdue / Due this week / Upcoming) are
+The Dashboard's active task lists (Overdue / Due this week / No due date /
+Upcoming) plus recently completed work are
 emitted as **real Sheets Tables sized to the actual data** at publish
 time. The template-time bootstrap only owns the static frame (border
 rows/cols, greeting, graphics band with floating KPI scorecards + donut,
@@ -28,8 +29,8 @@ Architecture
   list of active :class:`~homework_hub.pipeline.publish.TaskRow` rows,
   the list of existing Dashboard table ids (so we can tear them down),
   and emits the full batchUpdate body for the lists region.
-* Section identity is conveyed by the Table's ``name`` attribute
-  (``Overdue`` / ``Due this week`` / ``Upcoming``). No separate header
+* Section identity is conveyed by the Table's ``name`` attribute.
+  No separate header
   rows or coloured banners — the Table label IS the heading.
 * Empty sections render a 1-row Table with a kid-friendly fallback
   message in the Title column.
@@ -63,6 +64,8 @@ from typing import Any
 from homework_hub.schema import (
     DASHBOARD_DONE_TABLE_ID,
     DASHBOARD_DONE_TABLE_NAME,
+    DASHBOARD_NO_DUE_DATE_TABLE_ID,
+    DASHBOARD_NO_DUE_DATE_TABLE_NAME,
     DASHBOARD_OVERDUE_TABLE_ID,
     DASHBOARD_OVERDUE_TABLE_NAME,
     DASHBOARD_UPCOMING_TABLE_ID,
@@ -119,6 +122,7 @@ def _tint(accent: dict[str, float], white_mix: float = _BANDING_WHITE_MIX) -> di
         c: white_mix + (1 - white_mix) * accent.get(c, 0.0)
         for c in ("red", "green", "blue")
     }
+
 
 # --------------------------------------------------------------------------- #
 # Layout constants (shared with sheet_template's frame)
@@ -179,6 +183,7 @@ _SPACER_ROWS = 1
 _FALLBACKS: dict[str, str] = {
     DASHBOARD_OVERDUE_TABLE_NAME: "All caught up — nothing overdue!",
     DASHBOARD_WEEK_TABLE_NAME: "Nothing due this week.",
+    DASHBOARD_NO_DUE_DATE_TABLE_NAME: "Every pending task has a due date.",
     DASHBOARD_UPCOMING_TABLE_NAME: "No upcoming work — nice.",
     DASHBOARD_DONE_TABLE_NAME: "No work completed in the last 7 days yet.",
 }
@@ -208,6 +213,7 @@ class DashboardTask:
     status: str
     link: str
     submitted: date | None = None
+    assigned: date | None = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +285,24 @@ def filter_upcoming(tasks: list[DashboardTask], today: date) -> list[DashboardTa
     return _sort_by_due(out)
 
 
+def filter_no_due_date(tasks: list[DashboardTask]) -> list[DashboardTask]:
+    """Return pending tasks whose source supplied no due date.
+
+    These tasks cannot honestly be classified as overdue, due this week,
+    or upcoming. A dedicated section keeps them visible without inventing
+    urgency. Newer assignments sort first; tasks without an assignment
+    timestamp appear last.
+    """
+    out = [
+        task
+        for task in tasks
+        if task.due is None
+        and task.status != "Overdue"
+        and task.status not in _EXCLUDE_FROM_PENDING
+    ]
+    return _sort_by_assigned(out, descending=True)
+
+
 def filter_done(tasks: list[DashboardTask], today: date) -> list[DashboardTask]:
     """Done in the last 7 days = ``status IN {Submitted, Graded}`` AND
     the task was completed in the window ``today - 7 <= completed <= today``.
@@ -328,6 +352,21 @@ def _sort_by_due(tasks: list[DashboardTask], *, descending: bool = False) -> lis
     )
 
 
+def _sort_by_assigned(
+    tasks: list[DashboardTask], *, descending: bool = False
+) -> list[DashboardTask]:
+    """Sort by assignment date while keeping unknown dates at the end."""
+    direction = -1 if descending else 1
+    return sorted(
+        tasks,
+        key=lambda task: (
+            task.assigned is None,
+            direction * task.assigned.toordinal() if task.assigned else 0,
+            task.title.lower(),
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Conversion from TaskRow → DashboardTask
 # --------------------------------------------------------------------------- #
@@ -359,10 +398,12 @@ def task_rows_to_dashboard_tasks(
     uid_idx = TASKS_TAB.column_index("task_uid")
 
     submitted_by_uid: dict[str, date | None] = {}
+    assigned_by_uid: dict[str, date | None] = {}
     if tasks:
         for t in tasks:
             uid = f"{t.source.value}:{t.source_id}"
             submitted_by_uid[uid] = melbourne_local_date(t.submitted_at)
+            assigned_by_uid[uid] = melbourne_local_date(t.assigned_at)
 
     out: list[DashboardTask] = []
     for r in rows:
@@ -378,6 +419,7 @@ def task_rows_to_dashboard_tasks(
                 status=str(cells[status_idx] or ""),
                 link=str(cells[link_idx] or ""),
                 submitted=submitted_by_uid.get(uid),
+                assigned=assigned_by_uid.get(uid),
             )
         )
     return out
@@ -464,15 +506,11 @@ def build_requests(
 # --------------------------------------------------------------------------- #
 
 
-def _sectioned_tasks(tasks: list[DashboardTask], today: date) -> tuple[
-    list[DashboardTask],
-    list[DashboardTask],
-    list[DashboardTask],
-    list[DashboardTask],
-]:
+def _sectioned_tasks(tasks: list[DashboardTask], today: date) -> tuple[list[DashboardTask], ...]:
     return (
         filter_overdue(tasks),
         filter_week(tasks, today),
+        filter_no_due_date(tasks),
         filter_upcoming(tasks, today),
         filter_done(tasks, today),
     )
@@ -489,6 +527,11 @@ def _compute_section_layouts(tasks: list[DashboardTask], today: date) -> tuple[S
     sec_meta = (
         (DASHBOARD_OVERDUE_TABLE_NAME, DASHBOARD_OVERDUE_TABLE_ID, filter_overdue(tasks)),
         (DASHBOARD_WEEK_TABLE_NAME, DASHBOARD_WEEK_TABLE_ID, filter_week(tasks, today)),
+        (
+            DASHBOARD_NO_DUE_DATE_TABLE_NAME,
+            DASHBOARD_NO_DUE_DATE_TABLE_ID,
+            filter_no_due_date(tasks),
+        ),
         (
             DASHBOARD_UPCOMING_TABLE_NAME,
             DASHBOARD_UPCOMING_TABLE_ID,

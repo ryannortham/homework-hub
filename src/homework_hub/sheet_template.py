@@ -508,10 +508,11 @@ _GREETING_FORMULA = (
 # Last-sync footer formula moved to homework_hub.dashboard_layout in v5.0
 # (the footer's row is dynamic and is owned by the publish-time layout).
 
-# 4 KPI tiles in a 2x2 grid (no "Active" — user reads this from the
-# section row counts directly). Order matches the 2x2 layout: row 1
-# (Overdue, Due this week), row 2 (Upcoming, Done (7d)).
-_KPI_LABELS = ("Overdue", "Due this week", "Upcoming", "Done this week")
+# 4 KPI tiles in a 2x2 grid. Pending work takes priority over the
+# completion metric: Done this week remains visible as a Dashboard table,
+# while the fourth scorecard surfaces tasks that would otherwise disappear
+# from every date-based section.
+_KPI_LABELS = ("Overdue", "Due this week", "Upcoming", "No due date")
 _KPI_FORMULAS = (
     # Overdue = Status column says so (matches dashboard section).
     '=COUNTIF(Tasks!F2:F,"Overdue")',
@@ -534,19 +535,20 @@ _KPI_FORMULAS = (
         'Tasks!F2:F,"<>Graded",'
         'Tasks!F2:F,"<>Archived")'
     ),
-    # Done in last 7 days = Submitted or Graded with Due within the last
-    # 7 days (inclusive). Two COUNTIFS summed because COUNTIFS treats
-    # multiple criteria on the same column as AND. Matches the
-    # ``filter_done`` predicate in dashboard_layout exactly.
+    # No due date = a real task row with blank Due and a pending status.
+    # Subject must be non-blank so COUNTIFS does not count the unused tail
+    # of the open-ended Tasks ranges.
     (
-        '=COUNTIFS(Tasks!D2:D,">="&(TODAY()-7),Tasks!D2:D,"<="&TODAY(),'
-        'Tasks!F2:F,"Submitted")'
-        '+COUNTIFS(Tasks!D2:D,">="&(TODAY()-7),Tasks!D2:D,"<="&TODAY(),'
-        'Tasks!F2:F,"Graded")'
+        '=COUNTIFS(Tasks!A2:A,"<>",Tasks!D2:D,"",'
+        'Tasks!F2:F,"<>Overdue",'
+        'Tasks!F2:F,"<>Submitted",'
+        'Tasks!F2:F,"<>Graded",'
+        'Tasks!F2:F,"<>Archived")'
     ),
 )
 # Accent assigned to each tile's value foreground, matching its section.
-# Urgency mapping: Overdue=red, Due this week=amber, Upcoming=blue, Done=green.
+# Urgency mapping: Overdue=red, Due this week=amber, Upcoming=blue,
+# No due date=green.
 _KPI_ACCENTS = ("ACCENT2", "ACCENT3", "ACCENT1", "ACCENT4")
 
 
@@ -717,7 +719,7 @@ def _apply_dashboard_formats(
 #   A2      "Overdue"            B2  =COUNTIF(...)
 #   A3      "Due this week"      B3  =COUNTIFS(...)
 #   A4      "Upcoming"           B4  =COUNTIFS(...)
-#   A5      "Done this week"     B5  =COUNTIFS(...) + COUNTIFS(...)
+#   A5      "No due date"        B5  =COUNTIFS(...)
 #   A6      (separator)
 #   A7      =QUERY(Tasks!A2:A, "select A, count(A) ... group by A", 0)
 #           ↳ spills down into A7:B(7+N-1) with one row per distinct
@@ -738,13 +740,13 @@ _DASH_DATA_FIRST_ROW = 1  # 0-based; row 2 in 1-based notation.
 #   - Overdue:        F = 'Overdue'
 #   - Due this week:  D between today and today+7 AND F NOT IN {excluded}
 #   - Upcoming:       D > today+7              AND F NOT IN {excluded}
-#   - Done this week: F IN {'Submitted','Graded'} AND D between today-7 and today
+#   - No due date:    D is blank                 AND F NOT IN {excluded}
 # where {excluded} = {'Overdue','Submitted','Graded','Archived'}.
 #
 # This guarantees the sum of slice values == sum of tile values, since
 # the four predicates are mutually exclusive (Overdue is its own status;
 # pending statuses with future-dated D split into Due-week vs Upcoming;
-# Done-week is the only Submitted/Graded branch).
+# undated pending work is isolated in its own branch).
 #
 # QUERY needs date literals as `date 'yyyy-mm-dd'`; we build them via
 # string concatenation with TEXT(...) on TODAY() and TODAY()+/-7.
@@ -764,10 +766,9 @@ _DASH_SUBJECTS_FORMULA = (
     'or (D > date \'"&TEXT(TODAY()+7,"yyyy-mm-dd")&"\' '
     "and F != 'Overdue' and F != 'Submitted' "
     "and F != 'Graded' and F != 'Archived') "
-    # Done this week tile
-    "or ((F = 'Submitted' or F = 'Graded') "
-    'and D >= date \'"&TEXT(TODAY()-7,"yyyy-mm-dd")&"\' '
-    'and D <= date \'"&TEXT(TODAY(),"yyyy-mm-dd")&"\')'
+    # No due date tile
+    "or (D is null and F != 'Overdue' and F != 'Submitted' "
+    "and F != 'Graded' and F != 'Archived')"
     ") group by A label count(A) ''\", 0)"
 )
 
@@ -831,7 +832,7 @@ def _apply_dashboard_kpi_scorecards(
         |       8 px row gap     |                         |                              |
         |                        |                         |                              |
         | tile3 (164x82) 8 tile4 |                         |                              |
-        | Upcoming       Done wk |                         |                              |
+        | Upcoming       No date |                         |                              |
         +--------------------------------------------------------------------------------+
 
     Each tile pulls its value from a single cell on DashboardData:
@@ -839,7 +840,7 @@ def _apply_dashboard_kpi_scorecards(
         Overdue        → DashboardData!B2  ACCENT2 red
         Due this week  → DashboardData!B3  ACCENT3 amber
         Upcoming       → DashboardData!B4  ACCENT1 blue
-        Done this week → DashboardData!B5  ACCENT4 green
+        No due date    → DashboardData!B5  ACCENT4 green
 
     Tile size: 164 x 82 px. Grid pitch: 172 x 90 (tile + 8 gutter).
     Two tile columns (164+8+164 = 336 px) exactly fill the left third.

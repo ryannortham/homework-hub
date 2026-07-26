@@ -12,6 +12,7 @@ from homework_hub.dashboard_layout import (
     build_protect_dashboard_request,
     build_requests,
     filter_done,
+    filter_no_due_date,
     filter_overdue,
     filter_upcoming,
     filter_week,
@@ -20,6 +21,8 @@ from homework_hub.dashboard_layout import (
 from homework_hub.schema import (
     DASHBOARD_DONE_TABLE_ID,
     DASHBOARD_DONE_TABLE_NAME,
+    DASHBOARD_NO_DUE_DATE_TABLE_ID,
+    DASHBOARD_NO_DUE_DATE_TABLE_NAME,
     DASHBOARD_OVERDUE_TABLE_ID,
     DASHBOARD_OVERDUE_TABLE_NAME,
     DASHBOARD_UPCOMING_TABLE_ID,
@@ -43,6 +46,14 @@ def _tasks() -> list[DashboardTask]:
         DashboardTask("English", "Essay draft", date(2026, 5, 30), "Not started", "https://x/2"),
         DashboardTask("Science", "Lab report", date(2026, 6, 4), "In progress", ""),
         DashboardTask("Art", "Sketchbook", date(2026, 7, 1), "Not started", "https://x/4"),
+        DashboardTask(
+            "Music",
+            "Choose recital piece",
+            None,
+            "Not started",
+            "https://x/5",
+            assigned=date(2026, 5, 27),
+        ),
         # Overdue-by-status but due in the future — must still land in Overdue.
         DashboardTask("History", "Late essay", date(2026, 6, 1), "Overdue", ""),
     ]
@@ -108,6 +119,68 @@ class TestFilters:
         ]
         upcoming = filter_upcoming(tasks, TODAY)
         assert [t.title for t in upcoming] == ["pending"]
+
+    def test_no_due_date_includes_only_pending_undated_tasks(self):
+        tasks = [
+            DashboardTask("S", "pending", None, "Not started", ""),
+            DashboardTask("S", "in-progress", None, "In progress", ""),
+            DashboardTask("S", "overdue", None, "Overdue", ""),
+            DashboardTask("S", "submitted", None, "Submitted", ""),
+            DashboardTask("S", "graded", None, "Graded", ""),
+            DashboardTask("S", "archived", None, "Archived", ""),
+            DashboardTask("S", "dated", TODAY, "Not started", ""),
+        ]
+
+        result = filter_no_due_date(tasks)
+
+        assert [t.title for t in result] == ["in-progress", "pending"]
+
+    def test_no_due_date_sorts_newest_assignments_first(self):
+        tasks = [
+            DashboardTask(
+                "S",
+                "older",
+                None,
+                "Not started",
+                "",
+                assigned=date(2026, 5, 20),
+            ),
+            DashboardTask(
+                "S",
+                "newest",
+                None,
+                "Not started",
+                "",
+                assigned=date(2026, 5, 27),
+            ),
+            DashboardTask("S", "unknown", None, "Not started", ""),
+        ]
+
+        result = filter_no_due_date(tasks)
+
+        assert [t.title for t in result] == ["newest", "older", "unknown"]
+
+    def test_every_pending_task_appears_in_exactly_one_active_section(self):
+        tasks = [
+            DashboardTask("S", "overdue", date(2026, 5, 20), "Overdue", ""),
+            DashboardTask("S", "week", TODAY, "Not started", ""),
+            DashboardTask("S", "upcoming", date(2026, 6, 5), "In progress", ""),
+            DashboardTask("S", "undated", None, "Not started", ""),
+        ]
+        sections = (
+            filter_overdue(tasks),
+            filter_week(tasks, TODAY),
+            filter_upcoming(tasks, TODAY),
+            filter_no_due_date(tasks),
+        )
+        memberships = {task.title: sum(task in section for section in sections) for task in tasks}
+
+        assert memberships == {
+            "overdue": 1,
+            "week": 1,
+            "upcoming": 1,
+            "undated": 1,
+        }
 
 
 class TestFilterDone:
@@ -264,21 +337,23 @@ class TestTeardown:
 
 
 class TestSectionSizing:
-    def test_four_tables_with_canonical_names_and_ids(self):
+    def test_five_tables_with_canonical_names_and_ids(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
         tables = _by_kind(reqs, "addTable")
-        assert len(tables) == 4
+        assert len(tables) == 5
         names = [t["addTable"]["table"]["name"] for t in tables]
         ids = [t["addTable"]["table"]["tableId"] for t in tables]
         assert names == [
             DASHBOARD_OVERDUE_TABLE_NAME,
             DASHBOARD_WEEK_TABLE_NAME,
+            DASHBOARD_NO_DUE_DATE_TABLE_NAME,
             DASHBOARD_UPCOMING_TABLE_NAME,
             DASHBOARD_DONE_TABLE_NAME,
         ]
         assert ids == [
             DASHBOARD_OVERDUE_TABLE_ID,
             DASHBOARD_WEEK_TABLE_ID,
+            DASHBOARD_NO_DUE_DATE_TABLE_ID,
             DASHBOARD_UPCOMING_TABLE_ID,
             DASHBOARD_DONE_TABLE_ID,
         ]
@@ -286,18 +361,18 @@ class TestSectionSizing:
     def test_table_range_sizes_match_data(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
         tables = _by_kind(reqs, "addTable")
-        # Overdue: 2 (Algebra + Late essay), Week: 2 (Essay draft today+2, Lab today+7),
-        # Upcoming: 1 (Sketchbook today+34), Done: empty → 1 fallback row.
+        # Overdue: 2, Week: 2, No due date: 1, Upcoming: 1,
+        # Done: empty → 1 fallback row.
         spans = [
             t["addTable"]["table"]["range"]["endRowIndex"]
             - t["addTable"]["table"]["range"]["startRowIndex"]
             - 1  # subtract header row
             for t in tables
         ]
-        assert spans == [2, 2, 1, 1]
+        assert spans == [2, 2, 1, 1, 1]
 
     def test_empty_section_emits_one_row_fallback(self):
-        # No tasks at all → all four sections have 1-row fallback.
+        # No tasks at all → all five sections have 1-row fallback.
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=[], today=TODAY)
         tables = _by_kind(reqs, "addTable")
         for t in tables:
@@ -318,6 +393,7 @@ class TestSectionSizing:
                         title_fallbacks.append(title)
         assert any("caught up" in s for s in title_fallbacks)
         assert any("Nothing due" in s for s in title_fallbacks)
+        assert any("due date" in s.lower() for s in title_fallbacks)
         assert any("upcoming" in s.lower() for s in title_fallbacks)
         assert any("completed" in s.lower() for s in title_fallbacks)
 
@@ -354,7 +430,7 @@ class TestStatusColumn:
             for u in _by_kind(reqs, "updateTable")
             if "columnProperties" in u["updateTable"]["table"]
         ]
-        assert len(updates) == 4  # one per section
+        assert len(updates) == 5  # one per section
         for u in updates:
             cols = u["updateTable"]["table"]["columnProperties"]
             # All four content columns are described.
@@ -389,7 +465,7 @@ class TestStatusColumn:
 
 
 class TestTableHeaderColour:
-    """Every Sheets-Table header chip — Dashboard's four sections AND
+    """Every Sheets-Table header chip — Dashboard's five sections AND
     the non-Dashboard tabs (Tasks/History/UserEdits/Settings) — is
     painted with the resolved theme accent so the whole sheet tracks
     the kid's chosen ``Format → Theme``. When no theme is supplied
@@ -402,7 +478,7 @@ class TestTableHeaderColour:
             for u in _by_kind(reqs, "updateTable")
             if "columnProperties" in u["updateTable"]["table"]
         ]
-        assert len(section_updates) == 4
+        assert len(section_updates) == 5
         target = {"red": 111 / 255, "green": 164 / 255, "blue": 140 / 255}
         for u in section_updates:
             rows_props = u["updateTable"]["table"]["rowsProperties"]
@@ -420,7 +496,7 @@ class TestTableHeaderColour:
             for u in _by_kind(reqs, "updateTable")
             if "columnProperties" in u["updateTable"]["table"]
         ]
-        assert len(section_updates) == 4
+        assert len(section_updates) == 5
         for u in section_updates:
             rgb = u["updateTable"]["table"]["rowsProperties"]["headerColorStyle"]["rgbColor"]
             assert rgb == accent
@@ -459,7 +535,7 @@ class TestFooterAndGrid:
 
     def test_addtables_emitted_for_every_section(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
-        assert sum(1 for r in reqs if "addTable" in r) == 4
+        assert sum(1 for r in reqs if "addTable" in r) == 5
 
     def test_footer_emits_lastsync_formula_merged(self):
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)

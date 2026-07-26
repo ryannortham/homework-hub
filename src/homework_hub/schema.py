@@ -130,12 +130,13 @@ class TabSpec:
 # Fixed dropdown vocabularies
 # --------------------------------------------------------------------------- #
 
-# Native Sheets Table ids for the three Dashboard lists. The Tables are
+# Native Sheets Table ids for the Dashboard lists. The Tables are
 # emitted at publish time (sized to actual data) rather than at template
 # time, but the ids are declared here so callers can refer to them by
 # stable name when tearing down / re-creating.
 DASHBOARD_OVERDUE_TABLE_ID = "tbl_dash_overdue"
 DASHBOARD_WEEK_TABLE_ID = "tbl_dash_week"
+DASHBOARD_NO_DUE_DATE_TABLE_ID = "tbl_dash_no_due_date"
 DASHBOARD_UPCOMING_TABLE_ID = "tbl_dash_upcoming"
 DASHBOARD_DONE_TABLE_ID = "tbl_dash_done"
 
@@ -143,12 +144,14 @@ DASHBOARD_DONE_TABLE_ID = "tbl_dash_done"
 # section identity is conveyed via the Table label itself.
 DASHBOARD_OVERDUE_TABLE_NAME = "Overdue"
 DASHBOARD_WEEK_TABLE_NAME = "DueThisWeek"
+DASHBOARD_NO_DUE_DATE_TABLE_NAME = "NoDueDate"
 DASHBOARD_UPCOMING_TABLE_NAME = "Upcoming"
 DASHBOARD_DONE_TABLE_NAME = "DoneThisWeek"
 
 DASHBOARD_TABLE_IDS: tuple[str, ...] = (
     DASHBOARD_OVERDUE_TABLE_ID,
     DASHBOARD_WEEK_TABLE_ID,
+    DASHBOARD_NO_DUE_DATE_TABLE_ID,
     DASHBOARD_UPCOMING_TABLE_ID,
     DASHBOARD_DONE_TABLE_ID,
 )
