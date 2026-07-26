@@ -63,7 +63,7 @@ class TestMapping:
     def test_url_opens_student_learning_tasks_page(self, lt):
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.url == (
-            "https://mcsc-vic.compass.education/" "Records/UserNew.aspx?userId=12345#learningTasks"
+            "https://mcsc-vic.compass.education/Records/UserNew.aspx?userId=12345#learningTasks"
         )
 
     def test_configured_student_user_id_takes_precedence(self, lt):
@@ -74,7 +74,7 @@ class TestMapping:
             student_user_id=67890,
         )
         assert t.url == (
-            "https://mcsc-vic.compass.education/" "Records/UserNew.aspx?userId=67890#learningTasks"
+            "https://mcsc-vic.compass.education/Records/UserNew.aspx?userId=67890#learningTasks"
         )
 
     def test_due_date_parsed(self, lt):
@@ -379,6 +379,28 @@ class TestCompassClient:
             == "https://mcsc-vic.compass.education/Records/UserNew.aspx?userId=12345"
         )
 
+    def test_rotated_session_cookie_is_used_and_exposed(self):
+        seen_cookies: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_cookies.append(request.headers.get("cookie", ""))
+            if "/Services/" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={"d": []},
+                    headers={"Set-Cookie": "ASP.NET_SessionId=ROTATED; Path=/; HttpOnly"},
+                )
+            return httpx.Response(200, text="<html>Learning Tasks</html>")
+
+        client = self._client(handler)
+        client.get_learning_tasks(12345)
+        client.check_learning_tasks_link(12345)
+
+        refreshed = client.refreshed_token()
+        assert "ASP.NET_SessionId=ROTATED" in seen_cookies[1]
+        assert refreshed is not None
+        assert refreshed.cookie == "ROTATED"
+
     def test_check_learning_tasks_link_404_is_schema_break(self):
         client = self._client(lambda _request: httpx.Response(404, text="Compass: Error"))
 
@@ -434,8 +456,16 @@ class TestCompassClient:
 
 
 class FakeCompassClient:
-    def __init__(self, raw_tasks: list[dict]):
+    def __init__(
+        self,
+        raw_tasks: list[dict],
+        *,
+        refreshed: CompassToken | None = None,
+        fail_link_check: bool = False,
+    ):
         self.raw_tasks = raw_tasks
+        self.refreshed = refreshed
+        self.fail_link_check = fail_link_check
         self.calls: list[int] = []
         self.link_checks: list[int] = []
 
@@ -450,7 +480,12 @@ class FakeCompassClient:
         return self.raw_tasks
 
     def check_learning_tasks_link(self, user_id: int) -> None:
+        if self.fail_link_check:
+            raise RuntimeError("link check failed")
         self.link_checks.append(user_id)
+
+    def refreshed_token(self) -> CompassToken | None:
+        return self.refreshed
 
 
 class TestCompassSource:
@@ -567,3 +602,34 @@ class TestCompassFetchRaw:
         )
         with pytest.raises(SchemaBreakError, match="missing id"):
             source.fetch_raw("james")
+
+    def test_success_persists_rotated_session(self, tmp_path: Path, lt):
+        token_path = tmp_path / "compass.json"
+        CompassToken(subdomain="mcsc-vic", cookie="OLD").save(token_path)
+        refreshed = CompassToken(subdomain="mcsc-vic", cookie="ROTATED")
+        fake = FakeCompassClient([lt], refreshed=refreshed)
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 12345},
+            client_factory=lambda _token: fake,
+        )
+
+        source.fetch_raw("james")
+
+        assert CompassToken.load(token_path).cookie == "ROTATED"
+
+    def test_failed_fetch_does_not_persist_rotated_session(self, tmp_path: Path, lt):
+        token_path = tmp_path / "compass.json"
+        CompassToken(subdomain="mcsc-vic", cookie="OLD").save(token_path)
+        refreshed = CompassToken(subdomain="mcsc-vic", cookie="ROTATED")
+        fake = FakeCompassClient([lt], refreshed=refreshed, fail_link_check=True)
+        source = CompassSource(
+            token_path,
+            user_id_for_child={"james": 12345},
+            client_factory=lambda _token: fake,
+        )
+
+        with pytest.raises(RuntimeError, match="link check failed"):
+            source.fetch_raw("james")
+
+        assert CompassToken.load(token_path).cookie == "OLD"

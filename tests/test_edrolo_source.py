@@ -279,6 +279,28 @@ class TestEdroloClient:
         assert len(result) == 2
         assert result[0]["title"] == "VCE Biology Units 3&4 [2026]"
 
+    def test_rotated_session_cookie_is_used_and_exposed(self, storage_raw):
+        seen_cookies: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_cookies.append(request.headers.get("cookie", ""))
+            if "/student-tasks/" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[],
+                    headers={"Set-Cookie": "sessionid=rotated-session; Path=/; HttpOnly"},
+                )
+            return httpx.Response(200, json=[])
+
+        client = self._client(handler, storage_raw)
+        client.get_tasks()
+        client.get_courses()
+
+        refreshed = client.refreshed_storage_state()
+        assert "sessionid=rotated-session" in seen_cookies[1]
+        assert refreshed is not None
+        assert refreshed.cookies_for_domain("app.edrolo.com")["sessionid"] == "rotated-session"
+
     def test_check_task_link_happy_path(self, storage_raw):
         captured: dict = {}
 
@@ -369,9 +391,18 @@ class TestExtractTasksPayload:
 
 
 class FakeEdroloClient:
-    def __init__(self, raw_tasks: list[dict], raw_courses: list[dict] | None = None):
+    def __init__(
+        self,
+        raw_tasks: list[dict],
+        raw_courses: list[dict] | None = None,
+        *,
+        refreshed_storage: EdroloStorageState | None = None,
+        fail_link_check: bool = False,
+    ):
         self.raw_tasks = raw_tasks
         self.raw_courses = raw_courses or []
+        self.refreshed_storage = refreshed_storage
+        self.fail_link_check = fail_link_check
         self.calls: list[EdroloStorageState] = []
         self.link_checks: list[int] = []
 
@@ -388,7 +419,12 @@ class FakeEdroloClient:
         return self.raw_courses
 
     def check_task_link(self, task_id: int) -> None:
+        if self.fail_link_check:
+            raise RuntimeError("link check failed")
         self.link_checks.append(task_id)
+
+    def refreshed_storage_state(self) -> EdroloStorageState | None:
+        return self.refreshed_storage
 
 
 class TestEdroloSource:
@@ -513,3 +549,37 @@ class TestEdroloFetchRaw:
         )
         with pytest.raises(SchemaBreakError, match="missing id"):
             source.fetch_raw("james")
+
+    def test_success_persists_rotated_session(self, tmp_path: Path, task, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        refreshed_raw = json.loads(json.dumps(storage_raw))
+        refreshed_raw["cookies"][0]["value"] = "rotated-session"
+        fake = FakeEdroloClient(
+            [task],
+            [],
+            refreshed_storage=EdroloStorageState(refreshed_raw),
+        )
+        source = EdroloSource({"james": path}, client_factory=lambda _storage: fake)
+
+        source.fetch_raw("james")
+
+        saved = EdroloStorageState.load(path)
+        assert saved.cookies_for_domain("app.edrolo.com")["sessionid"] == "rotated-session"
+
+    def test_failed_fetch_does_not_persist_rotated_session(self, tmp_path: Path, task, storage_raw):
+        path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
+        original = path.read_text()
+        refreshed_raw = json.loads(json.dumps(storage_raw))
+        refreshed_raw["cookies"][0]["value"] = "must-not-be-saved"
+        fake = FakeEdroloClient(
+            [task],
+            [],
+            refreshed_storage=EdroloStorageState(refreshed_raw),
+            fail_link_check=True,
+        )
+        source = EdroloSource({"james": path}, client_factory=lambda _storage: fake)
+
+        with pytest.raises(RuntimeError, match="link check failed"):
+            source.fetch_raw("james")
+
+        assert path.read_text() == original

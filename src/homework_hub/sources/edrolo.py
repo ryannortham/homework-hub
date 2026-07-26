@@ -40,7 +40,9 @@ helper but no longer applied at fetch time.
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,9 @@ from homework_hub.sources.base import (
     Source,
     TransientError,
 )
+from homework_hub.token_store import atomic_write_json
+
+log = logging.getLogger(__name__)
 
 # Edrolo serves its app under the apex domain.
 DEFAULT_BASE_URL = "https://app.edrolo.com"
@@ -244,8 +249,7 @@ class EdroloStorageState:
         return state
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.raw, indent=2))
+        atomic_write_json(path, self.raw)
         self.path = path
 
     def validate(self) -> None:
@@ -355,7 +359,8 @@ class EdroloClient:
         client: httpx.Client | None = None,
         timeout: float = 30.0,
     ):
-        self.storage = storage
+        self._original_storage_raw = copy.deepcopy(storage.raw)
+        self.storage = EdroloStorageState(copy.deepcopy(storage.raw), path=storage.path)
         self.base_url = base_url.rstrip("/")
         self.user_agent = user_agent
         self._owns_client = client is None
@@ -403,6 +408,13 @@ class EdroloClient:
             raise SchemaBreakError(
                 f"Edrolo task link returned {resp.status_code}: {resp.text[:200]}"
             )
+        self._capture_response_cookies(resp)
+
+    def refreshed_storage_state(self) -> EdroloStorageState | None:
+        """Return cookies rotated during successful Edrolo requests."""
+        if self.storage.raw == self._original_storage_raw:
+            return None
+        return self.storage
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -442,6 +454,7 @@ class EdroloClient:
             raise SchemaBreakError(
                 f"Unexpected Edrolo status {resp.status_code} on {url}: {resp.text[:200]}"
             )
+        self._capture_response_cookies(resp)
 
         try:
             payload = resp.json()
@@ -449,6 +462,21 @@ class EdroloClient:
             raise SchemaBreakError(f"Non-JSON Edrolo response: {resp.text[:200]}") from exc
 
         return _extract_tasks_payload(payload)
+
+    def _capture_response_cookies(self, response: httpx.Response) -> None:
+        """Merge relevant response cookies into the in-memory browser state."""
+        by_name = {
+            cookie["name"]: cookie
+            for cookie in self.storage.raw.get("cookies", [])
+            if cookie.get("name") in {"sessionid", "csrftoken"}
+        }
+        for cookie in response.cookies.jar:
+            stored = by_name.get(cookie.name)
+            if stored is None or not cookie.value:
+                continue
+            stored["value"] = cookie.value
+            if cookie.expires is not None:
+                stored["expires"] = cookie.expires
 
 
 def _extract_tasks_payload(payload: Any) -> list[dict[str, Any]]:
@@ -511,10 +539,12 @@ class EdroloSource(Source):
         # Mirrors Classroom + Compass behaviour. The ``is_active_edrolo_task``
         # helper is retained for reference / future use but no longer applied
         # at fetch time.
-        return [
+        tasks = [
             map_edrolo_task_to_task(child=child, edrolo_task=t, course_titles=course_titles)
             for t in raw_tasks
         ]
+        self._persist_refreshed_storage(client, path)
+        return tasks
 
     def fetch_raw(self, child: str) -> list[RawRecord]:
         """Fetch Edrolo student-tasks as raw payloads for the bronze layer.
@@ -555,4 +585,20 @@ class EdroloSource(Source):
                     payload={"task": t, "course_titles": course_titles},
                 )
             )
+        self._persist_refreshed_storage(client, path)
         return records
+
+    @staticmethod
+    def _persist_refreshed_storage(client: Any, path: Path) -> None:
+        get_refreshed = getattr(client, "refreshed_storage_state", None)
+        if not callable(get_refreshed):
+            return
+        try:
+            refreshed = get_refreshed()
+            if refreshed is None:
+                return
+            refreshed.validate()
+            refreshed.save(path)
+            log.info("Edrolo session refreshed at %s", path)
+        except Exception as exc:
+            log.warning("Edrolo session refresh could not be persisted: %s", exc)

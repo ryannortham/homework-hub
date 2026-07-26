@@ -405,8 +405,16 @@ class TestStorageState:
 class FakeScraper:
     """Returns canned ScrapeResults per view; supports context-manager."""
 
-    def __init__(self, results_by_view: dict[str, list[dict]]):
+    def __init__(
+        self,
+        results_by_view: dict[str, list[dict]],
+        *,
+        refreshed_raw: dict | None = None,
+        fail_on_view: str | None = None,
+    ):
         self.results_by_view = results_by_view
+        self.refreshed_raw = refreshed_raw
+        self.fail_on_view = fail_on_view
         self.entered = False
         self.exited = False
 
@@ -418,7 +426,14 @@ class FakeScraper:
         self.exited = True
 
     def fetch_view(self, view: str) -> ScrapeResult:
+        if view == self.fail_on_view:
+            raise RuntimeError(f"failed on {view}")
         return ScrapeResult(view=view, cards=self.results_by_view.get(view, []))
+
+    def refreshed_storage_state(self) -> ClassroomStorageState | None:
+        if self.refreshed_raw is None:
+            return None
+        return ClassroomStorageState(self.refreshed_raw)
 
 
 @pytest.fixture
@@ -553,6 +568,37 @@ class TestClassroomFetchRaw:
             records[0].source_id == f"{CARD_NO_YEAR['course_id']}:{CARD_NO_YEAR['stream_item_id']}"
         )
         assert any("Broken Card" in r.message for r in caplog.records)
+
+    def test_success_persists_refreshed_browser_storage(self, storage_path: Path):
+        refreshed = _state_with_cookies("SID", "SAPISID")
+        refreshed["cookies"][0]["value"] = "rotated-sid"
+        source = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _storage: FakeScraper({}, refreshed_raw=refreshed),
+        )
+
+        source.fetch_raw("james")
+
+        saved = ClassroomStorageState.load(storage_path)
+        assert saved.cookies_for_domain("google.com")["SID"] == "rotated-sid"
+
+    def test_failed_scrape_does_not_replace_browser_storage(self, storage_path: Path):
+        original = storage_path.read_text()
+        refreshed = _state_with_cookies("SID", "SAPISID")
+        refreshed["cookies"][0]["value"] = "must-not-be-saved"
+        source = ClassroomSource(
+            {"james": storage_path},
+            scraper_factory=lambda _storage: FakeScraper(
+                {},
+                refreshed_raw=refreshed,
+                fail_on_view="missing",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="failed on missing"):
+            source.fetch_raw("james")
+
+        assert storage_path.read_text() == original
 
 
 class TestExtractCardsJs:

@@ -45,6 +45,7 @@ from homework_hub.sources.base import (
     Source,
     TransientError,
 )
+from homework_hub.token_store import atomic_write_json
 
 DEFAULT_BASE_URL = "https://classroom.google.com"
 
@@ -392,8 +393,7 @@ class ClassroomStorageState:
         return state
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.raw, indent=2))
+        atomic_write_json(path, self.raw)
         self.path = path
 
     def validate(self) -> None:
@@ -585,6 +585,14 @@ class ClassroomScraper:
         finally:
             page.close()
 
+    def refreshed_storage_state(self) -> ClassroomStorageState:
+        """Return cookies and browser storage updated during this scrape."""
+        if self._context is None:
+            raise RuntimeError("ClassroomScraper used outside of context manager")
+        state = ClassroomStorageState(self._context.storage_state())
+        state.validate()
+        return state
+
 
 # --------------------------------------------------------------------------- #
 # Source implementation
@@ -614,7 +622,8 @@ class ClassroomSource(Source):
     def fetch(self, child: str) -> list[Task]:
         if child not in self.storage_path_for_child:
             raise SchemaBreakError(f"No Classroom storage state path configured for {child}.")
-        storage = ClassroomStorageState.load(self.storage_path_for_child[child])
+        path = self.storage_path_for_child[child]
+        storage = ClassroomStorageState.load(path)
         tasks: list[Task] = []
         with self._scraper_factory(storage) as scraper:
             for view in VIEW_PATHS:
@@ -629,6 +638,7 @@ class ClassroomSource(Source):
                             tz=self.tz,
                         )
                     )
+            self._persist_refreshed_storage(storage, scraper, path)
         return _dedupe_by_source_id(tasks)
 
     def fetch_raw(self, child: str) -> list[RawRecord]:
@@ -642,7 +652,8 @@ class ClassroomSource(Source):
         """
         if child not in self.storage_path_for_child:
             raise SchemaBreakError(f"No Classroom storage state path configured for {child}.")
-        storage = ClassroomStorageState.load(self.storage_path_for_child[child])
+        path = self.storage_path_for_child[child]
+        storage = ClassroomStorageState.load(path)
         records: list[RawRecord] = []
         with self._scraper_factory(storage) as scraper:
             for view in VIEW_PATHS:
@@ -674,7 +685,28 @@ class ClassroomSource(Source):
                             },
                         )
                     )
+            self._persist_refreshed_storage(storage, scraper, path)
         return records
+
+    @staticmethod
+    def _persist_refreshed_storage(
+        original: ClassroomStorageState,
+        scraper: Any,
+        path: Path,
+    ) -> None:
+        """Persist browser-rotated cookies without risking the current token."""
+        get_refreshed = getattr(scraper, "refreshed_storage_state", None)
+        if not callable(get_refreshed):
+            return
+        try:
+            refreshed = get_refreshed()
+            if refreshed is None or refreshed.raw == original.raw:
+                return
+            refreshed.validate()
+            refreshed.save(path)
+            logger.info("Classroom session refreshed at %s", path)
+        except Exception as exc:
+            logger.warning("Classroom session refresh could not be persisted: %s", exc)
 
 
 def _dedupe_by_source_id(tasks: list[Task]) -> list[Task]:

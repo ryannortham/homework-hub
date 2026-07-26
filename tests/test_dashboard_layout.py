@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
@@ -18,6 +18,7 @@ from homework_hub.dashboard_layout import (
     filter_week,
     task_rows_to_dashboard_tasks,
 )
+from homework_hub.pipeline.auth_status import SourceAuthRow
 from homework_hub.schema import (
     DASHBOARD_DONE_TABLE_ID,
     DASHBOARD_DONE_TABLE_NAME,
@@ -262,10 +263,12 @@ class TestFilterDone:
         # A row with submitted=today should beat a row with due=today
         # but submitted=yesterday.
         tasks = [
-            DashboardTask("S", "due-today-sub-yest", TODAY, "Submitted", "",
-                          submitted=date(2026, 5, 27)),
-            DashboardTask("S", "due-yest-sub-today", date(2026, 5, 27), "Submitted", "",
-                          submitted=TODAY),
+            DashboardTask(
+                "S", "due-today-sub-yest", TODAY, "Submitted", "", submitted=date(2026, 5, 27)
+            ),
+            DashboardTask(
+                "S", "due-yest-sub-today", date(2026, 5, 27), "Submitted", "", submitted=TODAY
+            ),
         ]
         done = filter_done(tasks, TODAY)
         assert [t.title for t in done] == ["due-yest-sub-today", "due-today-sub-yest"]
@@ -562,6 +565,83 @@ class TestFooterAndGrid:
 
 
 class TestCellRendering:
+    def test_source_freshness_line_is_neutral(self):
+        source_rows = [
+            SourceAuthRow(
+                source="classroom",
+                display_name="Classroom",
+                last_success_at=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+                last_failure_at=None,
+                last_failure_kind=None,
+                token_expires_at=None,
+                token_present=True,
+                status="ok",
+            ),
+            SourceAuthRow(
+                source="eduperfect",
+                display_name="EduPerfect",
+                last_success_at=datetime(2026, 4, 30, 14, 0, tzinfo=UTC),
+                last_failure_at=datetime(2026, 5, 1, 15, 0, tzinfo=UTC),
+                last_failure_kind="auth_expired",
+                token_expires_at=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+                token_present=True,
+                status="expired",
+            ),
+        ]
+
+        requests = build_requests(
+            dash_sheet_id=DASH_SID,
+            tasks=[],
+            today=TODAY,
+            source_auth_rows=source_rows,
+        )
+
+        values = [
+            cell["userEnteredValue"]["stringValue"]
+            for request in _by_kind(requests, "updateCells")
+            for row in request["updateCells"].get("rows", [])
+            for cell in row.get("values", [])
+            if "stringValue" in cell.get("userEnteredValue", {})
+        ]
+        freshness = next(value for value in values if value.startswith("Sources:"))
+        assert "Classroom updated 02/05 00:00" in freshness
+        assert "EP updated 01/05 00:00" in freshness
+        assert "expired" not in freshness.lower()
+        assert "⚠" not in freshness
+
+    def test_source_freshness_line_uses_own_row_before_tables(self):
+        source_rows = [
+            SourceAuthRow(
+                source="classroom",
+                display_name="Classroom",
+                last_success_at=None,
+                last_failure_at=None,
+                last_failure_kind=None,
+                token_expires_at=None,
+                token_present=True,
+                status="never_synced",
+            )
+        ]
+
+        requests = build_requests(
+            dash_sheet_id=DASH_SID,
+            tasks=[],
+            today=TODAY,
+            source_auth_rows=source_rows,
+        )
+
+        source_merge = next(
+            request["mergeCells"]["range"]
+            for request in requests
+            if request.get("mergeCells", {}).get("range", {}).get("startRowIndex") == 3
+        )
+        assert source_merge["startColumnIndex"] == 1
+        assert source_merge["endColumnIndex"] == 5
+        first_table = next(
+            request["addTable"]["table"] for request in requests if "addTable" in request
+        )
+        assert first_table["range"]["startRowIndex"] == 5
+
     def test_title_uses_hyperlink_when_link_present(self):
         tasks = [DashboardTask("S", 'Re"port', date(2026, 5, 30), "Not started", "https://a/b")]
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=tasks, today=TODAY)
@@ -782,8 +862,7 @@ class TestRepaintNonDashboardTableHeaders:
         return [
             u
             for u in reqs
-            if "updateTable" in u
-            and "columnProperties" not in u["updateTable"]["table"]
+            if "updateTable" in u and "columnProperties" not in u["updateTable"]["table"]
         ]
 
     def test_emits_one_per_non_dashboard_table(self):
@@ -792,9 +871,7 @@ class TestRepaintNonDashboardTableHeaders:
         reqs = build_requests(dash_sheet_id=DASH_SID, tasks=_tasks(), today=TODAY)
         repaints = self._repaint_requests(reqs)
         expected_table_ids = {
-            tab.table_id
-            for tab in SCHEMA.tabs
-            if tab.table_id and tab.name != DASHBOARD_TAB.name
+            tab.table_id for tab in SCHEMA.tabs if tab.table_id and tab.name != DASHBOARD_TAB.name
         }
         seen = {u["updateTable"]["table"]["tableId"] for u in repaints}
         assert seen == expected_table_ids

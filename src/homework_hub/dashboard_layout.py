@@ -46,10 +46,10 @@ Layout
     Row 0     8px top border (frame, template-owned)
     Row 1     greeting          (frame, template-owned)
     Row 2     graphics band     (frame, template-owned, 188px)
-    Row 3     Overdue Table header  ← dynamic starts here
-    Rows 4..3+N_overdue    Overdue data rows (≥1)
-    Row 4+N_overdue        spacer (8px)
-    Row 5+N_overdue        Week Table header
+    Row 3     neutral source-freshness line
+    Row 4     spacer for the first Table label
+    Row 5     Overdue Table header  ← task Tables start here
+    Rows 6..5+N_overdue    Overdue data rows (≥1)
     ...
     Row M     last-sync footer  (frame, template-owned)
     Row M+1   8px bottom border (frame, template-owned)
@@ -58,9 +58,11 @@ Layout
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from homework_hub.pipeline.auth_status import SourceAuthRow
 from homework_hub.schema import (
     DASHBOARD_DONE_TABLE_ID,
     DASHBOARD_DONE_TABLE_NAME,
@@ -84,6 +86,7 @@ _EXCLUDE_FROM_PENDING: frozenset[str] = frozenset({"Submitted", "Graded", "Archi
 
 # Done(7d) window — must mirror the tile formula in sheet_template.
 _DONE_WINDOW_DAYS = 7
+_MELBOURNE = ZoneInfo("Australia/Melbourne")
 
 # Header colour for every Sheets-Table on the spreadsheet (Dashboard +
 # Tasks + History + UserEdits + Settings). Resolved at publish time from
@@ -118,10 +121,7 @@ def _tint(accent: dict[str, float], white_mix: float = _BANDING_WHITE_MIX) -> di
     Missing channels default to ``0.0`` (Sheets omits zero-valued channels
     in API responses).
     """
-    return {
-        c: white_mix + (1 - white_mix) * accent.get(c, 0.0)
-        for c in ("red", "green", "blue")
-    }
+    return {c: white_mix + (1 - white_mix) * accent.get(c, 0.0) for c in ("red", "green", "blue")}
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +163,7 @@ _ROW_HEIGHT_BORDER = 8
 _ROW_HEIGHT_CONTENT = 24
 _ROW_HEIGHT_GREETING = 56
 _ROW_HEIGHT_GRAPHICS = 188
+_ROW_HEIGHT_SOURCE_STATUS = 28
 _ROW_HEIGHT_FOOTER = 24
 # Spacer row between consecutive Tables. The Sheets-rendered
 # table-name chip floats above each header row and visually consumes
@@ -439,6 +440,7 @@ def build_requests(
     existing_banded_range_ids: list[int] | None = None,
     existing_conditional_format_rule_count: int = 0,
     theme_accent: dict[str, float] | None = None,
+    source_auth_rows: list[SourceAuthRow] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the per-publish Dashboard lists region as a single batchUpdate body.
 
@@ -463,15 +465,17 @@ def build_requests(
     2. ``deleteBanding`` per id in ``existing_banded_range_ids``.
     3. ``deleteConditionalFormatRule`` x N (drain semantics — always index 0).
     4. ``updateCells`` clearing the lists region.
-    5. ``updateDimensionProperties`` setting content-row heights.
-    6. Per section: header write, data write, ``addTable``, per-status CF rule,
+    5. Optional neutral source-freshness line.
+    6. ``updateDimensionProperties`` setting content-row heights.
+    7. Per section: header write, data write, ``addTable``, per-status CF rule,
        header cell formatting.
-    7. Footer: formula write + merge + format.
-    8. ``updateTable`` per non-Dashboard Sheets-Table to repaint its
+    8. Footer: formula write + merge + format.
+    9. ``updateTable`` per non-Dashboard Sheets-Table to repaint its
        header chip (so theme changes propagate without re-bootstrapping
        the template).
     """
-    sections = _compute_section_layouts(tasks, today)
+    has_source_status = bool(source_auth_rows)
+    sections = _compute_section_layouts(tasks, today, has_source_status=has_source_status)
     last_data_row = sections[-1].data_end_row
     footer_row = last_data_row + _SPACER_ROWS
 
@@ -485,11 +489,14 @@ def build_requests(
         )
     )
     requests.append(_clear_lists_region_request(dash_sheet_id, footer_row + 1))
+    if source_auth_rows:
+        requests.extend(_source_freshness_requests(dash_sheet_id, source_auth_rows))
     requests.extend(
         _row_height_requests(
             dash_sheet_id=dash_sheet_id,
             sections=sections,
             footer_row=footer_row,
+            has_source_status=has_source_status,
         )
     )
     for section, section_tasks in zip(sections, _sectioned_tasks(tasks, today), strict=True):
@@ -516,7 +523,12 @@ def _sectioned_tasks(tasks: list[DashboardTask], today: date) -> tuple[list[Dash
     )
 
 
-def _compute_section_layouts(tasks: list[DashboardTask], today: date) -> tuple[SectionLayout, ...]:
+def _compute_section_layouts(
+    tasks: list[DashboardTask],
+    today: date,
+    *,
+    has_source_status: bool = False,
+) -> tuple[SectionLayout, ...]:
     """Walk the sections in order, allocating rows as we go.
 
     Each section consumes 1 header row + ``max(1, len(data))`` data rows
@@ -542,7 +554,8 @@ def _compute_section_layouts(tasks: list[DashboardTask], today: date) -> tuple[S
     # Leading spacer row so the first table's Sheets-rendered name chip
     # gets the same visual breathing room above it as the second and
     # third tables get from inter-section spacers.
-    cursor = _LISTS_START_ROW + _SPACER_ROWS
+    source_rows = 1 if has_source_status else 0
+    cursor = _LISTS_START_ROW + source_rows + _SPACER_ROWS
     out: list[SectionLayout] = []
     for i, (name, tid, section_tasks) in enumerate(sec_meta):
         header_row = cursor
@@ -642,6 +655,7 @@ def _row_height_requests(
     dash_sheet_id: int,
     sections: tuple[SectionLayout, ...],
     footer_row: int,
+    has_source_status: bool,
 ) -> list[dict[str, Any]]:
     """Set per-row heights for the dynamic region.
 
@@ -651,14 +665,25 @@ def _row_height_requests(
     rows below the footer keep Sheets' default height.
     """
     out: list[dict[str, Any]] = []
-    # Leading spacer row(s) between the graphics frame and the first
-    # table's header — sized as spacer rows for consistency with the
-    # spacers between sections.
-    if sections[0].header_row > _LISTS_START_ROW:
+    leading_spacer_start = _LISTS_START_ROW
+    if has_source_status:
         out.append(
             _dim_height(
                 dash_sheet_id,
                 _LISTS_START_ROW,
+                _LISTS_START_ROW + 1,
+                _ROW_HEIGHT_SOURCE_STATUS,
+            )
+        )
+        leading_spacer_start += 1
+    # Leading spacer row(s) between the graphics frame and the first
+    # table's header — sized as spacer rows for consistency with the
+    # spacers between sections.
+    if sections[0].header_row > leading_spacer_start:
+        out.append(
+            _dim_height(
+                dash_sheet_id,
+                leading_spacer_start,
                 sections[0].header_row,
                 _ROW_HEIGHT_SPACER,
             )
@@ -676,6 +701,72 @@ def _row_height_requests(
     # Footer row.
     out.append(_dim_height(dash_sheet_id, footer_row, footer_row + 1, _ROW_HEIGHT_FOOTER))
     return out
+
+
+def _source_freshness_requests(
+    dash_sheet_id: int,
+    source_auth_rows: list[SourceAuthRow],
+) -> list[dict[str, Any]]:
+    """Write a neutral last-success summary without auth severity language."""
+    source_range = {
+        "sheetId": dash_sheet_id,
+        "startRowIndex": _LISTS_START_ROW,
+        "endRowIndex": _LISTS_START_ROW + 1,
+        "startColumnIndex": _COL_CONTENT_START,
+        "endColumnIndex": _COL_CONTENT_END,
+    }
+    return [
+        _update_cells(
+            dash_sheet_id,
+            row_index=_LISTS_START_ROW,
+            column_index=_COL_CONTENT_START,
+            rows=[[_string_cell(_format_source_freshness(source_auth_rows))]],
+            fields="userEnteredValue",
+        ),
+        {
+            "mergeCells": {
+                "range": source_range,
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": source_range,
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {
+                            "fontSize": 9,
+                            "italic": True,
+                            "foregroundColor": {
+                                "red": 0.35,
+                                "green": 0.35,
+                                "blue": 0.35,
+                            },
+                        },
+                        "horizontalAlignment": "LEFT",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": "userEnteredFormat",
+            }
+        },
+    ]
+
+
+def _format_source_freshness(source_auth_rows: list[SourceAuthRow]) -> str:
+    parts: list[str] = []
+    for row in source_auth_rows:
+        label = "EP" if row.source == "eduperfect" else row.display_name
+        if row.last_success_at is None:
+            parts.append(f"{label} not yet updated")
+            continue
+        updated_at = row.last_success_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+        local = updated_at.astimezone(_MELBOURNE)
+        parts.append(f"{label} updated {local:%d/%m %H:%M}")
+    return "Sources: " + " · ".join(parts)
 
 
 def _dim_height(sheet_id: int, start: int, end: int, px: int) -> dict[str, Any]:

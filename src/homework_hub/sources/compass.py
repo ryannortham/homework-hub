@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import html as _html
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,9 @@ from homework_hub.sources.base import (
     Source,
     TransientError,
 )
+from homework_hub.token_store import atomic_write_json
+
+log = logging.getLogger(__name__)
 
 # Compass uses an iOS app User-Agent that the unofficial Compasspy library
 # pins; non-browser UAs get bot-blocked. Keep this in sync with Compasspy.
@@ -297,8 +301,7 @@ class CompassToken:
         return cls.from_dict(data)
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2))
+        atomic_write_json(path, self.to_dict())
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +324,7 @@ class CompassClient:
         self.user_agent = user_agent
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout, follow_redirects=False)
+        self._session_refreshed = False
 
     def __enter__(self) -> CompassClient:
         return self
@@ -357,8 +361,7 @@ class CompassClient:
 
         if resp.status_code in (302, 401, 403):
             raise AuthExpiredError(
-                f"Compass Learning Tasks link returned {resp.status_code} — "
-                "session cookie expired."
+                f"Compass Learning Tasks link returned {resp.status_code} — session cookie expired."
             )
         if 500 <= resp.status_code < 600:
             raise TransientError(f"Compass {resp.status_code} on Learning Tasks link")
@@ -366,6 +369,11 @@ class CompassClient:
             raise SchemaBreakError(
                 f"Compass Learning Tasks link returned {resp.status_code}: {resp.text[:200]}"
             )
+        self._capture_session_cookie(resp)
+
+    def refreshed_token(self) -> CompassToken | None:
+        """Return a server-rotated token observed on a successful request."""
+        return self.token if self._session_refreshed else None
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -398,6 +406,7 @@ class CompassClient:
             raise SchemaBreakError(
                 f"Unexpected Compass status {resp.status_code} on {url}: {resp.text[:200]}"
             )
+        self._capture_session_cookie(resp)
 
         try:
             payload = resp.json()
@@ -410,6 +419,16 @@ class CompassClient:
         if not isinstance(data, list):
             raise SchemaBreakError(f"Compass response missing list payload: {type(data).__name__}")
         return data
+
+    def _capture_session_cookie(self, response: httpx.Response) -> None:
+        for cookie in response.cookies.jar:
+            if cookie.name != "ASP.NET_SessionId" or not cookie.value:
+                continue
+            self.token = CompassToken(
+                subdomain=self.token.subdomain,
+                cookie=cookie.value,
+            )
+            self._session_refreshed = True
 
 
 # --------------------------------------------------------------------------- #
@@ -444,7 +463,7 @@ class CompassSource(Source):
         with self._client_factory(token) as client:
             raw_tasks = client.get_learning_tasks(user_id)
             client.check_learning_tasks_link(user_id)
-        return [
+        tasks = [
             map_learning_task_to_task(
                 child=child,
                 learning_task=lt,
@@ -453,6 +472,8 @@ class CompassSource(Source):
             )
             for lt in raw_tasks
         ]
+        self._persist_refreshed_token(client)
+        return tasks
 
     def fetch_raw(self, child: str) -> list[RawRecord]:
         """Fetch Compass Learning Tasks as raw payloads for the bronze layer.
@@ -488,4 +509,18 @@ class CompassSource(Source):
                     },
                 )
             )
+        self._persist_refreshed_token(client)
         return records
+
+    def _persist_refreshed_token(self, client: Any) -> None:
+        get_refreshed = getattr(client, "refreshed_token", None)
+        if not callable(get_refreshed):
+            return
+        try:
+            refreshed = get_refreshed()
+            if refreshed is None:
+                return
+            refreshed.save(self.token_path)
+            log.info("Compass session refreshed at %s", self.token_path)
+        except Exception as exc:
+            log.warning("Compass session refresh could not be persisted: %s", exc)

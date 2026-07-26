@@ -1024,6 +1024,7 @@ def publish_for_child(
             existing_banded_range_ids=meta.banded_range_ids,
             existing_conditional_format_rule_count=meta.conditional_format_rule_count,
             theme_accent=meta.theme_accent,
+            source_auth_rows=source_auth_rows,
         )
         sink.write_dashboard_layout(spreadsheet_id, dash_requests)
         # One-shot install of the whole-sheet Dashboard protection. The

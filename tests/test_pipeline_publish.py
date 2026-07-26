@@ -306,9 +306,7 @@ class TestMergeUserEdits:
         assert merged[0].cells[_idx("notes")] == ""
 
     def test_persisted_iso_due_date_is_restored_as_date(self):
-        projected = project_tasks_rows(
-            [_task(due_at=datetime(2026, 6, 26, 13, 59, tzinfo=UTC))]
-        )
+        projected = project_tasks_rows([_task(due_at=datetime(2026, 6, 26, 13, 59, tzinfo=UTC))])
         edits = [
             UserEdit(
                 "compass:T1",
@@ -555,9 +553,9 @@ class TestFilterSupersededEdits:
         for terminal in (Status.SUBMITTED, Status.GRADED, Status.OVERDUE):
             t = _task(status=terminal)
             edits = [UserEdit("compass:T1", "status", "Archived", "now")]
-            assert filter_superseded_edits(edits, [t]) == edits, (
-                f"Archive edit must survive when silver={terminal}"
-            )
+            assert (
+                filter_superseded_edits(edits, [t]) == edits
+            ), f"Archive edit must survive when silver={terminal}"
 
     def test_status_edit_kept_when_not_started(self):
         t = _task(status=Status.NOT_STARTED)
@@ -701,9 +699,7 @@ class FakeGoldSink:
     def write_dashboard_layout(self, spreadsheet_id: str, requests: list[dict]) -> None:
         self.dashboard_requests.append(list(requests))
 
-    def write_dashboard_protection(
-        self, spreadsheet_id: str, dashboard_sheet_id: int
-    ) -> None:
+    def write_dashboard_protection(self, spreadsheet_id: str, dashboard_sheet_id: int) -> None:
         self.protection_installs.append((spreadsheet_id, dashboard_sheet_id))
 
 
@@ -1203,6 +1199,51 @@ class TestPublishDashboard:
         for at in addtables:
             assert at["addTable"]["table"]["range"]["sheetId"] == 42
 
+    def test_publishes_neutral_source_freshness_line(self, tmp_path: Path):
+        from homework_hub.pipeline.auth_status import SourceAuthRow
+
+        store = _store(tmp_path)
+        sink = FakeGoldSink(
+            dashboard_meta=DashboardMeta(
+                sheet_id=42,
+                table_ids=[],
+                banded_range_ids=[],
+                conditional_format_rule_count=0,
+            )
+        )
+        source_rows = [
+            SourceAuthRow(
+                source="eduperfect",
+                display_name="EduPerfect",
+                last_success_at=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+                last_failure_at=datetime(2026, 5, 1, 15, 0, tzinfo=UTC),
+                last_failure_kind="auth_expired",
+                token_expires_at=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+                token_present=True,
+                status="expired",
+            )
+        ]
+
+        publish_for_child(
+            store,
+            sink,
+            child="james",
+            spreadsheet_id="SS1",
+            tasks=[],
+            last_synced=datetime(2026, 5, 1, 16, 0, tzinfo=UTC),
+            source_auth_rows=source_rows,
+        )
+
+        values = [
+            cell["userEnteredValue"]["stringValue"]
+            for request in sink.dashboard_requests[0]
+            for row in request.get("updateCells", {}).get("rows", [])
+            for cell in row.get("values", [])
+            if "stringValue" in cell.get("userEnteredValue", {})
+        ]
+        freshness = next(value for value in values if value.startswith("Sources:"))
+        assert freshness == "Sources: EP updated 02/05 00:00"
+
     def test_dashboard_failure_does_not_break_publish(self, tmp_path: Path):
         """Tasks/History/UserEdits writes are canonical state — a
         Dashboard refresh failure must be swallowed (logged)."""
@@ -1360,13 +1401,10 @@ class TestPublishDashboardThemeAccent:
         repaints = [
             r
             for r in reqs
-            if "updateTable" in r
-            and "columnProperties" not in r["updateTable"]["table"]
+            if "updateTable" in r and "columnProperties" not in r["updateTable"]["table"]
         ]
         expected = {
-            tab.table_id
-            for tab in SCHEMA.tabs
-            if tab.table_id and tab.name != DASHBOARD_TAB.name
+            tab.table_id for tab in SCHEMA.tabs if tab.table_id and tab.name != DASHBOARD_TAB.name
         }
         seen = {r["updateTable"]["table"]["tableId"] for r in repaints}
         assert seen == expected
