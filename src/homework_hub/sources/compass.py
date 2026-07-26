@@ -41,7 +41,7 @@ from homework_hub.sources.base import (
     Source,
     TransientError,
 )
-from homework_hub.token_store import atomic_write_json
+from homework_hub.token_store import safe_write_json
 
 log = logging.getLogger(__name__)
 
@@ -301,7 +301,7 @@ class CompassToken:
         return cls.from_dict(data)
 
     def save(self, path: Path) -> None:
-        atomic_write_json(path, self.to_dict())
+        safe_write_json(path, self.to_dict())
 
 
 # --------------------------------------------------------------------------- #

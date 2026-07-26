@@ -45,7 +45,7 @@ from homework_hub.sources.base import (
     Source,
     TransientError,
 )
-from homework_hub.token_store import atomic_write_json
+from homework_hub.token_store import safe_write_json
 
 DEFAULT_BASE_URL = "https://classroom.google.com"
 
@@ -393,7 +393,7 @@ class ClassroomStorageState:
         return state
 
     def save(self, path: Path) -> None:
-        atomic_write_json(path, self.raw)
+        safe_write_json(path, self.raw)
         self.path = path
 
     def validate(self) -> None:

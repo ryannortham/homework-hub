@@ -10,9 +10,25 @@ from pathlib import Path
 from typing import Any
 
 
-def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically replace a sensitive JSON file with owner-only permissions."""
+def safe_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Safely persist sensitive JSON while preserving dataset ACLs.
+
+    Existing files are updated in place so ACL-backed mounts such as the
+    TrueNAS token dataset retain the original secure inode and permissions.
+    New files use an atomic owner-only rename.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = (json.dumps(payload, indent=2) + "\n").encode()
+    if path.exists():
+        original = path.read_bytes()
+        try:
+            _write_existing(path, serialized)
+        except Exception:
+            with contextlib.suppress(OSError):
+                _write_existing(path, original)
+            raise
+        return
+
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -21,9 +37,8 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary_path = Path(temporary_name)
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
@@ -36,4 +51,13 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-__all__ = ["atomic_write_json"]
+def _write_existing(path: Path, content: bytes) -> None:
+    with path.open("r+b") as handle:
+        handle.seek(0)
+        handle.write(content)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+__all__ = ["safe_write_json"]
