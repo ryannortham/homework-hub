@@ -79,7 +79,6 @@ RUN groupadd --system --gid 568 app \
 
 WORKDIR /app
 COPY --from=builder --chown=568:568 /opt/venv /opt/venv
-COPY --from=builder --chown=568:568 /build/src /app/src
 
 # Install Chromium + its system deps via Playwright. The image gains ~450MB
 # but it's the price of bypassing the school's OAuth block on Classroom.
@@ -90,6 +89,8 @@ RUN set -eux; \
     mkdir -p /opt/playwright; \
     /opt/venv/bin/python -m playwright install --with-deps chromium; \
     chown -R 568:568 /opt/playwright
+
+COPY --from=builder --chown=568:568 /build/src /app/src
 
 USER 568
 
