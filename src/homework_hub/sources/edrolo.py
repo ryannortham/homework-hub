@@ -175,9 +175,17 @@ def is_active_edrolo_task(t: dict[str, Any]) -> bool:
 
 
 def _build_default_url(task_id: Any) -> str:
-    # The SPA presents tasks under the studyplanner namespace; this URL form
-    # opens the task detail view in a logged-in browser.
-    return f"{DEFAULT_BASE_URL}/studyplanner/tasks/{task_id}/"
+    # The current student SPA resolves this route to the task's first item.
+    return f"{DEFAULT_BASE_URL}/student/tasks/{task_id}/"
+
+
+def _first_linkable_task_id(tasks: list[dict[str, Any]]) -> Any | None:
+    """Return a representative non-deleted task ID for route validation."""
+    for task in tasks:
+        task_id = task.get("id")
+        if task_id is not None and not task.get("soft_deleted"):
+            return task_id
+    return None
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -371,6 +379,31 @@ class EdroloClient:
         """Fetch the student's enrolled courses (used for course_id → title)."""
         return self._get_json(API_COURSES_PATH)
 
+    def check_task_link(self, task_id: Any) -> None:
+        """Verify one representative student task destination is reachable."""
+        url = _build_default_url(task_id)
+        headers = {
+            "User-Agent": self.user_agent,
+            "Cookie": self.storage.cookie_header(),
+        }
+        try:
+            resp = self._client.get(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise TransientError(f"Edrolo task link timeout: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise TransientError(f"Edrolo task link network error: {exc}") from exc
+
+        if resp.status_code in (301, 302, 401, 403):
+            raise AuthExpiredError(
+                f"Edrolo task link returned {resp.status_code} — session expired."
+            )
+        if 500 <= resp.status_code < 600:
+            raise TransientError(f"Edrolo {resp.status_code} on task link")
+        if resp.status_code != 200:
+            raise SchemaBreakError(
+                f"Edrolo task link returned {resp.status_code}: {resp.text[:200]}"
+            )
+
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
@@ -464,6 +497,9 @@ class EdroloSource(Source):
         with self._client_factory(storage) as client:
             raw_tasks = client.get_tasks()
             raw_courses = client.get_courses()
+            task_id = _first_linkable_task_id(raw_tasks)
+            if task_id is not None:
+                client.check_task_link(task_id)
 
         course_titles = {
             str(c["id"]): c.get("title", "")
@@ -495,6 +531,9 @@ class EdroloSource(Source):
         with self._client_factory(storage) as client:
             raw_tasks = client.get_tasks()
             raw_courses = client.get_courses()
+            task_id = _first_linkable_task_id(raw_tasks)
+            if task_id is not None:
+                client.check_task_link(task_id)
 
         course_titles = {
             str(c["id"]): c.get("title", "")

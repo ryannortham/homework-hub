@@ -62,7 +62,7 @@ class TestMapping:
         assert t.subject == "VCE Biology Units 3&4 [2026]"
         assert t.title == "11BIO 3 - Chapter 4 Practice"
         assert t.status is Status.NOT_STARTED
-        assert t.url == "https://app.edrolo.com/studyplanner/tasks/99821/"
+        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
 
     def test_due_date_parsed(self, task, course_titles):
         t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
@@ -96,9 +96,9 @@ class TestMapping:
         t = map_edrolo_task_to_task(child="james", edrolo_task=task)
         assert t.subject == "Edrolo"
 
-    def test_default_url_uses_studyplanner_path(self, task, course_titles):
+    def test_default_url_uses_current_student_task_path(self, task, course_titles):
         t = map_edrolo_task_to_task(child="james", edrolo_task=task, course_titles=course_titles)
-        assert t.url == "https://app.edrolo.com/studyplanner/tasks/99821/"
+        assert t.url == "https://app.edrolo.com/student/tasks/99821/"
 
     def test_description_for_spaced_retrieval(self, task, course_titles):
         task["type"] = "spaced_retrieval"
@@ -279,6 +279,27 @@ class TestEdroloClient:
         assert len(result) == 2
         assert result[0]["title"] == "VCE Biology Units 3&4 [2026]"
 
+    def test_check_task_link_happy_path(self, storage_raw):
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, text="<html>Edrolo task</html>")
+
+        client = self._client(handler, storage_raw)
+        client.check_task_link(99821)
+
+        assert captured["url"] == "https://app.edrolo.com/student/tasks/99821/"
+
+    def test_check_task_link_404_is_schema_break(self, storage_raw):
+        client = self._client(
+            lambda _request: httpx.Response(404, text="Yikes! We're lost."),
+            storage_raw,
+        )
+
+        with pytest.raises(SchemaBreakError, match="task link"):
+            client.check_task_link(99821)
+
     def test_302_translates_to_auth_expired(self, storage_raw):
         client = self._client(
             lambda _r: httpx.Response(302, headers={"Location": "/account/login/"}),
@@ -352,6 +373,7 @@ class FakeEdroloClient:
         self.raw_tasks = raw_tasks
         self.raw_courses = raw_courses or []
         self.calls: list[EdroloStorageState] = []
+        self.link_checks: list[int] = []
 
     def __enter__(self):
         return self
@@ -364,6 +386,9 @@ class FakeEdroloClient:
 
     def get_courses(self) -> list[dict]:
         return self.raw_courses
+
+    def check_task_link(self, task_id: int) -> None:
+        self.link_checks.append(task_id)
 
 
 class TestEdroloSource:
@@ -438,12 +463,14 @@ class TestEdroloFetchRaw:
     def test_returns_one_record_per_task(self, tmp_path: Path, task, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
         courses = _load("edrolo_courses.json")
+        fake = FakeEdroloClient([task], courses)
         source = EdroloSource(
             {"james": path},
-            client_factory=lambda _s: FakeEdroloClient([task], courses),
+            client_factory=lambda _s: fake,
         )
         records = source.fetch_raw("james")
         assert len(records) == 1
+        assert fake.link_checks == [99821]
         assert records[0].source == "edrolo"
         assert records[0].child == "james"
         assert records[0].source_id == "99821"
@@ -463,12 +490,14 @@ class TestEdroloFetchRaw:
     def test_soft_deleted_filtered_out(self, tmp_path: Path, task, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")
         deleted = {**task, "id": 99999, "soft_deleted": True}
+        fake = FakeEdroloClient([deleted, task], [])
         source = EdroloSource(
             {"james": path},
-            client_factory=lambda _s: FakeEdroloClient([task, deleted], []),
+            client_factory=lambda _s: fake,
         )
         records = source.fetch_raw("james")
         assert {r.source_id for r in records} == {"99821"}
+        assert fake.link_checks == [99821]
 
     def test_unknown_child_raises_schema_break(self, tmp_path: Path, storage_raw):
         path = self._save_storage(tmp_path, storage_raw, "james-edrolo.json")

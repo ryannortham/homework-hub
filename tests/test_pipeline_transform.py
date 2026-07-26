@@ -63,9 +63,10 @@ class TestBronzeToSilverCompass:
                 "name": "Pythagoras Investigation",
                 "subjectName": "9MATH",
                 "description": "<p>Do it</p>",
-                "students": [{"submissionStatus": 0}],
+                "students": [{"userId": 12345, "submissionStatus": 0}],
             },
             "subdomain": "mcsc-vic",
+            "student_user_id": 12345,
         }
         task = bronze_to_silver_compass(child="james", payload=payload)
         assert task.source is SourceEnum.COMPASS
@@ -73,6 +74,7 @@ class TestBronzeToSilverCompass:
         assert task.subject == "9MATH"
         assert task.title == "Pythagoras Investigation"
         assert "<p>" not in task.description
+        assert task.url.endswith("/Records/UserNew.aspx?userId=12345#learningTasks")
 
 
 class TestBronzeToSilverClassroom:

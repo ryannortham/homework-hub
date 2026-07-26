@@ -75,7 +75,13 @@ _CATEGORY_TYPE_MAP: dict[int, TaskType] = {
 # --------------------------------------------------------------------------- #
 
 
-def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subdomain: str) -> Task:
+def map_learning_task_to_task(
+    *,
+    child: str,
+    learning_task: dict[str, Any],
+    subdomain: str,
+    student_user_id: int | None = None,
+) -> Task:
     """Translate one Compass Learning Task into a canonical Task.
 
     Compass Learning Tasks come back from
@@ -136,7 +142,13 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
         and gi.get("name", "").strip()
     ]
 
-    url = f"https://{subdomain}.compass.education/Communicate/LearningTasksStudentDetails.aspx?taskId={task_id}"
+    if student_user_id is None:
+        student_user_id = _student_user_id(learning_task)
+    url = (
+        _learning_tasks_url(subdomain, student_user_id)
+        if student_user_id is not None
+        else f"https://{subdomain}.compass.education/"
+    )
 
     return Task(
         source=SourceEnum.COMPASS,
@@ -153,6 +165,30 @@ def map_learning_task_to_task(*, child: str, learning_task: dict[str, Any], subd
         task_type=task_type,
         checkpoints=checkpoints,
         url=url,
+    )
+
+
+def _student_user_id(learning_task: dict[str, Any]) -> int | None:
+    """Return the first student userId embedded in a Learning Task."""
+    for student in learning_task.get("students") or []:
+        if not isinstance(student, dict):
+            continue
+        user_id = student.get("userId")
+        if user_id is not None:
+            return int(user_id)
+    return None
+
+
+def _learning_tasks_url(subdomain: str, student_user_id: int) -> str:
+    """Build the current Compass profile URL for a student's Learning Tasks.
+
+    Compass now renders task details as an in-page widget rather than exposing
+    a stable task-detail route. The profile tab is therefore the closest
+    durable destination for every task belonging to the student.
+    """
+    return (
+        f"https://{subdomain}.compass.education/"
+        f"Records/UserNew.aspx?userId={student_user_id}#learningTasks"
     )
 
 
@@ -305,6 +341,32 @@ class CompassClient:
         body = {"userId": int(user_id), "page": 1, "start": 0, "limit": 200}
         return self._post(url, body)
 
+    def check_learning_tasks_link(self, user_id: int) -> None:
+        """Verify the current student Learning Tasks destination is reachable."""
+        url = _learning_tasks_url(self.token.subdomain, user_id).split("#", maxsplit=1)[0]
+        headers = {
+            "User-Agent": self.user_agent,
+            "Cookie": f"ASP.NET_SessionId={self.token.cookie}",
+        }
+        try:
+            resp = self._client.get(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise TransientError(f"Compass Learning Tasks link timeout: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise TransientError(f"Compass Learning Tasks link network error: {exc}") from exc
+
+        if resp.status_code in (302, 401, 403):
+            raise AuthExpiredError(
+                f"Compass Learning Tasks link returned {resp.status_code} — "
+                "session cookie expired."
+            )
+        if 500 <= resp.status_code < 600:
+            raise TransientError(f"Compass {resp.status_code} on Learning Tasks link")
+        if resp.status_code != 200:
+            raise SchemaBreakError(
+                f"Compass Learning Tasks link returned {resp.status_code}: {resp.text[:200]}"
+            )
+
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
@@ -381,8 +443,14 @@ class CompassSource(Source):
         token = CompassToken.load(self.token_path)
         with self._client_factory(token) as client:
             raw_tasks = client.get_learning_tasks(user_id)
+            client.check_learning_tasks_link(user_id)
         return [
-            map_learning_task_to_task(child=child, learning_task=lt, subdomain=token.subdomain)
+            map_learning_task_to_task(
+                child=child,
+                learning_task=lt,
+                subdomain=token.subdomain,
+                student_user_id=user_id,
+            )
             for lt in raw_tasks
         ]
 
@@ -402,6 +470,7 @@ class CompassSource(Source):
         token = CompassToken.load(self.token_path)
         with self._client_factory(token) as client:
             raw_tasks = client.get_learning_tasks(user_id)
+            client.check_learning_tasks_link(user_id)
         records: list[RawRecord] = []
         for lt in raw_tasks:
             task_id = lt.get("id")
@@ -412,7 +481,11 @@ class CompassSource(Source):
                     child=child,
                     source=SourceEnum.COMPASS.value,
                     source_id=str(task_id),
-                    payload={"learning_task": lt, "subdomain": token.subdomain},
+                    payload={
+                        "learning_task": lt,
+                        "subdomain": token.subdomain,
+                        "student_user_id": user_id,
+                    },
                 )
             )
         return records

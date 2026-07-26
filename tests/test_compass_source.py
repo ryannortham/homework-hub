@@ -60,11 +60,21 @@ class TestMapping:
         assert "Pythagorean triples" in t.description
         assert t.status is Status.NOT_STARTED
 
-    def test_url_built_from_subdomain_and_id(self, lt):
+    def test_url_opens_student_learning_tasks_page(self, lt):
         t = map_learning_task_to_task(child="james", learning_task=lt, subdomain="mcsc-vic")
         assert t.url == (
-            "https://mcsc-vic.compass.education/Communicate/"
-            "LearningTasksStudentDetails.aspx?taskId=8842"
+            "https://mcsc-vic.compass.education/" "Records/UserNew.aspx?userId=12345#learningTasks"
+        )
+
+    def test_configured_student_user_id_takes_precedence(self, lt):
+        t = map_learning_task_to_task(
+            child="james",
+            learning_task=lt,
+            subdomain="mcsc-vic",
+            student_user_id=67890,
+        )
+        assert t.url == (
+            "https://mcsc-vic.compass.education/" "Records/UserNew.aspx?userId=67890#learningTasks"
         )
 
     def test_due_date_parsed(self, lt):
@@ -354,6 +364,27 @@ class TestCompassClient:
         assert len(result) == 2
         assert result[0]["id"] == 8842
 
+    def test_check_learning_tasks_link_happy_path(self):
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, text="<html>Learning Tasks</html>")
+
+        client = self._client(handler)
+        client.check_learning_tasks_link(12345)
+
+        assert (
+            captured["url"]
+            == "https://mcsc-vic.compass.education/Records/UserNew.aspx?userId=12345"
+        )
+
+    def test_check_learning_tasks_link_404_is_schema_break(self):
+        client = self._client(lambda _request: httpx.Response(404, text="Compass: Error"))
+
+        with pytest.raises(SchemaBreakError, match="Learning Tasks link"):
+            client.check_learning_tasks_link(12345)
+
     def test_302_translates_to_auth_expired(self):
         def handler(_request):
             return httpx.Response(302, headers={"Location": "/Login.aspx"})
@@ -406,6 +437,7 @@ class FakeCompassClient:
     def __init__(self, raw_tasks: list[dict]):
         self.raw_tasks = raw_tasks
         self.calls: list[int] = []
+        self.link_checks: list[int] = []
 
     def __enter__(self):
         return self
@@ -416,6 +448,9 @@ class FakeCompassClient:
     def get_learning_tasks(self, user_id: int) -> list[dict]:
         self.calls.append(user_id)
         return self.raw_tasks
+
+    def check_learning_tasks_link(self, user_id: int) -> None:
+        self.link_checks.append(user_id)
 
 
 class TestCompassSource:
@@ -433,6 +468,7 @@ class TestCompassSource:
         tasks = source.fetch("james")
 
         assert fake.calls == [12345]
+        assert fake.link_checks == [12345]
         assert len(tasks) == 1
         assert tasks[0].child == "james"
         assert tasks[0].source_id == "8842"
@@ -450,6 +486,7 @@ class TestCompassSource:
         )
         source.fetch("tahlia")
         assert fake.calls == [67890]
+        assert fake.link_checks == [67890]
 
     def test_unknown_child_raises_schema_break(self, tmp_path: Path):
         token = CompassToken(subdomain="mcsc-vic", cookie="ABC")
@@ -488,6 +525,7 @@ class TestCompassFetchRaw:
         )
         records = source.fetch_raw("james")
         assert len(records) == 2
+        assert fake.link_checks == [12345]
         assert {r.source_id for r in records} == {"8842", "9999"}
         assert all(r.source == "compass" for r in records)
         assert all(r.child == "james" for r in records)
@@ -503,6 +541,7 @@ class TestCompassFetchRaw:
         )
         rec = source.fetch_raw("james")[0]
         assert rec.payload["subdomain"] == "mcsc-vic"
+        assert rec.payload["student_user_id"] == 1
         assert rec.payload["learning_task"] == lt
 
     def test_unknown_child_raises_schema_break(self, tmp_path: Path):

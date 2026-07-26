@@ -47,6 +47,7 @@ def bronze_to_silver_compass(*, child: str, payload: dict[str, Any]) -> Task:
         child=child,
         learning_task=payload["learning_task"],
         subdomain=payload["subdomain"],
+        student_user_id=payload.get("student_user_id"),
     )
 
 
