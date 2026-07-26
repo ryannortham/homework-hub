@@ -46,6 +46,7 @@ from homework_hub.schema import (
     SCHEMA,
     SETTINGS_TAB,
     TASKS_TAB,
+    ColumnKind,
     TabSpec,
 )
 from homework_hub.state.store import StateStore
@@ -494,7 +495,13 @@ def merge_user_edits(
         new_cells = list(row.cells)
         for col_idx, col in enumerate(TASKS_TAB.columns):
             if col.key in overrides:
-                new_cells[col_idx] = overrides[col.key]
+                value = overrides[col.key]
+                if col.kind is ColumnKind.DATE and isinstance(value, str):
+                    parsed = _parse_tasks_tab_date(value)
+                    if parsed is None:
+                        continue
+                    value = parsed
+                new_cells[col_idx] = value
         merged.append(TaskRow(task_uid=row.task_uid, cells=tuple(new_cells)))
     return merged
 
@@ -577,14 +584,20 @@ def _parse_tasks_tab_date(raw: str) -> date | None:
     Sheets returns the cell's *display* string, so we expect ``dd/MM/yyyy``
     (the format applied at bootstrap).  As a fallback we also handle the raw
     integer serial string that Sheets occasionally returns when the cell was
-    written as a number rather than a formatted date.  Any other value (empty,
-    unparseable) returns ``None`` so the caller can treat it as "no override".
+    written as a number rather than a formatted date. Persisted UserEdits use
+    ISO ``yyyy-MM-dd``, which is also accepted so date overrides retain their
+    type when reapplied. Any other value (empty, unparseable) returns ``None``
+    so the caller can treat it as "no override".
     """
     raw = raw.strip()
     if not raw:
         return None
     try:
         return datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(raw)
     except ValueError:
         pass
     if raw.isdigit():
@@ -615,8 +628,6 @@ def capture_tab_edits(
     - ``DATE``      — parsed via :func:`_parse_tasks_tab_date`; failures skipped.
     - ``DROPDOWN`` / ``TEXT`` — raw string; empty string skipped (= no override).
     """
-    from homework_hub.schema import ColumnKind
-
     editable_cols = tab.editable_columns()
     uid_idx = TASKS_TAB.column_index("task_uid")  # same index in both tabs
     projected_by_uid = {r.task_uid: r for r in projected}

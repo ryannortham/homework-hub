@@ -305,6 +305,25 @@ class TestMergeUserEdits:
         merged = merge_user_edits(rows, edits)
         assert merged[0].cells[_idx("notes")] == ""
 
+    def test_persisted_iso_due_date_is_restored_as_date(self):
+        projected = project_tasks_rows(
+            [_task(due_at=datetime(2026, 6, 26, 13, 59, tzinfo=UTC))]
+        )
+        edits = [
+            UserEdit(
+                "compass:T1",
+                "due",
+                "2026-06-26",
+                "old",
+                original_value="2026-06-26",
+            )
+        ]
+
+        merged = merge_user_edits(projected, edits)
+
+        assert merged[0].cells[_idx("due")] == date(2026, 6, 26)
+        assert diff_user_edits(merged, edits, projected=projected) == []
+
 
 class TestDiffUserEdits:
     def test_default_values_not_emitted(self):
